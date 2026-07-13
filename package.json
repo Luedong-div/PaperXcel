@@ -1,0 +1,113 @@
+{
+  "name": "paperxcel",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local-first AI paper reader for quantum mechanics and theoretical chemistry.",
+  "main": "./out/main/index.js",
+  "author": "PaperXcel",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/run-dev.mjs",
+    "build": "tsc --noEmit && electron-vite build",
+    "preview": "electron-vite preview",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint \"src/**/*.{ts,tsx}\" \"electron.vite.config.ts\"",
+    "lint:fix": "npm run lint -- --fix",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "npm run build && node tests/electron-smoke.mjs",
+    "test:citation-graph": "npm run build && node tests/citation-graph-smoke.mjs",
+    "test:packaged": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-packaged.ps1",
+    "dist:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^26.1.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "electron": "^43.1.0",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "eslint": "^10.7.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.7.0",
+    "jsdom": "^29.1.1",
+    "playwright": "^1.61.1",
+    "prettier": "3.8.3",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.63.0",
+    "vite": "^7.3.6",
+    "vitest": "^3.2.4"
+  },
+  "dependencies": {
+    "@dagrejs/dagre": "^3.0.0",
+    "@huggingface/tokenizers": "^0.1.3",
+    "@xyflow/react": "^12.11.2",
+    "electron-store": "^11.0.2",
+    "fast-xml-parser": "^5.10.0",
+    "katex": "^0.17.0",
+    "lucide-react": "^1.24.0",
+    "onnxruntime-node": "^1.24.3",
+    "openai": "^6.46.0",
+    "pdfjs-dist": "^6.1.200",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-markdown": "^10.1.0",
+    "rehype-katex": "^7.0.1",
+    "remark-breaks": "^4.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
+    "zod": "^4.4.3"
+  },
+  "build": {
+    "appId": "cn.paperxcel.desktop",
+    "productName": "PaperXcel",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "extraResources": [
+      {
+        "from": "models/bge-small-zh-v1.5",
+        "to": "models/bge-small-zh-v1.5",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "files": [
+      "out/**/*",
+      "package.json",
+      "!node_modules/onnxruntime-node/bin/napi-v6/darwin/**/*",
+      "!node_modules/onnxruntime-node/bin/napi-v6/linux/**/*",
+      "!node_modules/onnxruntime-node/bin/napi-v6/win32/arm64/**/*",
+      "!node_modules/onnxruntime-node/bin/napi-v6/win32/x64/DirectML.dll",
+      "!node_modules/onnxruntime-node/bin/napi-v6/win32/x64/dxcompiler.dll",
+      "!node_modules/onnxruntime-node/bin/napi-v6/win32/x64/dxil.dll",
+      "!node_modules/@napi-rs/canvas*/**/*"
+    ],
+    "win": {
+      "icon": "public/paperxcel.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}
