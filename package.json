@@ -2,7 +2,7 @@
   "name": "paperxcel",
   "private": true,
   "version": "0.1.0",
-  "description": "Local-first AI paper reader for quantum mechanics and theoretical chemistry.",
+  "description": "Local-first AI workspace for reading, organizing, and comparing research papers.",
   "main": "./out/main/index.js",
   "author": "PaperXcel",
   "type": "module",

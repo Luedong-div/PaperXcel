@@ -2,12 +2,15 @@ import type {
   CitationGraphEdge,
   CitationGraphNode,
   CitationGraphSnapshot,
+  CitationMatchStatus,
+  CitationMetadataSource,
+  CitationTextQuality,
   Paper,
 } from "./contracts";
 
 export const CITATION_GRAPH_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 export const CITATION_GRAPH_CITING_LIMIT = 20;
-export const CITATION_GRAPH_CORE_VERSION = 6;
+export const CITATION_GRAPH_CORE_VERSION = 7;
 
 export interface CitationWorkRecord {
   openAlexId: string;
@@ -17,9 +20,18 @@ export interface CitationWorkRecord {
   journal?: string;
   year?: number;
   abstract?: string;
-  citedByCount: number;
+  volume?: string;
+  issue?: string;
+  pages?: string;
+  issn?: string[];
+  citedByCount?: number;
   referencedOpenAlexIds: string[];
   sourceUrl?: string;
+  metadataSources?: CitationMetadataSource[];
+  matchStatus?: CitationMatchStatus;
+  matchConfidence?: number;
+  rawCitation?: string;
+  textQuality?: CitationTextQuality;
 }
 
 export interface CitationCoreRecord {
@@ -104,11 +116,17 @@ export function buildCitationGraphSnapshot(
       year: paper.year,
       abstract: paper.abstract,
       citedByCount: openAlexId
-        ? (cache.works[openAlexId]?.citedByCount ?? 0)
-        : 0,
+        ? cache.works[openAlexId]?.citedByCount
+        : undefined,
       referencedByLibrary: false,
       citesLibrary: false,
       sourceUrl: paper.sourceUrl,
+      metadataSources: [
+        "library",
+        ...(openAlexId ? (cache.works[openAlexId]?.metadataSources ?? []) : []),
+      ],
+      matchStatus: "verified",
+      matchConfidence: 100,
     });
   }
 
@@ -168,7 +186,7 @@ export function buildCitationGraphSnapshot(
       const secondWork = cache.works[secondId];
       return (
         second.connections.size - first.connections.size ||
-        (secondWork?.citedByCount ?? 0) - (firstWork?.citedByCount ?? 0) ||
+        (secondWork?.citedByCount ?? -1) - (firstWork?.citedByCount ?? -1) ||
         (secondWork?.year ?? 0) - (firstWork?.year ?? 0) ||
         (firstWork?.title ?? "").localeCompare(secondWork?.title ?? "")
       );
@@ -190,10 +208,21 @@ export function buildCitationGraphSnapshot(
       journal: work.journal,
       year: work.year,
       abstract: work.abstract,
+      volume: work.volume,
+      issue: work.issue,
+      pages: work.pages,
+      issn: work.issn ? [...work.issn] : undefined,
       citedByCount: work.citedByCount,
       referencedByLibrary: relation.referencedByLibrary,
       citesLibrary: relation.citesLibrary,
       sourceUrl: work.sourceUrl,
+      metadataSources: work.metadataSources
+        ? [...work.metadataSources]
+        : undefined,
+      matchStatus: work.matchStatus,
+      matchConfidence: work.matchConfidence,
+      rawCitation: work.rawCitation,
+      textQuality: work.textQuality,
     });
   }
 

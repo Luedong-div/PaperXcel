@@ -1,0 +1,4 @@
+interface:
+  display_name: "PaperXcel Research Workflow"
+  short_description: "Build evidence-backed literature analyses from PaperXcel."
+  default_prompt: "Use $paperxcel-research-workflow to answer this research question with auditable PaperXcel evidence."

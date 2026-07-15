@@ -11,6 +11,7 @@ import {
   RefreshCw,
   Save,
   Server,
+  Trash2,
   X,
 } from "lucide-react";
 import { normalizeZoteroUserLibraryId } from "../../shared/zotero";
@@ -72,7 +73,7 @@ export function AppSettingsDialog({
   const [openAlex, setOpenAlex] = useState<OpenAlexConfigInput>({ apiKey: "" });
   const [openAlexHasApiKey, setOpenAlexHasApiKey] = useState(false);
   const [openAlexBusy, setOpenAlexBusy] = useState<
-    "save" | "test" | undefined
+    "save" | "test" | "clear" | undefined
   >();
   const [openAlexResult, setOpenAlexResult] = useState<OpenAlexTestResult>();
   const [translation, setTranslation] = useState<TranslationConfigInput>({
@@ -218,6 +219,29 @@ export function AppSettingsDialog({
     setOpenAlexResult(undefined);
     try {
       setOpenAlexResult(await window.paperxcel.openAlex.test(openAlex));
+    } catch (error) {
+      setOpenAlexResult({
+        ok: false,
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setOpenAlexBusy(undefined);
+    }
+  };
+
+  const clearCitationGraphCache = async (): Promise<void> => {
+    setOpenAlexBusy("clear");
+    setOpenAlexResult(undefined);
+    try {
+      const result = await window.paperxcel.citationGraph.clear();
+      window.dispatchEvent(new Event("paperxcel:citation-graph-cache-cleared"));
+      setOpenAlexResult({
+        ok: true,
+        detail:
+          result.clearedPapers > 0 || result.clearedWorks > 0
+            ? `已清除 ${result.clearedPapers} 篇论文、${result.clearedWorks} 个图谱节点的缓存。`
+            : "引文图谱缓存已经是空的。",
+      });
     } catch (error) {
       setOpenAlexResult({
         ok: false,
@@ -663,6 +687,19 @@ export function AppSettingsDialog({
                   )}
 
                   <footer className="zotero-actions">
+                    <button
+                      className="secondary-button citation-cache-clear"
+                      type="button"
+                      disabled={Boolean(openAlexBusy)}
+                      onClick={() => void clearCitationGraphCache()}
+                    >
+                      {openAlexBusy === "clear" ? (
+                        <LoaderCircle className="spin" size={14} />
+                      ) : (
+                        <Trash2 size={14} />
+                      )}
+                      清除图谱缓存
+                    </button>
                     <button
                       className="secondary-button"
                       type="button"

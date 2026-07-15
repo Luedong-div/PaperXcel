@@ -1,0 +1,4 @@
+interface:
+  display_name: "PaperXcel Theoretical Chemistry"
+  short_description: "Analyze theoretical chemistry papers with strict evidence."
+  default_prompt: "Use $paperxcel-theoretical-chemistry to analyze these papers with page-level evidence and explicit method details."

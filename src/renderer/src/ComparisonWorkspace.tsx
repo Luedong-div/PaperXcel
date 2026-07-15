@@ -26,35 +26,35 @@ interface ComparisonWorkspaceProps {
 }
 
 const DEFAULT_QUESTION =
-  "比较这些论文的理论方法、Hamiltonian、关键近似、计算设置、主要结果与局限性。";
+  "比较这些论文的研究问题、研究对象、方法与研究设计、证据来源、主要结果和局限性。";
 
 const presets = [
   {
-    label: "方法与近似",
+    label: "研究设计",
     value:
-      "比较这些论文采用的 Hamiltonian、理论方法、关键近似、basis set/functional 与 electron correlation 处理。",
+      "比较这些论文的研究问题、研究对象或范围、理论框架、方法与研究设计，以及关键假设。",
   },
   {
-    label: "复现参数",
+    label: "证据与复现",
     value:
-      "比较这些论文的计算体系、软件、收敛标准、相对论处理、赝势及其他可复现参数。",
+      "比较这些论文使用的数据、样本或材料、实验或计算条件、软件或仪器、评价指标及其他可复现信息。",
   },
   {
     label: "结果与局限",
     value:
-      "比较这些论文的主要 observable、基准结果、误差来源、适用范围与作者明确陈述的局限性。",
+      "比较这些论文的主要结果、证据强度、不确定性、可比性、适用范围与作者明确陈述的局限性。",
   },
 ];
 
 type ComparisonView = "matrix" | "report";
 type MatrixFieldKey =
-  | "theory"
-  | "hamiltonian"
-  | "approximation"
-  | "basis"
-  | "correlation"
+  | "question"
+  | "scope"
+  | "method"
+  | "evidence"
   | "settings"
-  | "result";
+  | "result"
+  | "limitations";
 
 interface MatrixField {
   key: MatrixFieldKey;
@@ -66,13 +66,29 @@ type MatrixValues = Record<MatrixFieldKey, string>;
 type MatrixRows = Record<string, MatrixValues>;
 
 const MATRIX_FIELDS: MatrixField[] = [
-  { key: "theory", label: "理论方法", shortLabel: "Theory / method" },
-  { key: "hamiltonian", label: "Hamiltonian", shortLabel: "Hamiltonian" },
-  { key: "approximation", label: "关键近似", shortLabel: "Approximations" },
-  { key: "basis", label: "基组 / 泛函", shortLabel: "Basis / functional" },
-  { key: "correlation", label: "电子相关", shortLabel: "Correlation" },
-  { key: "settings", label: "计算设置", shortLabel: "Settings" },
+  {
+    key: "question",
+    label: "研究问题 / 目标",
+    shortLabel: "Question / objective",
+  },
+  { key: "scope", label: "对象 / 范围", shortLabel: "Population / system" },
+  { key: "method", label: "方法 / 研究设计", shortLabel: "Method / design" },
+  {
+    key: "evidence",
+    label: "数据 / 材料 / 证据",
+    shortLabel: "Data / evidence",
+  },
+  {
+    key: "settings",
+    label: "实施 / 复现信息",
+    shortLabel: "Setup / reproducibility",
+  },
   { key: "result", label: "主要结果", shortLabel: "Key result" },
+  {
+    key: "limitations",
+    label: "局限 / 适用范围",
+    shortLabel: "Limitations / scope",
+  },
 ];
 
 const MATRIX_STORAGE_PREFIX = "paperxcel.comparison-matrix:";
@@ -95,7 +111,12 @@ export function ComparisonWorkspace({
     () => new Map(papers.map((paper) => [paper.id, paper])),
     [papers],
   );
+  const availablePaperIds = useMemo(
+    () => new Set(papers.map((paper) => paper.id)),
+    [papers],
+  );
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [paperQuery, setPaperQuery] = useState("");
   const [question, setQuestion] = useState(DEFAULT_QUESTION);
   const [reports, setReports] = useState<ComparisonReport[]>([]);
   const [selectedReportId, setSelectedReportId] = useState<string>();
@@ -116,6 +137,22 @@ export function ComparisonWorkspace({
   const [onlyFilled, setOnlyFilled] = useState(false);
   const [matrixRows, setMatrixRows] = useState<MatrixRows>({});
   const [matrixReadyKey, setMatrixReadyKey] = useState("");
+  const visibleReadyPapers = useMemo(() => {
+    const normalized = paperQuery.trim().toLocaleLowerCase();
+    if (!normalized) return readyPapers;
+    return readyPapers.filter((paper) =>
+      [
+        paper.title,
+        ...paper.authors,
+        paper.doi,
+        paper.journal,
+        paper.year?.toString(),
+        ...paper.tags,
+      ]
+        .filter((value): value is string => Boolean(value))
+        .some((value) => value.toLocaleLowerCase().includes(normalized)),
+    );
+  }, [paperQuery, readyPapers]);
 
   useEffect(() => {
     let disposed = false;
@@ -124,11 +161,14 @@ export function ComparisonWorkspace({
       .list()
       .then((items) => {
         if (disposed) return;
-        setReports(items);
+        const availableReports = items.filter((report) =>
+          report.paperIds.every((paperId) => availablePaperIds.has(paperId)),
+        );
+        setReports(availableReports);
         setSelectedReportId((current) =>
-          current && items.some((report) => report.id === current)
+          current && availableReports.some((report) => report.id === current)
             ? current
-            : items[0]?.id,
+            : availableReports[0]?.id,
         );
       })
       .catch((error: unknown) => {
@@ -140,7 +180,7 @@ export function ComparisonWorkspace({
     return () => {
       disposed = true;
     };
-  }, [onError]);
+  }, [availablePaperIds, onError]);
 
   useEffect(() => {
     setSelectedIds((current) => {
@@ -156,8 +196,9 @@ export function ComparisonWorkspace({
     });
   }, [readyPapers]);
 
-  const selectedPapers = readyPapers.filter((paper) =>
-    selectedIds.has(paper.id),
+  const selectedPapers = useMemo(
+    () => readyPapers.filter((paper) => selectedIds.has(paper.id)),
+    [readyPapers, selectedIds],
   );
   const selectedReport =
     reports.find((report) => report.id === selectedReportId) ?? reports[0];
@@ -398,8 +439,22 @@ export function ComparisonWorkspace({
           <section className="comparison-control-section">
             <div className="comparison-section-heading">
               <strong>文献</strong>
-              <span>{selectedPapers.length}/5</span>
+              <span
+                title={`共 ${readyPapers.length} 篇可用文献，最多选择 5 篇`}
+              >
+                共 {readyPapers.length} 篇 · 已选 {selectedPapers.length}/5
+              </span>
             </div>
+            <label className="comparison-paper-search">
+              <Search size={14} />
+              <input
+                type="search"
+                aria-label="搜索候选文献"
+                placeholder="搜索标题、作者、DOI 等"
+                value={paperQuery}
+                onChange={(event) => setPaperQuery(event.target.value)}
+              />
+            </label>
             <div className="comparison-paper-list">
               {readyPapers.length === 0 && (
                 <div className="comparison-small-empty">
@@ -407,7 +462,13 @@ export function ComparisonWorkspace({
                   <span>暂无已索引文献</span>
                 </div>
               )}
-              {readyPapers.map((paper) => {
+              {readyPapers.length > 0 && visibleReadyPapers.length === 0 && (
+                <div className="comparison-small-empty">
+                  <Search size={20} />
+                  <span>未找到匹配文献</span>
+                </div>
+              )}
+              {visibleReadyPapers.map((paper) => {
                 const selectedIndex = selectedPapers.findIndex(
                   (item) => item.id === paper.id,
                 );
@@ -777,8 +838,29 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function normalizeMatrixValues(values?: Partial<MatrixValues>): MatrixValues {
-  return Object.fromEntries(
-    MATRIX_FIELDS.map((field) => [field.key, values?.[field.key] ?? ""]),
-  ) as MatrixValues;
+function normalizeMatrixValues(
+  values?: Partial<MatrixValues> & Record<string, unknown>,
+): MatrixValues {
+  const read = (key: string): string =>
+    typeof values?.[key] === "string" ? values[key] : "";
+  const legacyMethod = [
+    ["理论方法", read("theory")],
+    ["Hamiltonian", read("hamiltonian")],
+    ["关键近似", read("approximation")],
+    ["基组 / 泛函", read("basis")],
+    ["电子相关", read("correlation")],
+  ]
+    .filter(([, value]) => value.trim())
+    .map(([label, value]) => `${label}：${value}`)
+    .join("\n");
+
+  return {
+    question: read("question"),
+    scope: read("scope"),
+    method: read("method") || legacyMethod,
+    evidence: read("evidence"),
+    settings: read("settings"),
+    result: read("result"),
+    limitations: read("limitations"),
+  };
 }

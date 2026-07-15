@@ -235,6 +235,9 @@ export function parseOpenAlexWork(
     sourceUrl:
       payload.primary_location?.landing_page_url?.trim() ||
       (doi ? `https://doi.org/${doi}` : `https://openalex.org/${openAlexId}`),
+    metadataSources: ["openalex"],
+    matchStatus: "verified",
+    matchConfidence: 100,
   };
 }
 
@@ -259,7 +262,12 @@ export function reconstructOpenAlexAbstract(
         .map((position) => ({ position, word })),
     )
     .sort((left, right) => left.position - right.position);
-  return tokens.map((token) => token.word).join(" ").trim() || undefined;
+  return (
+    tokens
+      .map((token) => token.word)
+      .join(" ")
+      .trim() || undefined
+  );
 }
 
 function unique<T>(values: T[]): T[] {

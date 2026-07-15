@@ -44,6 +44,8 @@ import {
 import type {
   CitationGraphNode,
   CitationGraphSnapshot,
+  CitationMatchStatus,
+  CitationMetadataSource,
   LibraryFolder,
   Paper,
 } from "../../shared/contracts";
@@ -149,6 +151,24 @@ function CitationGraphWorkspaceContent({
       }
     | undefined
   >(undefined);
+
+  useEffect(() => {
+    const clearSnapshot = (): void => {
+      setSnapshot({ nodes: [], edges: [], errors: [] });
+      setSelectedId(undefined);
+      setDetailMinimized(false);
+    };
+    window.addEventListener(
+      "paperxcel:citation-graph-cache-cleared",
+      clearSnapshot,
+    );
+    return () => {
+      window.removeEventListener(
+        "paperxcel:citation-graph-cache-cleared",
+        clearSnapshot,
+      );
+    };
+  }, []);
 
   const selectedPaperIdList = useMemo(
     () =>
@@ -488,9 +508,7 @@ function CitationGraphWorkspaceContent({
     setDetailMinimized(false);
   };
 
-  const startDetailDrag = (
-    event: React.PointerEvent<HTMLElement>,
-  ): void => {
+  const startDetailDrag = (event: React.PointerEvent<HTMLElement>): void => {
     if (event.button !== 0) return;
     const rect = event.currentTarget
       .closest(".citation-detail-popover")
@@ -504,9 +522,7 @@ function CitationGraphWorkspaceContent({
     event.currentTarget.setPointerCapture(event.pointerId);
   };
 
-  const moveDetailPanel = (
-    event: React.PointerEvent<HTMLElement>,
-  ): void => {
+  const moveDetailPanel = (event: React.PointerEvent<HTMLElement>): void => {
     const drag = detailDragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
     setDetailPosition(
@@ -517,9 +533,7 @@ function CitationGraphWorkspaceContent({
     );
   };
 
-  const stopDetailDrag = (
-    event: React.PointerEvent<HTMLElement>,
-  ): void => {
+  const stopDetailDrag = (event: React.PointerEvent<HTMLElement>): void => {
     if (detailDragRef.current?.pointerId !== event.pointerId) return;
     detailDragRef.current = undefined;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
@@ -552,7 +566,7 @@ function CitationGraphWorkspaceContent({
           <div>
             <h2>引文图谱</h2>
             <p title={selectedScopeLabel}>
-              {selectedScopeLabel} · OpenAlex 引用关系网络
+              {selectedScopeLabel} · OpenAlex / Crossref 引文网络
             </p>
           </div>
         </div>
@@ -565,11 +579,7 @@ function CitationGraphWorkspaceContent({
             onChange={(event) => setQuery(event.target.value)}
           />
           {query && (
-            <button
-              type="button"
-              title="清除搜索"
-              onClick={() => setQuery("")}
-            >
+            <button type="button" title="清除搜索" onClick={() => setQuery("")}>
               <X size={14} />
             </button>
           )}
@@ -812,10 +822,7 @@ function CitationGraphWorkspaceContent({
                       <span className="citation-year-bar" aria-hidden="true">
                         <span
                           style={{
-                            width: `${Math.max(
-                              5,
-                              Math.min(112, count * 6),
-                            )}px`,
+                            width: `${Math.max(5, Math.min(112, count * 6))}px`,
                           }}
                         />
                       </span>
@@ -829,7 +836,7 @@ function CitationGraphWorkspaceContent({
 
           <div className="citation-filter-footer">
             <Database size={14} />
-            OpenAlex
+            OpenAlex / Crossref
             <span>{snapshot.updatedAt ? "已缓存" : "待刷新"}</span>
           </div>
         </aside>
@@ -870,7 +877,7 @@ function CitationGraphWorkspaceContent({
             <EmptyGraphState
               icon={<Network size={34} />}
               title="建立论文之间的关系"
-              description="刷新后会结合 OpenAlex 与 PDF 文末编号书目补齐参考文献，并获取引用本文的高被引论文。"
+              description="刷新后会结合 OpenAlex、Crossref 与 PDF 文末书目补齐并校验参考文献，同时获取引用本文的高被引论文。"
               action={
                 <button
                   className="citation-empty-refresh"
@@ -1173,12 +1180,32 @@ function DetailOverview({
           <dd>{selected.year ?? "未知"}</dd>
         </div>
         <div>
-          <dt>来源</dt>
+          <dt>期刊</dt>
           <dd>{selected.journal ?? "未知"}</dd>
         </div>
+        {(selected.volume || selected.issue || selected.pages) && (
+          <div>
+            <dt>卷期页</dt>
+            <dd>
+              {[
+                selected.volume ? `卷 ${selected.volume}` : undefined,
+                selected.issue ? `期 ${selected.issue}` : undefined,
+                selected.pages ? `页 ${selected.pages}` : undefined,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            </dd>
+          </div>
+        )}
+        {selected.issn && selected.issn.length > 0 && (
+          <div>
+            <dt>ISSN</dt>
+            <dd>{selected.issn.join(" / ")}</dd>
+          </div>
+        )}
         <div>
           <dt>被引次数</dt>
-          <dd>{selected.citedByCount.toLocaleString()}</dd>
+          <dd>{formatCitedByCount(selected.citedByCount)}</dd>
         </div>
         {selected.openAlexId && (
           <div>
@@ -1186,7 +1213,41 @@ function DetailOverview({
             <dd>{selected.openAlexId}</dd>
           </div>
         )}
+        {selected.matchStatus && (
+          <div>
+            <dt>匹配状态</dt>
+            <dd>
+              <span className={`citation-match-state ${selected.matchStatus}`}>
+                {formatMatchStatus(selected.matchStatus)}
+              </span>
+            </dd>
+          </div>
+        )}
+        {typeof selected.matchConfidence === "number" && (
+          <div>
+            <dt>匹配置信度</dt>
+            <dd>{Math.round(selected.matchConfidence)}%</dd>
+          </div>
+        )}
+        {selected.metadataSources && selected.metadataSources.length > 0 && (
+          <div>
+            <dt>元数据来源</dt>
+            <dd>{formatMetadataSources(selected.metadataSources)}</dd>
+          </div>
+        )}
+        {selected.textQuality === "degraded" && (
+          <div>
+            <dt>PDF 文本</dt>
+            <dd>存在乱码；匹配时未依赖缺失字符</dd>
+          </div>
+        )}
       </dl>
+      {selected.rawCitation && (
+        <article className="citation-raw-reference">
+          <span>PDF 原始书目</span>
+          <p>{selected.rawCitation}</p>
+        </article>
+      )}
       {selected.doi && (
         <button
           className="citation-detail-doi"
@@ -1638,7 +1699,9 @@ function CitationNode({
     <div
       className={`citation-flow-node ${relationClass} ${
         selected ? "selected" : ""
-      } ${data.dimmed ? "dimmed" : ""}`}
+      } ${data.dimmed ? "dimmed" : ""} ${
+        node.matchStatus ? `match-${node.matchStatus}` : ""
+      }`}
     >
       <Handle type="target" position={Position.Left} />
       <strong title={formatCitationTitle(node.title)}>
@@ -1646,7 +1709,7 @@ function CitationNode({
       </strong>
       <div className="citation-flow-node-meta">
         <span>{node.year ?? "年份未知"}</span>
-        <span>被引 {node.citedByCount.toLocaleString()}</span>
+        <span>被引 {formatCitedByCount(node.citedByCount)}</span>
         <span className="citation-flow-node-author">
           {node.authors[0] ?? node.journal ?? "作者未知"}
         </span>
@@ -1654,6 +1717,30 @@ function CitationNode({
       <Handle type="source" position={Position.Right} />
     </div>
   );
+}
+
+function formatCitedByCount(value?: number): string {
+  return typeof value === "number" ? value.toLocaleString() : "未知";
+}
+
+function formatMatchStatus(status: CitationMatchStatus): string {
+  const labels: Record<CitationMatchStatus, string> = {
+    verified: "已确认",
+    probable: "可能匹配",
+    ambiguous: "匹配存疑",
+    unresolved: "未解析",
+  };
+  return labels[status];
+}
+
+function formatMetadataSources(sources: CitationMetadataSource[]): string {
+  const labels: Record<CitationMetadataSource, string> = {
+    library: "文献库",
+    pdf: "PDF",
+    crossref: "Crossref",
+    openalex: "OpenAlex",
+  };
+  return [...new Set(sources)].map((source) => labels[source]).join(" / ");
 }
 
 function buildFlowGraph(

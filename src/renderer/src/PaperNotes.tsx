@@ -18,6 +18,7 @@ import { normalizeMarkdownMath } from "./markdown";
 interface PaperNotesProps {
   paper: Paper;
   onError: (message: string) => void;
+  onGeneratingChange?: (paperId: string, generating: boolean) => void;
 }
 
 type SaveState =
@@ -39,7 +40,7 @@ const NOTE_PLACEHOLDER = `## 研究问题
 
 ## 计算设置与复现参数
 
-## 主要结果
+## 主要结果与证据链
 
 ## 局限性
 
@@ -48,6 +49,7 @@ const NOTE_PLACEHOLDER = `## 研究问题
 export function PaperNotes({
   paper,
   onError,
+  onGeneratingChange,
 }: PaperNotesProps): React.JSX.Element {
   const [content, setContent] = useState("");
   const [view, setView] = useState<NoteView>(readStoredNoteView);
@@ -151,17 +153,20 @@ export function PaperNotes({
       timerRef.current = undefined;
     }
     setGenerating(true);
+    onGeneratingChange?.(paper.id, true);
     try {
       const result = await window.paperxcel.notes.generate(paper.id);
       draftRef.current = result.note.content;
       savedRef.current = result.note.content;
       setContent(result.note.content);
       setSaveState("generated");
+      if (result.warning) onError(result.warning);
     } catch (error) {
       setSaveState("error");
       onError(error instanceof Error ? error.message : String(error));
     } finally {
       setGenerating(false);
+      onGeneratingChange?.(paper.id, false);
     }
   };
 

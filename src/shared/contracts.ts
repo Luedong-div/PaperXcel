@@ -7,14 +7,7 @@ export type PaperStatus =
 
 export type ProviderProtocol = "auto" | "responses" | "chat-completions";
 export type TranslationLanguage = "en" | "zh";
-export type ModelReasoningEffort =
-  | "default"
-  | "none"
-  | "minimal"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh";
+export type ModelReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh";
 
 export interface Paper {
   id: string;
@@ -128,11 +121,36 @@ export interface ReferencedSnippet {
   imageOnly?: boolean;
 }
 
+export type ChatAttachmentKind =
+  | "pdf"
+  | "image"
+  | "text"
+  | "document"
+  | "other";
+
+export type ChatAttachmentSource = "uploaded" | "library";
+export type ChatTask = "qa" | "repair-markdown";
+
+export interface ChatAttachment {
+  id: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  kind: ChatAttachmentKind;
+  source: ChatAttachmentSource;
+  paperId?: string;
+  pageCount?: number;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  reasoningContent?: string;
+  processingDurationMs?: number;
   prompt?: string;
+  task?: ChatTask;
+  attachments?: ChatAttachment[];
   selectedText?: string;
   selectedPage?: number;
   selectedSnippets?: ReferencedSnippet[];
@@ -154,6 +172,8 @@ export interface AskPaperInput {
   selectedText?: string;
   selectedPage?: number;
   selectedSnippets?: ReferencedSnippet[];
+  task?: ChatTask;
+  attachments?: ChatAttachment[];
   reasoningEffort?: ModelReasoningEffort;
   messages: ChatMessage[];
 }
@@ -162,6 +182,7 @@ export interface AskPaperResult {
   message: ChatMessage;
   protocol: Exclude<ProviderProtocol, "auto">;
   model: string;
+  markdownPreview?: KnowledgeBaseMarkdownPreview;
 }
 
 export interface AskPaperCancelledResult {
@@ -170,10 +191,116 @@ export interface AskPaperCancelledResult {
 
 export type AskPaperResponse = AskPaperResult | AskPaperCancelledResult;
 
+export type ChatProgressPhase = "searching" | "thinking" | "answering";
+
+export interface ChatProgress {
+  requestId: string;
+  phase: ChatProgressPhase;
+  detail: string;
+  reasoningContent?: string;
+  reasoningDelta?: string;
+  answerContent?: string;
+  answerDelta?: string;
+}
+
 export interface GeneratePaperNoteResult {
   note: PaperNote;
   protocol: Exclude<ProviderProtocol, "auto">;
   model: string;
+  source: "pdf" | "full.md";
+  warning?: string;
+}
+
+export interface LibraryReview {
+  id: string;
+  focus: string;
+  content: string;
+  paperIds: string[];
+  protocol: Exclude<ProviderProtocol, "auto">;
+  model: string;
+  createdAt: string;
+}
+
+export interface GenerateLibraryReviewInput {
+  focus?: string;
+}
+
+export interface KnowledgeBaseExportResult {
+  path: string;
+  paperCount: number;
+  noteCount: number;
+  reviewCount: number;
+  aiRepair: boolean;
+  repairedPaperCount: number;
+  repairedCitationNodeCount: number;
+  repairIssues: KnowledgeBaseRepairIssue[];
+  validation: KnowledgeBaseExportValidation;
+}
+
+export interface KnowledgeBaseExportCancelled {
+  cancelled: true;
+}
+
+export interface KnowledgeBaseExportValidation {
+  checkedFiles: number;
+  warnings: string[];
+}
+
+export interface KnowledgeBaseMarkdownPreview {
+  paperId: string;
+  markdown: string;
+  pageCount: number;
+  generatedAt: string;
+  aiRepaired: boolean;
+  model?: string;
+  protocol?: Exclude<ProviderProtocol, "auto">;
+  repairedAt?: string;
+  warnings?: string[];
+}
+
+export interface KnowledgeBaseMarkdownRepairCancelled {
+  cancelled: true;
+}
+
+export type KnowledgeBaseMarkdownRepairResult =
+  | KnowledgeBaseMarkdownPreview
+  | KnowledgeBaseMarkdownRepairCancelled;
+
+export interface KnowledgeBaseExportOptions {
+  aiRepair?: boolean;
+  paperIds?: string[];
+  requestId?: string;
+}
+
+export interface KnowledgeBaseRepairIssue {
+  paperId: string;
+  paperTitle: string;
+  message: string;
+}
+
+export type KnowledgeBaseRepairPhase =
+  | "preparing"
+  | "extracting"
+  | "repairing-text"
+  | "repairing-citations"
+  | "writing"
+  | "finalizing"
+  | "cancelled"
+  | "complete";
+
+export interface KnowledgeBaseRepairProgress {
+  requestId?: string;
+  phase: KnowledgeBaseRepairPhase;
+  completed: number;
+  total: number;
+  paperId?: string;
+  paperTitle?: string;
+  detail: string;
+}
+
+export interface DocumentPageText {
+  page: number;
+  text: string;
 }
 
 export interface ComparisonCitation {
@@ -213,6 +340,25 @@ export interface LibrarySearchHit {
   score: number;
 }
 
+export interface LibraryAskHistoryMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface LibraryAskInput {
+  query: string;
+  reasoningEffort?: ModelReasoningEffort;
+  selectedHits?: LibrarySearchHit[];
+  history?: LibraryAskHistoryMessage[];
+}
+
+export interface LibraryAskResult {
+  content: string;
+  citations: ComparisonCitation[];
+  protocol: Exclude<ProviderProtocol, "auto">;
+  model: string;
+}
+
 export type PaperIdentifier =
   | { kind: "doi"; doi: string }
   | { kind: "arxiv"; arxivId: string; version?: number };
@@ -243,6 +389,17 @@ export interface OpenAlexTestResult {
 }
 
 export type CitationGraphNodeKind = "library" | "external";
+export type CitationMetadataSource =
+  | "library"
+  | "pdf"
+  | "crossref"
+  | "openalex";
+export type CitationMatchStatus =
+  | "verified"
+  | "probable"
+  | "ambiguous"
+  | "unresolved";
+export type CitationTextQuality = "clean" | "degraded";
 
 export interface CitationGraphNode {
   id: string;
@@ -255,10 +412,19 @@ export interface CitationGraphNode {
   journal?: string;
   year?: number;
   abstract?: string;
-  citedByCount: number;
+  volume?: string;
+  issue?: string;
+  pages?: string;
+  issn?: string[];
+  citedByCount?: number;
   referencedByLibrary: boolean;
   citesLibrary: boolean;
   sourceUrl?: string;
+  metadataSources?: CitationMetadataSource[];
+  matchStatus?: CitationMatchStatus;
+  matchConfidence?: number;
+  rawCitation?: string;
+  textQuality?: CitationTextQuality;
 }
 
 export interface CitationGraphEdge {
@@ -279,6 +445,11 @@ export interface CitationGraphRefreshResult {
   updatedPapers: number;
   skippedPapers: number;
   failedPapers: number;
+}
+
+export interface CitationGraphClearResult {
+  clearedWorks: number;
+  clearedPapers: number;
 }
 
 export interface WorkerStatus {
@@ -364,6 +535,9 @@ export interface PaperXcelApi {
   };
   chat: {
     list: (paperId: string) => Promise<ChatMessage[]>;
+    attachFile: (file: File, paperId?: string) => Promise<ChatAttachment>;
+    attachPaperMarkdown: (paperId: string) => Promise<ChatAttachment>;
+    removeAttachment: (attachmentId: string) => Promise<boolean>;
     append: (paperId: string, message: ChatMessage) => Promise<ChatMessage[]>;
     clear: (paperId: string) => Promise<void>;
     replace: (
@@ -372,6 +546,7 @@ export interface PaperXcelApi {
     ) => Promise<ChatMessage[]>;
     ask: (input: AskPaperInput) => Promise<AskPaperResponse>;
     cancel: (requestId: string) => Promise<boolean>;
+    onProgress: (listener: (progress: ChatProgress) => void) => () => void;
   };
   selectionImages: {
     save: (dataUrl: string) => Promise<{ id: string; url: string }>;
@@ -389,6 +564,28 @@ export interface PaperXcelApi {
     generate: (paperId: string) => Promise<GeneratePaperNoteResult>;
     exportMarkdown: (paperId: string) => Promise<boolean>;
   };
+  reviews: {
+    list: () => Promise<LibraryReview[]>;
+    generate: (input: GenerateLibraryReviewInput) => Promise<LibraryReview>;
+    remove: (reviewId: string) => Promise<void>;
+    exportMarkdown: (reviewId: string) => Promise<boolean>;
+  };
+  knowledgeBase: {
+    export: (
+      options?: KnowledgeBaseExportOptions,
+    ) => Promise<
+      KnowledgeBaseExportResult | KnowledgeBaseExportCancelled | null
+    >;
+    cancel: (requestId: string) => Promise<boolean>;
+    previewMarkdown: (paperId: string) => Promise<KnowledgeBaseMarkdownPreview>;
+    repairMarkdown: (
+      paperId: string,
+      requestId?: string,
+    ) => Promise<KnowledgeBaseMarkdownRepairResult>;
+    onProgress: (
+      listener: (progress: KnowledgeBaseRepairProgress) => void,
+    ) => () => void;
+  };
   comparisons: {
     list: () => Promise<ComparisonReport[]>;
     generate: (input: ComparePapersInput) => Promise<ComparisonReport>;
@@ -397,6 +594,7 @@ export interface PaperXcelApi {
   };
   search: {
     library: (input: LibrarySearchInput) => Promise<LibrarySearchHit[]>;
+    askLibrary: (input: LibraryAskInput) => Promise<LibraryAskResult>;
   };
   settings: {
     getScihubEnabled: () => Promise<boolean>;
@@ -413,6 +611,7 @@ export interface PaperXcelApi {
       force?: boolean,
       paperIds?: string[],
     ) => Promise<CitationGraphRefreshResult>;
+    clear: () => Promise<CitationGraphClearResult>;
   };
   zotero: {
     getConfig: () => Promise<ZoteroConfig>;

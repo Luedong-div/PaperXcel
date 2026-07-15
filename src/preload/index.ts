@@ -2,13 +2,26 @@ import { contextBridge, ipcRenderer, webUtils } from "electron";
 import type {
   AskPaperInput,
   AskPaperResponse,
+  ChatAttachment,
   ChatMessage,
+  ChatProgress,
   ComparePapersInput,
   ComparisonReport,
   CitationGraphRefreshResult,
+  CitationGraphClearResult,
   CitationGraphSnapshot,
   GeneratePaperNoteResult,
+  GenerateLibraryReviewInput,
   ImportPdfInput,
+  KnowledgeBaseExportCancelled,
+  KnowledgeBaseExportOptions,
+  KnowledgeBaseExportResult,
+  KnowledgeBaseMarkdownPreview,
+  KnowledgeBaseMarkdownRepairResult,
+  KnowledgeBaseRepairProgress,
+  LibraryAskInput,
+  LibraryAskResult,
+  LibraryReview,
   LibrarySearchHit,
   LibrarySearchInput,
   Paper,
@@ -82,6 +95,39 @@ const api: PaperXcelApi = {
   chat: {
     list: (paperId: string): Promise<ChatMessage[]> =>
       ipcRenderer.invoke("chat:list", paperId),
+    attachFile: async (
+      file: File,
+      paperId?: string,
+    ): Promise<ChatAttachment> => {
+      let sourcePath = "";
+      try {
+        sourcePath = webUtils.getPathForFile(file);
+      } catch {
+        // Clipboard-created File objects do not always expose a native path.
+      }
+      if (sourcePath) {
+        return ipcRenderer.invoke(
+          "chat:attach-file",
+          sourcePath,
+          paperId,
+          file.type,
+        );
+      }
+      const data = new Uint8Array(await file.arrayBuffer());
+      return ipcRenderer.invoke(
+        "chat:attach-data",
+        {
+          fileName: file.name || pastedFileName(file.type),
+          mimeType: file.type,
+          data,
+        },
+        paperId,
+      );
+    },
+    attachPaperMarkdown: (paperId: string): Promise<ChatAttachment> =>
+      ipcRenderer.invoke("chat:attach-paper-markdown", paperId),
+    removeAttachment: (attachmentId: string): Promise<boolean> =>
+      ipcRenderer.invoke("chat:remove-attachment", attachmentId),
     append: (paperId: string, message: ChatMessage): Promise<ChatMessage[]> =>
       ipcRenderer.invoke("chat:append", paperId, message),
     clear: (paperId: string): Promise<void> =>
@@ -95,6 +141,14 @@ const api: PaperXcelApi = {
       ipcRenderer.invoke("chat:ask", input),
     cancel: (requestId: string): Promise<boolean> =>
       ipcRenderer.invoke("chat:cancel", requestId),
+    onProgress: (listener: (progress: ChatProgress) => void) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        progress: ChatProgress,
+      ): void => listener(progress);
+      ipcRenderer.on("chat:progress", handler);
+      return () => ipcRenderer.removeListener("chat:progress", handler);
+    },
   },
   selectionImages: {
     save: (dataUrl: string): Promise<{ id: string; url: string }> =>
@@ -122,6 +176,40 @@ const api: PaperXcelApi = {
     exportMarkdown: (paperId: string): Promise<boolean> =>
       ipcRenderer.invoke("notes:export-markdown", paperId),
   },
+  reviews: {
+    list: (): Promise<LibraryReview[]> => ipcRenderer.invoke("reviews:list"),
+    generate: (input: GenerateLibraryReviewInput): Promise<LibraryReview> =>
+      ipcRenderer.invoke("reviews:generate", input),
+    remove: (reviewId: string): Promise<void> =>
+      ipcRenderer.invoke("reviews:remove", reviewId),
+    exportMarkdown: (reviewId: string): Promise<boolean> =>
+      ipcRenderer.invoke("reviews:export-markdown", reviewId),
+  },
+  knowledgeBase: {
+    export: (
+      options?: KnowledgeBaseExportOptions,
+    ): Promise<
+      KnowledgeBaseExportResult | KnowledgeBaseExportCancelled | null
+    > => ipcRenderer.invoke("knowledge-base:export", options),
+    cancel: (requestId: string): Promise<boolean> =>
+      ipcRenderer.invoke("knowledge-base:cancel", requestId),
+    previewMarkdown: (paperId: string): Promise<KnowledgeBaseMarkdownPreview> =>
+      ipcRenderer.invoke("knowledge-base:preview-markdown", paperId),
+    repairMarkdown: (
+      paperId: string,
+      requestId?: string,
+    ): Promise<KnowledgeBaseMarkdownRepairResult> =>
+      ipcRenderer.invoke("knowledge-base:repair-markdown", paperId, requestId),
+    onProgress: (listener: (progress: KnowledgeBaseRepairProgress) => void) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        progress: KnowledgeBaseRepairProgress,
+      ): void => listener(progress);
+      ipcRenderer.on("knowledge-base:progress", handler);
+      return () =>
+        ipcRenderer.removeListener("knowledge-base:progress", handler);
+    },
+  },
   comparisons: {
     list: (): Promise<ComparisonReport[]> =>
       ipcRenderer.invoke("comparisons:list"),
@@ -135,6 +223,8 @@ const api: PaperXcelApi = {
   search: {
     library: (input: LibrarySearchInput): Promise<LibrarySearchHit[]> =>
       ipcRenderer.invoke("search:library", input),
+    askLibrary: (input: LibraryAskInput): Promise<LibraryAskResult> =>
+      ipcRenderer.invoke("search:ask-library", input),
   },
   settings: {
     getScihubEnabled: (): Promise<boolean> =>
@@ -157,6 +247,8 @@ const api: PaperXcelApi = {
       paperIds?: string[],
     ): Promise<CitationGraphRefreshResult> =>
       ipcRenderer.invoke("citation-graph:refresh", force, paperIds),
+    clear: (): Promise<CitationGraphClearResult> =>
+      ipcRenderer.invoke("citation-graph:clear"),
   },
   zotero: {
     getConfig: () => ipcRenderer.invoke("zotero:get-config"),
@@ -187,3 +279,16 @@ const api: PaperXcelApi = {
 };
 
 contextBridge.exposeInMainWorld("paperxcel", api);
+
+function pastedFileName(mimeType: string): string {
+  const extension =
+    {
+      "image/gif": "gif",
+      "image/jpeg": "jpg",
+      "image/png": "png",
+      "image/webp": "webp",
+      "application/pdf": "pdf",
+      "text/plain": "txt",
+    }[mimeType] ?? "bin";
+  return `pasted-${Date.now()}.${extension}`;
+}

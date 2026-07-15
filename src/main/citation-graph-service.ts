@@ -9,26 +9,9 @@ import {
   type CitationWorkRecord,
 } from "../shared/citationGraph";
 import type { CitationGraphRefreshResult, Paper } from "../shared/contracts";
+import { CrossrefClient, type CrossrefWorkRecord } from "./crossref-client";
 import { OpenAlexClient } from "./openalex-client";
-
-const CROSSREF_MATCH_CONCURRENCY = 4;
-const CROSSREF_MATCH_MIN_SCORE = 35;
-const CROSSREF_BASE_URL = "https://api.crossref.org";
-const CROSSREF_TIMEOUT_MS = 10_000;
-const CITATION_MATCH_THRESHOLD = 8;
-
-interface CrossrefWorkPayload {
-  message?: {
-    reference?: Array<{
-      DOI?: string;
-      doi?: string;
-    }>;
-    items?: Array<{
-      DOI?: string;
-      score?: number;
-    }>;
-  };
-}
+import { resolveReferenceWorks } from "./reference-resolver";
 
 export interface CitationGraphRefreshOptions {
   papers: Paper[];
@@ -59,6 +42,7 @@ export async function refreshCitationGraphData({
   let updatedPapers = 0;
   let skippedPapers = 0;
   let failedPapers = 0;
+  const crossref = new CrossrefClient(fetchImpl);
   const libraryDois = new Set(
     papers
       .map((paper) => normalizeCitationDoi(paper.doi))
@@ -77,15 +61,16 @@ export async function refreshCitationGraphData({
             paper,
             nextCache,
             client,
+            crossref,
             libraryDois,
             extractLocalReferenceCitations,
-            fetchImpl,
             now,
           )
         : await refreshLocalPaper(
             paper,
             nextCache,
             client,
+            crossref,
             extractLocalReferenceDois,
             extractLocalReferenceCitations,
             now,
@@ -117,49 +102,76 @@ async function refreshDoiPaper(
   paper: Paper,
   cache: CitationGraphCache,
   client: OpenAlexClient,
+  crossref: CrossrefClient,
   libraryDois: Set<string>,
   extractLocalReferenceCitations: CitationGraphRefreshOptions["extractLocalReferenceCitations"],
-  fetchImpl: typeof fetch,
   now: Date,
 ) {
-  const work = await client.getWorkByDoi(paper.doi!);
-  if (!work) throw new Error("OpenAlex 未找到该 DOI。");
-  cache.works[work.openAlexId] = work;
+  let openAlexLookupError: Error | undefined;
+  const work = await client.getWorkByDoi(paper.doi!).catch((error: unknown) => {
+    openAlexLookupError =
+      error instanceof Error ? error : new Error(String(error));
+    return undefined;
+  });
+  if (work) cache.works[work.openAlexId] = work;
 
   const citations = extractLocalReferenceCitations
     ? await extractLocalReferenceCitations(paper).catch(() => [])
     : [];
-  let referencedWorks = await client.getWorksByOpenAlexIds(
-    work.referencedOpenAlexIds,
-  );
+  let referencedWorks = work
+    ? await client
+        .getWorksByOpenAlexIds(work.referencedOpenAlexIds)
+        .catch(() => [])
+    : [];
   if (referencedWorks.length === 0) {
-    const crossrefDois = await fetchCrossrefReferenceDois(
-      paper.doi!,
-      fetchImpl,
+    const sourceDoi = normalizeCitationDoi(paper.doi);
+    const crossrefDois = (await crossref.getReferenceDois(paper.doi!)).filter(
+      (doi) => doi !== sourceDoi,
     );
     if (crossrefDois.length > 0) {
-      referencedWorks = await client.getWorksByDois(crossrefDois);
+      referencedWorks = await client
+        .getWorksByDois(crossrefDois)
+        .catch(() => []);
+      if (referencedWorks.length === 0) {
+        referencedWorks = (await crossref.getWorksByDois(crossrefDois)).map(
+          createCrossrefOnlyWork,
+        );
+      }
     }
   }
-  if (referencedWorks.length === 0 && citations.length > 0) {
-    const citationDois = await resolveCrossrefCitationDois(
-      citations,
-      paper.doi!,
-      fetchImpl,
-    );
-    if (citationDois.length > 0) {
-      referencedWorks = await client.getWorksByDois(citationDois);
-    }
-  }
+
+  const resolvedReferences =
+    citations.length > 0
+      ? await resolveReferenceWorks({
+          paperId: paper.id,
+          citations,
+          knownWorks: referencedWorks,
+          sourceDoi: paper.doi,
+          openAlex: client,
+          crossref,
+        })
+      : [];
   const selectedReferences =
-    citations.length > 0 && citations.length >= referencedWorks.length
-      ? reconcileReferenceWorks(paper.id, citations, referencedWorks)
-      : selectRelatedWorks(referencedWorks, undefined, libraryDois);
+    citations.length === 0
+      ? selectRelatedWorks(referencedWorks, undefined, libraryDois)
+      : citations.length < referencedWorks.length
+        ? combineReferenceWorks(resolvedReferences, referencedWorks)
+        : resolvedReferences;
+  if (
+    !work &&
+    openAlexLookupError &&
+    selectedReferences.length === 0 &&
+    citations.length === 0
+  ) {
+    throw openAlexLookupError;
+  }
   storeWorks(cache, selectedReferences);
-  const citingWorks = await client.getCitingWorks(
-    work.openAlexId,
-    CITATION_GRAPH_CITING_LIMIT,
-  );
+
+  const citingWorks = work
+    ? await client
+        .getCitingWorks(work.openAlexId, CITATION_GRAPH_CITING_LIMIT)
+        .catch(() => [])
+    : [];
   storeWorks(cache, citingWorks);
   const selectedCitingWorks = selectRelatedWorks(
     citingWorks,
@@ -169,113 +181,18 @@ async function refreshDoiPaper(
   return {
     version: CITATION_GRAPH_CORE_VERSION,
     paperId: paper.id,
-    openAlexId: work.openAlexId,
+    openAlexId: work?.openAlexId,
     referencedOpenAlexIds: selectedReferences.map((item) => item.openAlexId),
     citingOpenAlexIds: selectedCitingWorks.map((item) => item.openAlexId),
     fetchedAt: now.toISOString(),
   };
 }
 
-async function fetchCrossrefReferenceDois(
-  doi: string,
-  fetchImpl: typeof fetch,
-): Promise<string[]> {
-  const normalizedDoi = normalizeCitationDoi(doi);
-  if (!normalizedDoi) return [];
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), CROSSREF_TIMEOUT_MS);
-  try {
-    const response = await fetchImpl(
-      `${CROSSREF_BASE_URL}/works/${encodeURIComponent(normalizedDoi)}`,
-      {
-        headers: {
-          Accept: "application/json",
-          "User-Agent": "PaperXcel/0.1",
-        },
-        signal: controller.signal,
-      },
-    );
-    if (!response.ok) return [];
-    const payload = (await response.json()) as CrossrefWorkPayload;
-    const dois = (payload.message?.reference ?? [])
-      .map((reference) => normalizeCitationDoi(reference.DOI ?? reference.doi))
-      .filter((referenceDoi): referenceDoi is string => Boolean(referenceDoi));
-    return [...new Set(dois)];
-  } catch {
-    return [];
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function resolveCrossrefCitationDois(
-  citations: string[],
-  sourceDoi: string,
-  fetchImpl: typeof fetch,
-): Promise<string[]> {
-  const normalizedSourceDoi = normalizeCitationDoi(sourceDoi);
-  const resolved = new Set<string>();
-  const unmatched: string[] = [];
-  for (const citation of citations) {
-    const directDoi = normalizeCitationDoi(
-      citation.match(/10\.\d{4,9}\/[-._;()/:A-Z0-9]+/i)?.[0],
-    );
-    if (directDoi && directDoi !== normalizedSourceDoi) resolved.add(directDoi);
-    else if (citation.trim()) unmatched.push(citation.trim());
-  }
-
-  for (
-    let index = 0;
-    index < unmatched.length;
-    index += CROSSREF_MATCH_CONCURRENCY
-  ) {
-    const chunk = unmatched.slice(index, index + CROSSREF_MATCH_CONCURRENCY);
-    const matches = await Promise.all(
-      chunk.map((citation) =>
-        fetchCrossrefBibliographicDoi(citation, fetchImpl),
-      ),
-    );
-    for (const doi of matches) {
-      if (doi && doi !== normalizedSourceDoi) resolved.add(doi);
-    }
-  }
-  return [...resolved];
-}
-
-async function fetchCrossrefBibliographicDoi(
-  citation: string,
-  fetchImpl: typeof fetch,
-): Promise<string | undefined> {
-  const url = new URL(`${CROSSREF_BASE_URL}/works`);
-  url.searchParams.set("query.bibliographic", citation.slice(0, 800));
-  url.searchParams.set("rows", "1");
-  url.searchParams.set("select", "DOI,score");
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), CROSSREF_TIMEOUT_MS);
-  try {
-    const response = await fetchImpl(url, {
-      headers: {
-        Accept: "application/json",
-        "User-Agent": "PaperXcel/0.1",
-      },
-      signal: controller.signal,
-    });
-    if (!response.ok) return undefined;
-    const payload = (await response.json()) as CrossrefWorkPayload;
-    const match = payload.message?.items?.[0];
-    if ((match?.score ?? 0) < CROSSREF_MATCH_MIN_SCORE) return undefined;
-    return normalizeCitationDoi(match?.DOI);
-  } catch {
-    return undefined;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 async function refreshLocalPaper(
   paper: Paper,
   cache: CitationGraphCache,
   client: OpenAlexClient,
+  crossref: CrossrefClient,
   extractLocalReferenceDois: CitationGraphRefreshOptions["extractLocalReferenceDois"],
   extractLocalReferenceCitations: CitationGraphRefreshOptions["extractLocalReferenceCitations"],
   now: Date,
@@ -283,16 +200,34 @@ async function refreshLocalPaper(
   const dois = extractLocalReferenceDois
     ? await extractLocalReferenceDois(paper)
     : [];
-  const works = await client.getWorksByDois(
-    dois.map(normalizeCitationDoi).filter((doi): doi is string => Boolean(doi)),
-  );
+  const normalizedDois = dois
+    .map(normalizeCitationDoi)
+    .filter((doi): doi is string => Boolean(doi));
+  let works = await client.getWorksByDois(normalizedDois).catch(() => []);
+  if (works.length === 0 && normalizedDois.length > 0) {
+    works = (await crossref.getWorksByDois(normalizedDois)).map(
+      createCrossrefOnlyWork,
+    );
+  }
   const citations = extractLocalReferenceCitations
     ? await extractLocalReferenceCitations(paper).catch(() => [])
     : [];
+  const resolvedReferences =
+    citations.length > 0
+      ? await resolveReferenceWorks({
+          paperId: paper.id,
+          citations,
+          knownWorks: works,
+          openAlex: client,
+          crossref,
+        })
+      : [];
   const selectedReferences =
-    citations.length > 0 && citations.length >= works.length
-      ? reconcileReferenceWorks(paper.id, citations, works)
-      : selectRelatedWorks(works);
+    citations.length === 0
+      ? selectRelatedWorks(works)
+      : citations.length < works.length
+        ? combineReferenceWorks(resolvedReferences, works)
+        : resolvedReferences;
   storeWorks(cache, selectedReferences);
   return {
     version: CITATION_GRAPH_CORE_VERSION,
@@ -301,6 +236,18 @@ async function refreshLocalPaper(
     citingOpenAlexIds: [],
     fetchedAt: now.toISOString(),
   };
+}
+
+function combineReferenceWorks(
+  resolved: CitationWorkRecord[],
+  fallback: CitationWorkRecord[],
+): CitationWorkRecord[] {
+  const selected = new Map<string, CitationWorkRecord>();
+  for (const work of [...resolved, ...fallback]) {
+    const identity = normalizeCitationDoi(work.doi) ?? work.openAlexId;
+    if (!selected.has(identity)) selected.set(identity, work);
+  }
+  return [...selected.values()];
 }
 
 function selectRelatedWorks(
@@ -313,7 +260,7 @@ function selectRelatedWorks(
   );
   const ranked = [...works].sort(
     (first, second) =>
-      second.citedByCount - first.citedByCount ||
+      (second.citedByCount ?? -1) - (first.citedByCount ?? -1) ||
       (second.year ?? 0) - (first.year ?? 0) ||
       first.title.localeCompare(second.title),
   );
@@ -325,146 +272,38 @@ function selectRelatedWorks(
   return [...selected.values()];
 }
 
-function reconcileReferenceWorks(
-  paperId: string,
-  citations: string[],
-  works: CitationWorkRecord[],
-): CitationWorkRecord[] {
-  const available = new Map(works.map((work) => [work.openAlexId, work]));
-  return citations.map((citation, index) => {
-    const directDoi = extractCitationDoi(citation);
-    let matchedWork = directDoi
-      ? [...available.values()].find(
-          (work) => normalizeCitationDoi(work.doi) === directDoi,
-        )
-      : undefined;
-    if (!matchedWork) {
-      const bestMatch = [...available.values()]
-        .map((work) => ({
-          work,
-          score: citationWorkMatchScore(citation, work),
-        }))
-        .sort((first, second) => second.score - first.score)[0];
-      if (bestMatch?.score >= CITATION_MATCH_THRESHOLD) {
-        matchedWork = bestMatch.work;
-      }
-    }
-    if (matchedWork) {
-      available.delete(matchedWork.openAlexId);
-      return matchedWork;
-    }
-    return createCitationPlaceholderWork(paperId, index, citation);
-  });
-}
-
-function citationWorkMatchScore(
-  citation: string,
-  work: CitationWorkRecord,
-): number {
-  const citationTokens = normalizeMatchText(citation)
-    .split(" ")
-    .filter(Boolean);
-  const citationYear = extractCitationYear(citation);
-  let score = 0;
-
-  if (citationYear && work.year) score += citationYear === work.year ? 5 : -8;
-
-  const authorSurnames = work.authors
-    .map(authorSurname)
-    .filter((surname) => surname.length >= 3);
-  if (
-    authorSurnames[0] &&
-    citationContainsToken(citationTokens, authorSurnames[0])
-  ) {
-    score += 5;
-  }
-  for (const surname of authorSurnames.slice(1)) {
-    if (citationContainsToken(citationTokens, surname)) score += 2;
-  }
-
-  const titleHits = uniqueMatchTokens(work.title, 5).filter((token) =>
-    citationContainsToken(citationTokens, token),
-  ).length;
-  score += Math.min(6, titleHits * 2);
-
-  const journalHits = uniqueMatchTokens(work.journal ?? "", 4).filter((token) =>
-    citationTokens.some(
-      (citationToken) =>
-        citationToken.length >= 3 &&
-        (token.startsWith(citationToken) ||
-          citationToken.startsWith(token.slice(0, 4))),
-    ),
-  ).length;
-  return score + Math.min(4, journalHits);
-}
-
-function createCitationPlaceholderWork(
-  paperId: string,
-  index: number,
-  citation: string,
-): CitationWorkRecord {
-  const title = citation.replace(/\s+/g, " ").trim();
-  const openAlexId = `REF_${createHash("sha256")
-    .update(`${paperId}\0${index}\0${title}`)
-    .digest("hex")
-    .slice(0, 24)}`;
-  return {
-    openAlexId,
-    title,
-    authors: [],
-    journal: "PDF 参考文献",
-    year: extractCitationYear(title),
-    citedByCount: 0,
-    referencedOpenAlexIds: [],
-  };
-}
-
-function extractCitationDoi(citation: string): string | undefined {
-  return normalizeCitationDoi(
-    citation.match(/10\.\d{4,9}\/[-._;()/:A-Z0-9]+/i)?.[0],
-  );
-}
-
-function extractCitationYear(citation: string): number | undefined {
-  const year = Number(citation.match(/\b(?:18|19|20)\d{2}\b/)?.[0]);
-  return Number.isFinite(year) && year > 0 ? year : undefined;
-}
-
-function authorSurname(author: string): string {
-  const parts = normalizeMatchText(author)
-    .split(" ")
-    .filter((part) => part && !/^(?:jr|sr|ii|iii|iv)$/.test(part));
-  return parts.at(-1) ?? "";
-}
-
-function uniqueMatchTokens(value: string, minimumLength: number): string[] {
-  return [
-    ...new Set(
-      normalizeMatchText(value)
-        .split(" ")
-        .filter((token) => token.length >= minimumLength),
-    ),
-  ];
-}
-
-function citationContainsToken(tokens: string[], token: string): boolean {
-  return token.length >= 3 && tokens.includes(token);
-}
-
-function normalizeMatchText(value: string): string {
-  return value
-    .normalize("NFKD")
-    .replace(/\p{Mark}/gu, "")
-    .toLocaleLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim();
-}
-
 function storeWorks(
   cache: CitationGraphCache,
   works: CitationWorkRecord[],
 ): void {
   for (const work of works) cache.works[work.openAlexId] = work;
+}
+
+function createCrossrefOnlyWork(work: CrossrefWorkRecord): CitationWorkRecord {
+  const identity =
+    work.doi ??
+    [work.title, work.year, work.volume, work.pages].filter(Boolean).join("\0");
+  return {
+    openAlexId: `CR_${createHash("sha256")
+      .update(identity)
+      .digest("hex")
+      .slice(0, 24)}`,
+    doi: work.doi,
+    title: work.title ?? (work.doi ? `DOI ${work.doi}` : "未解析参考文献"),
+    authors: [...work.authors],
+    journal: work.journal,
+    year: work.year,
+    volume: work.volume,
+    issue: work.issue,
+    pages: work.pages,
+    issn: [...work.issn],
+    citedByCount: undefined,
+    referencedOpenAlexIds: [],
+    sourceUrl: work.sourceUrl,
+    metadataSources: ["crossref"],
+    matchStatus: "verified",
+    matchConfidence: 100,
+  };
 }
 
 function cloneCache(cache: CitationGraphCache): CitationGraphCache {
@@ -475,6 +314,10 @@ function cloneCache(cache: CitationGraphCache): CitationGraphCache {
         {
           ...work,
           authors: [...work.authors],
+          issn: work.issn ? [...work.issn] : undefined,
+          metadataSources: work.metadataSources
+            ? [...work.metadataSources]
+            : undefined,
           referencedOpenAlexIds: [...work.referencedOpenAlexIds],
         },
       ]),

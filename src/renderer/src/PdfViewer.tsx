@@ -21,6 +21,10 @@ import {
   type SelectionRect,
 } from "./pdfSelection";
 import { nextPdfZoom, PDF_MAX_ZOOM, PDF_MIN_ZOOM } from "./pdfZoom";
+import {
+  DocumentViewToggle,
+  type DocumentViewMode,
+} from "./DocumentViewToggle";
 
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -48,6 +52,8 @@ export interface PdfTextSelection {
 interface PdfViewerProps {
   url: string;
   page: number;
+  viewMode?: DocumentViewMode;
+  onViewModeChange?: (viewMode: DocumentViewMode) => void;
   onPageChange: (page: number) => void;
   onTextSelection?: (selection?: PdfTextSelection) => void;
   onReferenceSelection?: (selection: PdfTextSelection) => void;
@@ -57,6 +63,8 @@ interface PdfViewerProps {
 export function PdfViewer({
   url,
   page: requestedPage,
+  viewMode = "pdf",
+  onViewModeChange,
   onPageChange,
   onTextSelection,
   onReferenceSelection,
@@ -122,6 +130,8 @@ export function PdfViewer({
 
   useEffect(() => {
     if (!document) return;
+    // App 传入的 requestedPage 来自检索结果页码。这里先限制到 PDF
+    // 的有效页数，再更新本地 page；后续渲染 effect 会调用 getPage(page)。
     setPage(Math.max(1, Math.min(requestedPage, document.numPages)));
   }, [document, requestedPage]);
 
@@ -157,6 +167,8 @@ export function PdfViewer({
     let disposed = false;
     setLoading(true);
     clearFloatingSelection();
+    // page 改变后，PDF.js 读取真正的 PDF 第 page 页：先把页面绘制到 canvas，
+    // 再创建透明 text layer，后者负责文本选择、复制和划词功能。
     void document
       .getPage(page)
       .then(async (pdfPage) => {
@@ -444,6 +456,11 @@ export function PdfViewer({
             <ChevronRight size={17} />
           </button>
         </div>
+        {onViewModeChange ? (
+          <DocumentViewToggle value={viewMode} onChange={onViewModeChange} />
+        ) : (
+          <span />
+        )}
         <div className="toolbar-group">
           <button
             className="icon-button"

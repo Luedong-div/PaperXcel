@@ -1,13 +1,21 @@
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { mkdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Tokenizer } from "@huggingface/tokenizers";
 import * as ort from "onnxruntime-node";
+import type { DocumentPageText } from "../shared/contracts";
+import {
+  normalizePdfPageText,
+  reconstructPdfPageText,
+  type PdfLayoutTextItem,
+} from "./pdf-layout";
 import { extractNumberedReferenceCitations } from "./reference-citations";
 
 const MAX_CHUNK_CHARS = 1_600;
 const CHUNK_OVERLAP_CHARS = 180;
+const MAX_EMBEDDING_TOKENS = 512;
 
 interface Chunk {
   chunkId: string;
@@ -35,10 +43,20 @@ interface ExtractResult {
   semantic_ready: boolean;
 }
 
-type PdfTextItem = {
-  str: string;
-  transform: number[];
-};
+interface MarkdownReindexResult {
+  page_count: number;
+  chunk_count: number;
+  semantic_ready: boolean;
+  updated: boolean;
+}
+
+interface IndexSource {
+  kind: "pdf" | "markdown";
+  path: string;
+  digest?: string;
+}
+
+type PdfTextItem = PdfLayoutTextItem;
 
 export class DocumentEngine {
   private tokenizer?: Tokenizer;
@@ -79,8 +97,10 @@ export class DocumentEngine {
   ): Promise<unknown> {
     if (method === "health") return this.health();
     if (method === "extract") return this.extract(params);
+    if (method === "reindex_markdown") return this.reindexMarkdown(params);
     if (method === "search") return this.search(params);
     if (method === "search_library") return this.searchLibrary(params);
+    if (method === "document_text") return this.readDocumentPages(params);
     if (method === "reference_dois") return this.extractReferenceDois(params);
     if (method === "reference_citations")
       return this.extractReferenceCitations(params);
@@ -117,7 +137,8 @@ export class DocumentEngine {
         const items = textContent.items
           .filter((item) => "str" in item && typeof item.str === "string")
           .map((item) => item as PdfTextItem);
-        const pageText = normalizeText(items.map((item) => item.str).join(" "));
+        const viewport = page.getViewport({ scale: 1 });
+        const pageText = reconstructPdfPageText(items, viewport.width);
         if (pageIndex === 0) {
           firstPageText = pageText;
           titleGuess = guessTitle(items, pageText);
@@ -158,7 +179,10 @@ export class DocumentEngine {
         progress: 88,
       });
     }
-    this.writeIndex(join(indexDir, `${paperId}.sqlite3`), chunks, embeddings);
+    this.writeIndex(join(indexDir, `${paperId}.sqlite3`), chunks, embeddings, {
+      kind: "pdf",
+      path: pdfPath,
+    });
     this.sendProgress({
       paper_id: paperId,
       stage: "Document index complete",
@@ -173,6 +197,64 @@ export class DocumentEngine {
       doi_guess: guessDoi(`${doiText}\n${firstPageText}`),
       chunk_count: chunks.length,
       semantic_ready: semanticReady,
+    };
+  }
+
+  private async reindexMarkdown(
+    params: Record<string, unknown>,
+  ): Promise<MarkdownReindexResult> {
+    const paperId = String(params.paper_id ?? "").trim();
+    const markdownPath = String(params.markdown_path ?? "").trim();
+    const indexDir = String(params.index_dir ?? "").trim();
+    if (!paperId) throw new Error("Paper ID is required.");
+    if (!markdownPath || !existsSync(markdownPath)) {
+      throw new Error("Markdown file does not exist.");
+    }
+    if (!indexDir) throw new Error("Index directory is required.");
+    await mkdir(indexDir, { recursive: true });
+
+    // AI 修复后的 full.md 是新的正文来源。先按页面标记还原页码，再沿用
+    // 与 PDF 索引相同的切片和 embedding 流程，最终覆盖该论文原来的 SQLite。
+    const markdown = await readFile(markdownPath, "utf8");
+    const pages = parseMarkdownPages(markdown);
+    const chunks = pages.flatMap((page) =>
+      splitChunks(paperId, page.page, page.text),
+    );
+    if (!chunks.length) {
+      throw new Error("Markdown 文件中没有可索引的文本。请检查 markdown 文件.");
+    }
+
+    const indexPath = join(indexDir, `${paperId}.sqlite3`);
+    // source_digest 用来判断 full.md 是否真的变化，避免每次启动都重新计算向量。
+    const digest = createHash("sha256").update(markdown).digest("hex");
+    const current = readIndexSummary(indexPath);
+    if (
+      !params.force &&
+      current?.sourceKind === "markdown" &&
+      current.sourceDigest === digest
+    ) {
+      return {
+        page_count: current.pageCount,
+        chunk_count: current.chunkCount,
+        semantic_ready: current.semanticReady,
+        updated: false,
+      };
+    }
+
+    const embeddings = await this.embedChunks(chunks);
+    const semanticReady = embeddings.some(
+      (embedding) => embedding !== undefined,
+    );
+    this.writeIndex(indexPath, chunks, embeddings, {
+      kind: "markdown",
+      path: markdownPath,
+      digest,
+    });
+    return {
+      page_count: pages.length,
+      chunk_count: chunks.length,
+      semantic_ready: semanticReady,
+      updated: true,
     };
   }
 
@@ -213,6 +295,8 @@ export class DocumentEngine {
     const perPaperLimit = clampNumber(params.per_paper_limit, 1, 10, 4);
     const query = String(params.query ?? "");
     const hits: SearchHit[] = [];
+    // 全库检索没有创建一个“全库总数据库”。这里逐篇打开
+    // indexes/<paperId>.sqlite3，检索后再把各论文结果汇总。
     for (const paperId of paperIds) {
       const indexPath = join(indexDir, `${paperId}.sqlite3`);
       if (!existsSync(indexPath)) continue;
@@ -234,6 +318,8 @@ export class DocumentEngine {
   ): Promise<SearchHit[]> {
     const database = new DatabaseSync(indexPath, { readOnly: true });
     try {
+      // lexical 使用 SQLite FTS5/BM25；semantic 使用 BGE query embedding
+      // 与 chunks.embedding 做余弦相似度。最后用排名融合得到统一分数。
       const lexical = lexicalSearch(database, query, limit * 3);
       const queryEmbedding = await this.embedText(query);
       const semantic = queryEmbedding
@@ -249,12 +335,19 @@ export class DocumentEngine {
     indexPath: string,
     chunks: Chunk[],
     embeddings: Array<Float32Array | undefined>,
+    source: IndexSource,
   ): void {
     const database = new DatabaseSync(indexPath);
+    let transactionStarted = false;
     try {
+      // 一个事务内删除旧表并写入新表：提交成功后，旧切片、旧 FTS
+      // 和旧向量会同时被 full.md 生成的新数据替换。
+      database.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
       database.exec(`
-        DROP TABLE IF EXISTS chunks;
         DROP TABLE IF EXISTS chunks_fts;
+        DROP TABLE IF EXISTS chunks;
+        DROP TABLE IF EXISTS index_metadata;
         CREATE TABLE chunks (
           chunk_id TEXT PRIMARY KEY,
           page INTEGER NOT NULL,
@@ -268,6 +361,10 @@ export class DocumentEngine {
           text,
           tokenize = 'unicode61 remove_diacritics 2'
         );
+        CREATE TABLE index_metadata (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
       `);
       const insertChunk = database.prepare(
         "INSERT INTO chunks (chunk_id, page, text, bbox_json, embedding) VALUES (?, ?, ?, ?, ?)",
@@ -275,7 +372,9 @@ export class DocumentEngine {
       const insertFts = database.prepare(
         "INSERT INTO chunks_fts (chunk_id, page, text) VALUES (?, ?, ?)",
       );
-      database.exec("BEGIN");
+      const insertMetadata = database.prepare(
+        "INSERT INTO index_metadata (key, value) VALUES (?, ?)",
+      );
       for (const [index, chunk] of chunks.entries()) {
         const embedding = embeddings[index];
         insertChunk.run(
@@ -287,9 +386,33 @@ export class DocumentEngine {
         );
         insertFts.run(chunk.chunkId, chunk.page, chunk.text);
       }
+      const metadata = new Map<string, string>([
+        ["source_kind", source.kind],
+        ["source_path", source.path],
+        ["source_digest", source.digest ?? ""],
+        ["indexed_at", new Date().toISOString()],
+        ["page_count", String(new Set(chunks.map((chunk) => chunk.page)).size)],
+        ["chunk_count", String(chunks.length)],
+        [
+          "semantic_ready",
+          embeddings.some((embedding) => embedding !== undefined)
+            ? "true"
+            : "false",
+        ],
+      ]);
+      for (const [key, value] of metadata) {
+        insertMetadata.run(key, value);
+      }
       database.exec("COMMIT");
+      transactionStarted = false;
     } catch (error) {
-      database.exec("ROLLBACK");
+      if (transactionStarted) {
+        try {
+          database.exec("ROLLBACK");
+        } catch {
+          // Preserve the original indexing error.
+        }
+      }
       throw error;
     } finally {
       database.close();
@@ -342,6 +465,72 @@ export class DocumentEngine {
     }
   }
 
+  private async readDocumentPages(
+    params: Record<string, unknown>,
+  ): Promise<DocumentPageText[]> {
+    const pdfPath =
+      typeof params.pdf_path === "string" ? params.pdf_path.trim() : "";
+    if (pdfPath) {
+      return this.readPdfPages(pdfPath);
+    }
+    const paperId = String(params.paper_id);
+    const indexPath = join(
+      String(params.index_dir ?? ""),
+      `${paperId}.sqlite3`,
+    );
+    if (!existsSync(indexPath)) {
+      throw new Error("Document index has not been created.");
+    }
+    const database = new DatabaseSync(indexPath, { readOnly: true });
+    try {
+      const rows = database
+        .prepare(
+          "SELECT rowid AS position, CAST(page AS INTEGER) AS page, text FROM chunks ORDER BY page, position",
+        )
+        .all() as Array<{ position: number; page: number; text: string }>;
+      const byPage = new Map<number, string>();
+      for (const row of rows) {
+        const current = byPage.get(row.page) ?? "";
+        byPage.set(row.page, mergeChunkText(current, row.text));
+      }
+      return [...byPage.entries()].map(([page, text]) => ({
+        page,
+        text: text.trim(),
+      }));
+    } finally {
+      database.close();
+    }
+  }
+
+  private async readPdfPages(pdfPath: string): Promise<DocumentPageText[]> {
+    if (!existsSync(pdfPath)) throw new Error("PDF file does not exist.");
+    const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    const loadingTask = pdfjs.getDocument({
+      url: pdfPath,
+      standardFontDataUrl: toPdfJsDirectoryUrl(this.standardFontDirectory),
+      wasmUrl: toPdfJsDirectoryUrl(this.wasmDirectory),
+    });
+    const document = await loadingTask.promise;
+    const pages: DocumentPageText[] = [];
+    try {
+      for (let pageIndex = 0; pageIndex < document.numPages; pageIndex += 1) {
+        const page = await document.getPage(pageIndex + 1);
+        const textContent = await page.getTextContent();
+        const items = textContent.items
+          .filter((item) => "str" in item && typeof item.str === "string")
+          .map((item) => item as PdfTextItem);
+        const viewport = page.getViewport({ scale: 1 });
+        pages.push({
+          page: pageIndex + 1,
+          text: reconstructPdfPageText(items, viewport.width).trim(),
+        });
+      }
+    } finally {
+      await loadingTask.destroy();
+    }
+    return pages.filter((page) => page.text);
+  }
+
   private async embedChunks(
     chunks: Chunk[],
   ): Promise<Array<Float32Array | undefined>> {
@@ -357,21 +546,36 @@ export class DocumentEngine {
       const encoding = this.tokenizer.encode(text.slice(0, 8_000), {
         return_token_type_ids: true,
       });
-      const length = encoding.ids.length;
+      const inputIds = encoding.ids.slice(0, MAX_EMBEDDING_TOKENS);
+      const attentionMask = encoding.attention_mask.slice(
+        0,
+        MAX_EMBEDDING_TOKENS,
+      );
+      const tokenTypeIds = encoding.token_type_ids.slice(
+        0,
+        MAX_EMBEDDING_TOKENS,
+      );
+      const length = inputIds.length;
+      if (!length) return undefined;
       const feeds = {
         input_ids: new ort.Tensor(
           "int64",
-          BigInt64Array.from(encoding.ids, BigInt),
+          BigInt64Array.from(inputIds, BigInt),
           [1, length],
         ),
         attention_mask: new ort.Tensor(
           "int64",
-          BigInt64Array.from(encoding.attention_mask, BigInt),
+          BigInt64Array.from(attentionMask, BigInt),
           [1, length],
         ),
         token_type_ids: new ort.Tensor(
           "int64",
-          BigInt64Array.from(encoding.token_type_ids, BigInt),
+          BigInt64Array.from(
+            tokenTypeIds.length === length
+              ? tokenTypeIds
+              : new Array<number>(length).fill(0),
+            BigInt,
+          ),
           [1, length],
         ),
       };
@@ -380,7 +584,7 @@ export class DocumentEngine {
       const embedding = new Float32Array(512);
       let count = 0;
       for (let token = 0; token < length; token += 1) {
-        if (!encoding.attention_mask[token]) continue;
+        if (!attentionMask[token]) continue;
         count += 1;
         const offset = token * 512;
         for (let dimension = 0; dimension < 512; dimension += 1) {
@@ -428,15 +632,99 @@ export class DocumentEngine {
   }
 }
 
+export function parseMarkdownPages(markdown: string): DocumentPageText[] {
+  const normalized = markdown.replace(/\r\n?/g, "\n").trim();
+  if (!normalized) return [];
+
+  // 支持 <!-- page: N -->、## 第 N 页和 ## Page N。
+  // 页标记之前的标题、作者、DOI 等前置信息归入第一页，便于检索元数据。
+  const preamble: string[] = [];
+  const pages = new Map<number, string[]>();
+  let currentPage: number | undefined;
+  for (const line of normalized.split("\n")) {
+    const page = markdownPageNumber(line);
+    if (page !== undefined) {
+      currentPage = page;
+      if (!pages.has(page)) pages.set(page, []);
+      continue;
+    }
+    if (currentPage === undefined) {
+      preamble.push(line);
+    } else {
+      pages.get(currentPage)!.push(line);
+    }
+  }
+
+  if (!pages.size) return [{ page: 1, text: normalized }];
+  const orderedPageNumbers = [...pages.keys()].sort(
+    (left, right) => left - right,
+  );
+  const firstPage = orderedPageNumbers[0];
+  if (preamble.some((line) => line.trim())) {
+    pages.set(firstPage, [...preamble, "", ...(pages.get(firstPage) ?? [])]);
+  }
+  return orderedPageNumbers.flatMap((page) => {
+    const text = (pages.get(page) ?? []).join("\n").trim();
+    return text ? [{ page, text }] : [];
+  });
+}
+
+function markdownPageNumber(line: string): number | undefined {
+  const comment = line.match(/^\s*<!--\s*page\s*:\s*(\d+)\s*-->\s*$/i);
+  const chineseHeading = line.match(/^\s{0,3}#{1,6}\s*第\s*(\d+)\s*页\s*$/u);
+  const englishHeading = line.match(/^\s{0,3}#{1,6}\s*page\s*(\d+)\s*$/i);
+  const page = Number(
+    comment?.[1] ?? chineseHeading?.[1] ?? englishHeading?.[1],
+  );
+  return Number.isInteger(page) && page > 0 ? page : undefined;
+}
+
+function readIndexSummary(indexPath: string):
+  | {
+      sourceKind?: string;
+      sourceDigest?: string;
+      pageCount: number;
+      chunkCount: number;
+      semanticReady: boolean;
+    }
+  | undefined {
+  if (!existsSync(indexPath)) return undefined;
+  const database = new DatabaseSync(indexPath, { readOnly: true });
+  try {
+    const hasMetadata = database
+      .prepare(
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'index_metadata'",
+      )
+      .get() as { present?: number } | undefined;
+    if (!hasMetadata?.present) return undefined;
+    const metadataRows = database
+      .prepare("SELECT key, value FROM index_metadata")
+      .all() as Array<{ key: string; value: string }>;
+    const metadata = new Map(metadataRows.map((row) => [row.key, row.value]));
+    return {
+      sourceKind: metadata.get("source_kind"),
+      sourceDigest: metadata.get("source_digest"),
+      pageCount: Number(metadata.get("page_count")) || 0,
+      chunkCount: Number(metadata.get("chunk_count")) || 0,
+      semanticReady: metadata.get("semantic_ready") === "true",
+    };
+  } catch {
+    return undefined;
+  } finally {
+    database.close();
+  }
+}
+
 function toPdfJsDirectoryUrl(directory: string): string {
   return `${directory.replaceAll("\\", "/").replace(/\/+$/, "")}/`;
 }
 
 function splitChunks(paperId: string, page: number, text: string): Chunk[] {
-  const clean = normalizeText(text);
+  const clean = normalizePdfPageText(text);
   if (!clean) return [];
   const chunks: Chunk[] = [];
   let remaining = clean;
+  // 相邻切片保留重叠文本，避免查询关键词或语义恰好落在切片边界时丢失上下文。
   while (remaining) {
     const value = remaining.slice(0, MAX_CHUNK_CHARS);
     chunks.push({
@@ -464,6 +752,7 @@ function lexicalSearch(
     .map((token) => `"${token.replace(/"/g, '""')}"`)
     .join(" OR ");
   try {
+    // FTS5 的 bm25 越小越相关，因此取负数后统一为“分数越大越相关”。
     return database
       .prepare(
         `
@@ -487,6 +776,8 @@ function semanticSearch(
       "SELECT chunk_id, CAST(page AS INTEGER) AS page, text, embedding FROM chunks WHERE embedding IS NOT NULL",
     )
     .all() as unknown as Array<SearchHit & { embedding: Uint8Array }>;
+  // embedding 在 SQLite 中以 Float32Array 的原始 BLOB 保存，读取后恢复为
+  // 512 维向量，与当前查询向量计算 cosine similarity。
   return rows
     .map((row) => ({
       chunk_id: row.chunk_id,
@@ -511,6 +802,8 @@ function fuseRankings(
   currentPage?: number,
 ): SearchHit[] {
   const fused = new Map<string, SearchHit>();
+  // Reciprocal Rank Fusion：不直接比较 BM25 与 cosine 的原始数值，
+  // 而是按它们各自的排名累加 1 / (60 + rank)，量纲更稳定。
   for (const ranking of rankings) {
     ranking.forEach((hit, index) => {
       const current = fused.get(hit.chunk_id) ?? { ...hit, score: 0 };
@@ -534,6 +827,7 @@ function diversify(
   perPaperLimit: number,
 ): SearchHit[] {
   const count = new Map<string, number>();
+  // 限制单篇论文最多占据 perPaperLimit 个结果，避免高频词让一篇论文刷满列表。
   return hits
     .sort((left, right) => right.score - left.score)
     .filter((hit) => {
@@ -551,6 +845,17 @@ function normalizeText(value: string): string {
     .replace(/\u00ad/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function mergeChunkText(current: string, next: string): string {
+  if (!current) return next;
+  const maximum = Math.min(400, current.length, next.length);
+  for (let overlap = maximum; overlap >= 20; overlap -= 1) {
+    if (current.endsWith(next.slice(0, overlap))) {
+      return `${current}${next.slice(overlap)}`;
+    }
+  }
+  return `${current}\n${next}`;
 }
 
 function guessTitle(items: PdfTextItem[], text: string): string | undefined {

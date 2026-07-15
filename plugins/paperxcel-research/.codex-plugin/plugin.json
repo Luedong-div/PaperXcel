@@ -1,0 +1,18 @@
+{
+  "name": "paperxcel-research",
+  "version": "0.1.0",
+  "description": "Evidence-driven research workflows and optional domain skills for PaperXcel.",
+  "author": {
+    "name": "PaperXcel"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "PaperXcel Research",
+    "shortDescription": "Evidence-backed literature analysis for PaperXcel.",
+    "longDescription": "Analyze PaperXcel papers and knowledge-base exports with auditable citations, cross-paper synthesis, and optional domain-specific research skills.",
+    "developerName": "PaperXcel",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Use PaperXcel evidence to analyze these papers without inventing unsupported claims."
+  }
+}

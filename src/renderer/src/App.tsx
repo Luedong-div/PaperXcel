@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type ClipboardEvent as ReactClipboardEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
@@ -28,13 +29,13 @@ import {
   CircleAlert,
   Columns3,
   Copy,
+  Database,
   Download,
   Eraser,
   ExternalLink,
   FileSearch,
   FilePlus2,
   FileText,
-  FlaskConical,
   Folder,
   FolderOpen,
   FolderPlus,
@@ -62,7 +63,10 @@ import {
 } from "lucide-react";
 import "katex/dist/katex.min.css";
 import type {
+  ChatAttachment,
   ChatMessage,
+  ChatTask,
+  KnowledgeBaseMarkdownRepairResult,
   LibrarySearchHit,
   LibraryFolder,
   ModelReasoningEffort,
@@ -78,10 +82,13 @@ import { CitationGraphWorkspace } from "./CitationGraphWorkspace";
 import { DoiDialog } from "./DoiDialog";
 import { GlobalSelectionMenu } from "./GlobalSelectionMenu";
 import { LibrarySearchWorkspace } from "./LibrarySearchWorkspace";
-import { PdfViewer, type PdfTextSelection } from "./PdfViewer";
+import { KnowledgeWorkspace } from "./KnowledgeWorkspace";
+import type { PdfTextSelection } from "./PdfViewer";
+import { PaperReader } from "./PaperReader";
 import { PaperNotes } from "./PaperNotes";
 import { shouldIgnorePdfDragEnter, shouldIgnorePdfDragLeave } from "./pdfDrag";
 import { normalizeMarkdownMath } from "./markdown";
+import { formatProcessingDuration } from "./chatProgress";
 import { AppSettingsDialog } from "./AppSettingsDialog";
 import { SettingsDialog } from "./SettingsDialog";
 import {
@@ -92,7 +99,12 @@ import { detectTranslationDirection } from "../../shared/translation";
 
 type LibraryFilter = "all" | "starred" | "archived";
 type AssistantView = "chat" | "notes";
-type WorkspaceView = "reader" | "search" | "comparison" | "citation";
+type WorkspaceView =
+  | "reader"
+  | "search"
+  | "knowledge"
+  | "comparison"
+  | "citation";
 type AppSettingsSection = "doi" | "zotero" | "openalex" | "translation";
 type ComposerMenuSection = "model" | "reasoning";
 type ResizablePanel = "library" | "assistant";
@@ -107,19 +119,21 @@ type FolderDialog = {
 };
 type AskOptions = {
   history?: ChatMessage[];
+  task?: ChatTask;
+  attachments?: ChatAttachment[];
 };
 
-const prompts = [
+const prompts: Array<{ label: string; prompt: string; task?: ChatTask }> = [
   { label: "核心结论", prompt: "概括本文的研究问题、核心方法和主要结论。" },
   {
-    label: "方法与近似",
+    label: "研究设计",
     prompt:
-      "整理本文采用的理论方法，若涉及计算化学则进一步说明 Hamiltonian、关键近似、基组或泛函及适用条件。",
+      "梳理本文的研究对象、理论框架或研究设计、数据或材料来源、关键假设与评价指标。",
   },
   {
-    label: "计算细节",
+    label: "复现信息",
     prompt:
-      "提取计算体系、软件、收敛标准、赝势、相对论与电子相关处理等可复现信息。",
+      "提取样本或数据、实验或计算条件、软件或仪器、关键参数、统计方法及其他可复现信息。",
   },
   { label: "局限性", prompt: "论文明确陈述或从证据可判断的局限性分别是什么？" },
 ];
@@ -142,8 +156,19 @@ const MAX_ASSISTANT_PANE_WIDTH = 520;
 const MIN_READER_PANE_WIDTH = 480;
 const PAPER_RAIL_VISIBLE_STORAGE_KEY = "paperxcel:library-rail-visible";
 const PAPER_RAIL_WIDTH_STORAGE_KEY = "paperxcel:library-rail-width";
+const CITATION_SIDEBAR_VISIBLE_STORAGE_KEY =
+  "paperxcel:citation-sidebar-visible";
+const COMPARISON_SIDEBAR_VISIBLE_STORAGE_KEY =
+  "paperxcel:comparison-sidebar-visible";
 const ASSISTANT_PANE_VISIBLE_STORAGE_KEY = "paperxcel:assistant-pane-visible";
 const ASSISTANT_PANE_WIDTH_STORAGE_KEY = "paperxcel:assistant-pane-width";
+
+function getAttachmentDisplayName(attachment: ChatAttachment): string {
+  if (attachment.source === "library" && attachment.fileName === "full.md") {
+    return "论文全文文件";
+  }
+  return attachment.fileName;
+}
 
 export default function App(): React.JSX.Element {
   const [papers, setPapers] = useState<Paper[]>([]);
@@ -168,8 +193,17 @@ export default function App(): React.JSX.Element {
   const [composerMenuSection, setComposerMenuSection] =
     useState<ComposerMenuSection>();
   const [assistantView, setAssistantView] = useState<AssistantView>("chat");
+  const [generatingNotePaperIds, setGeneratingNotePaperIds] = useState<
+    Set<string>
+  >(() => new Set());
   const [paperRailVisible, setPaperRailVisible] = useState(() =>
     readStoredBoolean(PAPER_RAIL_VISIBLE_STORAGE_KEY, true),
+  );
+  const [citationSidebarVisible, setCitationSidebarVisible] = useState(() =>
+    readStoredBoolean(CITATION_SIDEBAR_VISIBLE_STORAGE_KEY, true),
+  );
+  const [comparisonSidebarVisible, setComparisonSidebarVisible] = useState(() =>
+    readStoredBoolean(COMPARISON_SIDEBAR_VISIBLE_STORAGE_KEY, true),
   );
   const [paperRailWidth, setPaperRailWidth] = useState(() =>
     readStoredNumber(
@@ -200,6 +234,19 @@ export default function App(): React.JSX.Element {
   const [copiedMessageId, setCopiedMessageId] = useState<string>();
   const [asking, setAsking] = useState(false);
   const [stoppingAsk, setStoppingAsk] = useState(false);
+  const [askProgress, setAskProgress] = useState("");
+  const [askReasoning, setAskReasoning] = useState("");
+  const [askAnswer, setAskAnswer] = useState("");
+  const [askElapsedMs, setAskElapsedMs] = useState(0);
+  const [composerAttachments, setComposerAttachments] = useState<
+    ChatAttachment[]
+  >([]);
+  const [composerTask, setComposerTask] = useState<ChatTask>("qa");
+  const [uploadingAttachmentCount, setUploadingAttachmentCount] = useState(0);
+  const [draggingChatFile, setDraggingChatFile] = useState(false);
+  const [markdownRefreshTokens, setMarkdownRefreshTokens] = useState<
+    Record<string, string>
+  >({});
   const [currentPage, setCurrentPage] = useState(1);
   const [expandedCitation, setExpandedCitation] = useState<string>();
   const [fileUrl, setFileUrl] = useState<string>();
@@ -231,9 +278,13 @@ export default function App(): React.JSX.Element {
   const paperMenuRef = useRef<HTMLDivElement>(null);
   const composerMenuRef = useRef<HTMLDivElement>(null);
   const dragDepthRef = useRef(0);
+  const chatDragDepthRef = useRef(0);
   const copyResetTimerRef = useRef<number | undefined>(undefined);
   const activeAskRequestRef = useRef<string | undefined>(undefined);
+  const activeAskStartedAtRef = useRef<number | undefined>(undefined);
   const cancelledAskRequestIdsRef = useRef<Set<string>>(new Set());
+  const providerRef = useRef(provider);
+  const reasoningEffortRef = useRef(reasoningEffort);
   const pendingPageRef = useRef<{ paperId: string; page: number } | undefined>(
     undefined,
   );
@@ -243,6 +294,8 @@ export default function App(): React.JSX.Element {
     assistantPaneVisible,
     assistantPaneWidth,
   });
+  providerRef.current = provider;
+  reasoningEffortRef.current = reasoningEffort;
 
   panelLayoutRef.current = {
     paperRailVisible,
@@ -255,6 +308,30 @@ export default function App(): React.JSX.Element {
     dragDepthRef.current = 0;
     setDraggingPdf(false);
   }, []);
+  const resetChatDragState = useCallback((): void => {
+    chatDragDepthRef.current = 0;
+    setDraggingChatFile(false);
+  }, []);
+  const resetTransientDragState = useCallback((): void => {
+    resetPdfDragState();
+    resetChatDragState();
+  }, [resetChatDragState, resetPdfDragState]);
+
+  const handleNoteGeneratingChange = useCallback(
+    (paperId: string, generating: boolean): void => {
+      setGeneratingNotePaperIds((current) => {
+        if (current.has(paperId) === generating) return current;
+        const next = new Set(current);
+        if (generating) {
+          next.add(paperId);
+        } else {
+          next.delete(paperId);
+        }
+        return next;
+      });
+    },
+    [],
+  );
 
   const closeComposerMenu = useCallback((): void => {
     setComposerMenuOpen(false);
@@ -516,6 +593,23 @@ export default function App(): React.JSX.Element {
     setEditingMessageId(undefined);
     setEditingMessageText("");
   }, []);
+  const beginAskPresentation = useCallback((detail: string): void => {
+    activeAskStartedAtRef.current = Date.now();
+    setAskProgress(detail);
+    setAskReasoning("");
+    setAskAnswer("");
+    setAskElapsedMs(0);
+  }, []);
+  const updateAskProgress = useCallback((detail: string): void => {
+    setAskProgress(detail);
+  }, []);
+  const resetAskPresentation = useCallback((): void => {
+    activeAskStartedAtRef.current = undefined;
+    setAskProgress("");
+    setAskReasoning("");
+    setAskAnswer("");
+    setAskElapsedMs(0);
+  }, []);
   const stopAsking = useCallback(async (): Promise<void> => {
     const requestId = activeAskRequestRef.current;
     if (!requestId || stoppingAsk) return;
@@ -523,6 +617,7 @@ export default function App(): React.JSX.Element {
     cancelledAskRequestIdsRef.current.add(requestId);
     activeAskRequestRef.current = undefined;
     setAsking(false);
+    resetAskPresentation();
     try {
       await window.paperxcel.chat.cancel(requestId);
     } catch (error) {
@@ -530,7 +625,149 @@ export default function App(): React.JSX.Element {
     } finally {
       setStoppingAsk(false);
     }
-  }, [stoppingAsk]);
+  }, [resetAskPresentation, stoppingAsk]);
+  const cancelMarkdownThroughAssistant = useCallback(
+    async (requestId: string): Promise<boolean> => {
+      cancelledAskRequestIdsRef.current.add(requestId);
+      if (activeAskRequestRef.current === requestId) {
+        activeAskRequestRef.current = undefined;
+        setAsking(false);
+        resetAskPresentation();
+      }
+      try {
+        return await window.paperxcel.chat.cancel(requestId);
+      } catch (error) {
+        setNotice(error instanceof Error ? error.message : String(error));
+        return false;
+      }
+    },
+    [resetAskPresentation],
+  );
+  const repairMarkdownThroughAssistant = useCallback(
+    async (
+      paperId: string,
+      requestId: string,
+    ): Promise<KnowledgeBaseMarkdownRepairResult> => {
+      const activeProvider = providerRef.current;
+      if (!activeProvider?.hasApiKey) {
+        throw new Error("请先配置可用的 AI 模型与 API Key。");
+      }
+      if (activeAskRequestRef.current) {
+        throw new Error("文献助手正在处理其他请求，请稍后再试。");
+      }
+
+      const prompt =
+        "请读取附件中的论文全文文件，按原文结构修复标题、段落、公式、表格与引用格式，并返回完整修复结果。PaperXcel 会在校验后写回当前论文缓存。";
+      let attachment: ChatAttachment | undefined;
+      let userMessage: ChatMessage | undefined;
+      let attachmentPersisted = false;
+
+      activeAskRequestRef.current = requestId;
+      cancelledAskRequestIdsRef.current.delete(requestId);
+      setAssistantView("chat");
+      setAssistantPaneVisible(true);
+      setStoppingAsk(false);
+      setAsking(true);
+      beginAskPresentation("正在准备文件修复");
+
+      try {
+        const baseMessages = await window.paperxcel.chat.list(paperId);
+        if (cancelledAskRequestIdsRef.current.has(requestId)) {
+          return { cancelled: true };
+        }
+
+        attachment = await window.paperxcel.chat.attachPaperMarkdown(paperId);
+        if (cancelledAskRequestIdsRef.current.has(requestId)) {
+          return { cancelled: true };
+        }
+
+        userMessage = {
+          id: crypto.randomUUID(),
+          role: "user",
+          content: prompt,
+          prompt,
+          task: "repair-markdown",
+          attachments: [attachment],
+          createdAt: new Date().toISOString(),
+        };
+        const nextMessages = [...baseMessages, userMessage];
+        await window.paperxcel.chat.append(paperId, userMessage);
+        attachmentPersisted = true;
+        setMessages((current) => ({
+          ...current,
+          [paperId]: nextMessages,
+        }));
+        updateAskProgress("正在将论文全文文件交给文献助手修复");
+
+        const result = await window.paperxcel.chat.ask({
+          requestId,
+          paperId,
+          question: prompt,
+          task: "repair-markdown",
+          attachments: [attachment],
+          reasoningEffort: reasoningEffortRef.current,
+          messages: baseMessages,
+        });
+        if ("cancelled" in result) {
+          return { cancelled: true };
+        }
+        if (cancelledAskRequestIdsRef.current.has(requestId)) {
+          return { cancelled: true };
+        }
+
+        const completeMessages = [...nextMessages, result.message];
+        await window.paperxcel.chat.append(paperId, result.message);
+        setMessages((current) => ({
+          ...current,
+          [paperId]: completeMessages,
+        }));
+        if (!result.markdownPreview) {
+          throw new Error("文献助手未返回可用的文件修复结果。");
+        }
+        setMarkdownRefreshTokens((current) => ({
+          ...current,
+          [paperId]:
+            result.markdownPreview?.repairedAt ?? new Date().toISOString(),
+        }));
+        return result.markdownPreview;
+      } catch (error) {
+        if (cancelledAskRequestIdsRef.current.has(requestId)) {
+          return { cancelled: true };
+        }
+        if (userMessage) {
+          const errorMessage: ChatMessage = {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: `请求失败：${
+              error instanceof Error ? error.message : String(error)
+            }`,
+            createdAt: new Date().toISOString(),
+          };
+          try {
+            await window.paperxcel.chat.append(paperId, errorMessage);
+          } catch {
+            // Preserve the original repair error for the reader.
+          }
+          setMessages((current) => ({
+            ...current,
+            [paperId]: [...(current[paperId] ?? []), errorMessage],
+          }));
+        }
+        throw error;
+      } finally {
+        if (attachment && !attachmentPersisted) {
+          void window.paperxcel.chat.removeAttachment(attachment.id);
+        }
+        cancelledAskRequestIdsRef.current.delete(requestId);
+        if (activeAskRequestRef.current === requestId) {
+          activeAskRequestRef.current = undefined;
+          setAsking(false);
+          resetAskPresentation();
+        }
+      }
+    },
+    [beginAskPresentation, resetAskPresentation, updateAskProgress],
+  );
   useEffect(() => {
     cancelEditingMessage();
   }, [cancelEditingMessage, selectedId]);
@@ -538,6 +775,20 @@ export default function App(): React.JSX.Element {
   useEffect(() => {
     writeStoredBoolean(PAPER_RAIL_VISIBLE_STORAGE_KEY, paperRailVisible);
   }, [paperRailVisible]);
+
+  useEffect(() => {
+    writeStoredBoolean(
+      CITATION_SIDEBAR_VISIBLE_STORAGE_KEY,
+      citationSidebarVisible,
+    );
+  }, [citationSidebarVisible]);
+
+  useEffect(() => {
+    writeStoredBoolean(
+      COMPARISON_SIDEBAR_VISIBLE_STORAGE_KEY,
+      comparisonSidebarVisible,
+    );
+  }, [comparisonSidebarVisible]);
 
   useEffect(() => {
     writeStoredNumber(PAPER_RAIL_WIDTH_STORAGE_KEY, paperRailWidth);
@@ -660,7 +911,6 @@ export default function App(): React.JSX.Element {
   }, [closeComposerMenu, composerMenuOpen]);
 
   useEffect(() => {
-    if (!draggingPdf) return;
     const handleWindowDragLeave = (event: DragEvent): void => {
       const container = document.documentElement;
       if (
@@ -673,18 +923,32 @@ export default function App(): React.JSX.Element {
       ) {
         return;
       }
-      resetPdfDragState();
+      resetTransientDragState();
     };
-    const handleWindowDrop = (): void => {
-      resetPdfDragState();
+    const resetWindowDragState = (): void => resetTransientDragState();
+    const handleVisibilityChange = (): void => {
+      if (document.hidden) resetTransientDragState();
     };
     window.addEventListener("dragleave", handleWindowDragLeave);
-    window.addEventListener("drop", handleWindowDrop);
+    window.addEventListener("drop", resetWindowDragState);
+    window.addEventListener("dragend", resetWindowDragState);
+    window.addEventListener("blur", resetWindowDragState);
+    window.addEventListener("focus", resetWindowDragState);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => {
       window.removeEventListener("dragleave", handleWindowDragLeave);
-      window.removeEventListener("drop", handleWindowDrop);
+      window.removeEventListener("drop", resetWindowDragState);
+      window.removeEventListener("dragend", resetWindowDragState);
+      window.removeEventListener("blur", resetWindowDragState);
+      window.removeEventListener("focus", resetWindowDragState);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [draggingPdf, resetPdfDragState]);
+  }, [resetTransientDragState]);
+
+  useEffect(() => {
+    if (workspaceView === "reader" && paperRailVisible) return;
+    resetPdfDragState();
+  }, [paperRailVisible, resetPdfDragState, workspaceView]);
 
   useEffect(() => {
     if (!resizingPanel) return;
@@ -750,6 +1014,8 @@ export default function App(): React.JSX.Element {
   useEffect(() => {
     const pending = pendingPageRef.current;
     let pendingPage = 1;
+    // 跨论文跳转时，selectedPaper 的切换是异步 React 状态更新。
+    // pendingPageRef 暂存目标页，等新论文真正成为 selectedPaper 后再设置页码。
     if (pending && pending.paperId === selectedPaper?.id) {
       pendingPage = pending.page;
       pendingPageRef.current = undefined;
@@ -771,6 +1037,22 @@ export default function App(): React.JSX.Element {
   }, [selectedPaper?.fileName, selectedPaper?.id]);
 
   useEffect(() => {
+    setComposerAttachments((current) => {
+      if (current.length) {
+        void Promise.all(
+          current.map((attachment) =>
+            window.paperxcel.chat.removeAttachment(attachment.id),
+          ),
+        );
+      }
+      return [];
+    });
+    setComposerTask("qa");
+    setUploadingAttachmentCount(0);
+    resetChatDragState();
+  }, [resetChatDragState, selectedId]);
+
+  useEffect(() => {
     if (!selectedId) return;
     let disposed = false;
     void window.paperxcel.chat
@@ -788,6 +1070,47 @@ export default function App(): React.JSX.Element {
       disposed = true;
     };
   }, [selectedId]);
+
+  useEffect(() => {
+    return window.paperxcel.chat.onProgress((progress) => {
+      if (progress.requestId !== activeAskRequestRef.current) return;
+      updateAskProgress(progress.detail);
+      if (progress.reasoningContent !== undefined) {
+        setAskReasoning(progress.reasoningContent);
+      } else if (progress.reasoningDelta) {
+        setAskReasoning((current) => current + progress.reasoningDelta);
+      }
+      if (progress.answerContent !== undefined) {
+        setAskAnswer(progress.answerContent);
+      } else if (progress.answerDelta) {
+        setAskAnswer((current) => current + progress.answerDelta);
+      }
+    });
+  }, [updateAskProgress]);
+
+  useEffect(
+    () =>
+      window.paperxcel.knowledgeBase.onProgress((progress) => {
+        if (
+          progress.requestId &&
+          progress.requestId === activeAskRequestRef.current
+        ) {
+          updateAskProgress(progress.detail);
+        }
+      }),
+    [updateAskProgress],
+  );
+
+  useEffect(() => {
+    if (!asking) return;
+    const updateElapsed = (): void => {
+      const startedAt = activeAskStartedAtRef.current;
+      if (startedAt !== undefined) setAskElapsedMs(Date.now() - startedAt);
+    };
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 500);
+    return () => window.clearInterval(timer);
+  }, [asking]);
 
   useLayoutEffect(() => {
     pendingInitialChatScrollRef.current = selectedId;
@@ -807,18 +1130,25 @@ export default function App(): React.JSX.Element {
   }, [
     assistantView,
     asking,
+    askAnswer,
+    askProgress,
+    askReasoning,
     chatHistoryLoaded,
     paperMessages.length,
     selectedId,
   ]);
 
+  const libraryScopePapers = useMemo(() => {
+    return papers.filter((paper) => {
+      if (filter === "all") return !paper.archived;
+      if (filter === "starred") return paper.starred && !paper.archived;
+      return Boolean(paper.archived);
+    });
+  }, [filter, papers]);
+
   const visiblePapers = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
-    return papers.filter((paper) => {
-      if (filter === "all" && paper.archived) return false;
-      if (filter === "starred" && !paper.starred) return false;
-      if (filter === "starred" && paper.archived) return false;
-      if (filter === "archived" && !paper.archived) return false;
+    return libraryScopePapers.filter((paper) => {
       if (selectedFolderId && paper.folderId !== selectedFolderId) return false;
       if (!normalized) return true;
       return [
@@ -831,7 +1161,12 @@ export default function App(): React.JSX.Element {
         .filter(Boolean)
         .some((value) => value!.toLocaleLowerCase().includes(normalized));
     });
-  }, [filter, papers, query, selectedFolderId]);
+  }, [libraryScopePapers, query, selectedFolderId]);
+
+  const activePapers = useMemo(
+    () => papers.filter((paper) => !paper.archived),
+    [papers],
+  );
 
   const folderNavigation = useMemo(() => {
     const entries: Array<{ folder: LibraryFolder; depth: number }> = [];
@@ -925,11 +1260,176 @@ export default function App(): React.JSX.Element {
     }
   };
 
-  const isFileDrag = (event: React.DragEvent<HTMLDivElement>): boolean =>
+  const uploadChatFiles = async (files: File[]): Promise<void> => {
+    if (!selectedPaper || selectedPaper.status !== "ready") return;
+    const available = Math.max(0, 6 - composerAttachments.length);
+    const selectedFiles = files
+      .filter((file) => file.size > 0)
+      .slice(0, available);
+    if (!selectedFiles.length) {
+      setNotice(
+        available
+          ? "请选择有效文件。"
+          : "单轮对话最多保留 6 个附件，请先移除已有附件。",
+      );
+      return;
+    }
+    setUploadingAttachmentCount((count) => count + selectedFiles.length);
+    try {
+      for (const file of selectedFiles) {
+        try {
+          const attachment = await window.paperxcel.chat.attachFile(
+            file,
+            selectedPaper.id,
+          );
+          setComposerAttachments((current) => [...current, attachment]);
+        } catch (error) {
+          setNotice(
+            `${file.name} 上传失败：${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        } finally {
+          setUploadingAttachmentCount((count) => Math.max(0, count - 1));
+        }
+      }
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+      setUploadingAttachmentCount(0);
+    }
+  };
+
+  const handleChatPaste = (
+    event: ReactClipboardEvent<HTMLTextAreaElement>,
+  ): void => {
+    const files = Array.from(event.clipboardData.files);
+    if (!files.length) {
+      for (const item of Array.from(event.clipboardData.items)) {
+        if (item.kind !== "file") continue;
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
+    if (!files.length) return;
+    event.preventDefault();
+    void uploadChatFiles(files);
+  };
+
+  const removeComposerAttachment = async (
+    attachment: ChatAttachment,
+  ): Promise<void> => {
+    setComposerAttachments((current) =>
+      current.filter((item) => item.id !== attachment.id),
+    );
+    try {
+      await window.paperxcel.chat.removeAttachment(attachment.id);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const prepareMarkdownPrompt = async (): Promise<void> => {
+    if (
+      !selectedPaper ||
+      selectedPaper.status !== "ready" ||
+      uploadingAttachmentCount
+    ) {
+      return;
+    }
+    const oldAttachments = composerAttachments;
+    setComposerAttachments([]);
+    if (oldAttachments.length) {
+      await Promise.all(
+        oldAttachments.map((attachment) =>
+          window.paperxcel.chat.removeAttachment(attachment.id),
+        ),
+      );
+    }
+    setUploadingAttachmentCount(1);
+    try {
+      const attachment = await window.paperxcel.chat.attachPaperMarkdown(
+        selectedPaper.id,
+      );
+      setComposerAttachments([attachment]);
+      setComposerTask("repair-markdown");
+      setQuestion(
+        "请读取附件中的论文全文文件，修复并返回完整结果，写入当前论文缓存。",
+      );
+      window.requestAnimationFrame(() => questionRef.current?.focus());
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+      setComposerTask("qa");
+    } finally {
+      setUploadingAttachmentCount(0);
+    }
+  };
+
+  const isInsideChatFileDropzone = (
+    event: React.DragEvent<HTMLElement>,
+  ): boolean =>
+    event.target instanceof Element &&
+    Boolean(event.target.closest("[data-chat-file-dropzone]"));
+
+  const handleChatDragEnter = (
+    event: React.DragEvent<HTMLDivElement>,
+  ): void => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (
+      shouldIgnorePdfDragEnter(
+        chatDragDepthRef.current > 0,
+        event,
+        event.currentTarget.getBoundingClientRect(),
+      )
+    ) {
+      return;
+    }
+    chatDragDepthRef.current = 1;
+    setDraggingChatFile(true);
+  };
+
+  const handleChatDragOver = (event: React.DragEvent<HTMLDivElement>): void => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+    setDraggingChatFile(true);
+  };
+
+  const handleChatDragLeave = (
+    event: React.DragEvent<HTMLDivElement>,
+  ): void => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (
+      shouldIgnorePdfDragLeave(
+        event.currentTarget,
+        event.relatedTarget,
+        event,
+        event.currentTarget.getBoundingClientRect(),
+      )
+    ) {
+      return;
+    }
+    resetChatDragState();
+  };
+
+  const handleChatDrop = (event: React.DragEvent<HTMLDivElement>): void => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    resetChatDragState();
+    void uploadChatFiles(Array.from(event.dataTransfer.files));
+  };
+
+  const isFileDrag = (event: React.DragEvent<HTMLElement>): boolean =>
     Array.from(event.dataTransfer?.types ?? []).includes("Files");
 
-  const handleDragEnter = (event: React.DragEvent<HTMLDivElement>): void => {
+  const handleDragEnter = (event: React.DragEvent<HTMLElement>): void => {
     if (!isFileDrag(event)) return;
+    if (isInsideChatFileDropzone(event)) return;
     event.preventDefault();
     if (
       shouldIgnorePdfDragEnter(
@@ -944,8 +1444,9 @@ export default function App(): React.JSX.Element {
     setDraggingPdf(true);
   };
 
-  const handleDragOver = (event: React.DragEvent<HTMLDivElement>): void => {
+  const handleDragOver = (event: React.DragEvent<HTMLElement>): void => {
     if (!isFileDrag(event)) return;
+    if (isInsideChatFileDropzone(event)) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
     if (dragDepthRef.current === 0) {
@@ -954,8 +1455,9 @@ export default function App(): React.JSX.Element {
     }
   };
 
-  const handleDragLeave = (event: React.DragEvent<HTMLDivElement>): void => {
+  const handleDragLeave = (event: React.DragEvent<HTMLElement>): void => {
     if (!isFileDrag(event)) return;
+    if (isInsideChatFileDropzone(event)) return;
     event.preventDefault();
     if (
       shouldIgnorePdfDragLeave(
@@ -970,8 +1472,9 @@ export default function App(): React.JSX.Element {
     resetPdfDragState();
   };
 
-  const handleDrop = (event: React.DragEvent<HTMLDivElement>): void => {
+  const handleDrop = (event: React.DragEvent<HTMLElement>): void => {
     if (!isFileDrag(event)) return;
+    if (isInsideChatFileDropzone(event)) return;
     event.preventDefault();
     resetPdfDragState();
     void importDroppedPdfs(Array.from(event.dataTransfer.files));
@@ -1282,8 +1785,18 @@ export default function App(): React.JSX.Element {
     references: ChatReference[] = paperReferences,
     options?: AskOptions,
   ): Promise<void> => {
-    if (!selectedPaper || !prompt.trim() || asking) return;
+    if (
+      !selectedPaper ||
+      !prompt.trim() ||
+      asking ||
+      uploadingAttachmentCount > 0
+    ) {
+      return;
+    }
     const cleanQuestion = prompt.trim();
+    const task = options?.task ?? (options?.history ? "qa" : composerTask);
+    const attachments =
+      options?.attachments ?? (options?.history ? [] : composerAttachments);
     const cleanReferences = references
       .map((reference) => ({
         page: reference.page,
@@ -1322,6 +1835,8 @@ export default function App(): React.JSX.Element {
         ? `${cleanQuestion}\n\n引用原文：\n${formatReferencesForMessage(cleanReferences)}`
         : cleanQuestion,
       prompt: cleanQuestion,
+      task,
+      attachments: attachments.length ? attachments : undefined,
       selectedText: persistedReferences[0]?.text,
       selectedPage: persistedReferences[0]?.page,
       selectedSnippets: persistedReferences.length
@@ -1334,6 +1849,8 @@ export default function App(): React.JSX.Element {
     const nextMessages = [...baseMessages, userMessage];
     setQuestion("");
     setPaperReferences([]);
+    setComposerAttachments([]);
+    setComposerTask("qa");
     window.getSelection()?.removeAllRanges();
     setMessages((current) => ({
       ...current,
@@ -1342,6 +1859,13 @@ export default function App(): React.JSX.Element {
     activeAskRequestRef.current = requestId;
     setStoppingAsk(false);
     setAsking(true);
+    beginAskPresentation(
+      task === "repair-markdown"
+        ? "正在准备文件修复"
+        : attachments.length
+          ? "正在上传附件给模型"
+          : "正在准备当前论文 PDF",
+    );
     try {
       if (shouldReplaceHistory) {
         await persistConversation(paperId, nextMessages);
@@ -1356,6 +1880,8 @@ export default function App(): React.JSX.Element {
         selectedText: cleanReferences[0]?.text,
         selectedPage: cleanReferences[0]?.page,
         selectedSnippets: persistedReferences,
+        task,
+        attachments,
         reasoningEffort,
         messages: baseMessages,
       });
@@ -1373,6 +1899,15 @@ export default function App(): React.JSX.Element {
         ...current,
         [paperId]: completeMessages,
       }));
+      if (result.markdownPreview) {
+        setMarkdownRefreshTokens((current) => ({
+          ...current,
+          [paperId]:
+            result.markdownPreview?.repairedAt ||
+            result.markdownPreview?.generatedAt ||
+            crypto.randomUUID(),
+        }));
+      }
     } catch (error) {
       if (
         cancelledAskRequestIdsRef.current.has(requestId) ||
@@ -1395,6 +1930,7 @@ export default function App(): React.JSX.Element {
         activeAskRequestRef.current = undefined;
         setStoppingAsk(false);
         setAsking(false);
+        resetAskPresentation();
       }
       cancelledAskRequestIdsRef.current.delete(requestId);
     }
@@ -1466,6 +2002,8 @@ export default function App(): React.JSX.Element {
   const openComparisonCitation = (paperId: string, page: number): void => {
     setWorkspaceView("reader");
     setExpandedCitation(undefined);
+    // 同一篇论文可以直接改 currentPage；跨论文则先记录目标页，
+    // 再切换 selectedId，由上面的 effect 在新论文加载时恢复该页。
     if (selectedId === paperId) {
       setCurrentPage(page);
       return;
@@ -1561,20 +2099,33 @@ export default function App(): React.JSX.Element {
     "--paper-rail-width": `${paperRailWidth}px`,
     "--assistant-pane-width": `${assistantPaneWidth}px`,
   } as CSSProperties;
+  const leftSidebarVisible =
+    workspaceView === "citation"
+      ? citationSidebarVisible
+      : workspaceView === "comparison"
+        ? comparisonSidebarVisible
+        : paperRailVisible;
+  const leftSidebarLabel = leftSidebarVisible ? "隐藏侧边栏" : "显示侧边栏";
 
   return (
     <div
       ref={appShellRef}
       className={`app-shell workspace-${workspaceView} ${
-        draggingPdf ? "dragging-pdf" : ""
-      } ${paperRailVisible ? "" : "paper-rail-collapsed"} ${
-        assistantPaneVisible ? "" : "assistant-pane-collapsed"
+        workspaceView !== "citation" &&
+        workspaceView !== "comparison" &&
+        !paperRailVisible
+          ? "paper-rail-collapsed"
+          : ""
+      } ${assistantPaneVisible ? "" : "assistant-pane-collapsed"} ${
+        workspaceView === "citation" && !citationSidebarVisible
+          ? "citation-sidebar-collapsed"
+          : ""
+      } ${
+        workspaceView === "comparison" && !comparisonSidebarVisible
+          ? "comparison-sidebar-collapsed"
+          : ""
       } ${resizingPanel ? "is-resizing" : ""}`}
       style={appShellStyle}
-      onDragEnter={handleDragEnter}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
     >
       <div className="titlebar-drag">
         <div className="titlebar-brand" aria-label="PaperXcel">
@@ -1583,34 +2134,26 @@ export default function App(): React.JSX.Element {
         </div>
       </div>
       <button
-        className="titlebar-panel-toggle"
-        type="button"
-        title={paperRailVisible ? "隐藏文献栏" : "显示文献栏"}
-        aria-label={paperRailVisible ? "隐藏文献栏" : "显示文献栏"}
-        disabled={workspaceView === "citation"}
-        onClick={() => setPaperRailVisible((current) => !current)}
-      >
-        {paperRailVisible ? (
-          <PanelLeftClose size={17} />
-        ) : (
-          <PanelLeftOpen size={17} />
-        )}
+          className="titlebar-panel-toggle"
+          type="button"
+          title={leftSidebarLabel}
+          aria-label={leftSidebarLabel}
+          onClick={() => {
+            if (workspaceView === "citation") {
+              setCitationSidebarVisible((current) => !current);
+            } else if (workspaceView === "comparison") {
+              setComparisonSidebarVisible((current) => !current);
+            } else {
+              setPaperRailVisible((current) => !current);
+            }
+          }}
+        >
+          {leftSidebarVisible ? (
+            <PanelLeftClose size={17} />
+          ) : (
+            <PanelLeftOpen size={17} />
+          )}
       </button>
-      {(draggingPdf || importingDrop) && (
-        <div className="pdf-drop-overlay" aria-live="polite">
-          <div>
-            {importingDrop ? (
-              <LoaderCircle className="spin" size={28} />
-            ) : (
-              <Upload size={28} />
-            )}
-            <strong>
-              {importingDrop ? "正在导入 PDF" : "松开即可导入 PDF"}
-            </strong>
-            <span>支持一次拖入多篇论文</span>
-          </div>
-        </div>
-      )}
       <aside ref={appSidebarRef} className="app-sidebar">
         <nav className="sidebar-nav" aria-label="主导航">
           <button
@@ -1666,6 +2209,14 @@ export default function App(): React.JSX.Element {
             <FileSearch size={20} />
           </button>
           <button
+            className={workspaceView === "knowledge" ? "active" : ""}
+            type="button"
+            title="知识库"
+            onClick={() => setWorkspaceView("knowledge")}
+          >
+            <Database size={20} />
+          </button>
+          <button
             className={workspaceView === "comparison" ? "active" : ""}
             type="button"
             title="研究矩阵"
@@ -1698,419 +2249,447 @@ export default function App(): React.JSX.Element {
         </button>
       </aside>
 
-      {workspaceView !== "citation" && paperRailVisible && (
-        <>
-          <aside className="paper-rail">
-            <header className="rail-header">
-              <div>
-                <span className="eyebrow">
-                  {selectedFolder
-                    ? "FOLDER"
-                    : filter === "starred"
-                      ? "STARRED"
-                      : filter === "archived"
-                        ? "ARCHIVE"
-                        : "LIBRARY"}
-                </span>
-                <h1>
-                  {selectedFolder
-                    ? selectedFolder.name
-                    : filter === "starred"
-                      ? "星标文献"
-                      : filter === "archived"
-                        ? "已归档文献"
-                        : "文献库"}
-                </h1>
-              </div>
-              <button
-                className="icon-button strong"
-                type="button"
-                title="导入 PDF"
-                onClick={() => void importPdf()}
-              >
-                <Plus size={18} />
-              </button>
-            </header>
-            <div className="rail-actions">
-              <label className="search-field">
-                <Search size={16} />
-                <input
-                  placeholder="搜索标题、作者、DOI 等"
-                  value={query}
-                  onChange={(event) => setQuery(event.target.value)}
-                />
-                {query && (
-                  <button
-                    type="button"
-                    title="清除"
-                    onClick={() => setQuery("")}
-                  >
-                    <X size={14} />
-                  </button>
-                )}
-              </label>
-              <button
-                className="doi-button"
-                type="button"
-                title="通过 DOI 或 arXiv 添加论文"
-                onClick={() => setDoiOpen(true)}
-              >
-                论文
-              </button>
-              <button
-                className="zotero-button"
-                type="button"
-                title="从 Zotero 拉取"
-                onClick={() => {
-                  setAppSettingsSection("zotero");
-                  setAppSettingsOpen(true);
-                }}
-              >
-                <Download size={15} />
-              </button>
-            </div>
-            <section className="folder-navigation" aria-label="文件夹">
-              <div className="folder-navigation-header">
-                <span>文件夹</span>
-                <button
-                  type="button"
-                  title="新建文件夹"
-                  onClick={() => openCreateFolder()}
-                >
-                  <FolderPlus size={15} />
-                </button>
-              </div>
-              <div className="folder-navigation-list">
-                <button
-                  className={`folder-navigation-item ${
-                    !selectedFolderId && filter === "all" ? "active" : ""
-                  }`}
-                  type="button"
-                  onClick={() => {
-                    setFilter("all");
-                    setSelectedFolderId(undefined);
-                    setWorkspaceView("reader");
-                  }}
-                >
-                  <FolderOpen size={15} />
-                  <span>全部文献</span>
-                  <small>
-                    {papers.filter((paper) => !paper.archived).length}
-                  </small>
-                </button>
-                {folderNavigation.map(({ folder, depth }) => (
-                  <div className="folder-navigation-row" key={folder.id}>
-                    <button
-                      className={`folder-navigation-item ${
-                        selectedFolderId === folder.id ? "active" : ""
-                      } ${folderDropTargetId === folder.id ? "drop-target" : ""}`}
-                      type="button"
-                      style={{ paddingLeft: `${10 + depth * 14}px` }}
-                      title={folder.name}
-                      onClick={() => {
-                        setFilter("all");
-                        setSelectedFolderId(folder.id);
-                        setWorkspaceView("reader");
-                      }}
-                      onDragOver={(event) =>
-                        updateFolderDropTarget(event, folder.id)
-                      }
-                      onDragLeave={(event) =>
-                        clearFolderDropTarget(event, folder.id)
-                      }
-                      onDrop={(event) => dropPaperInFolder(event, folder.id)}
-                    >
-                      <Folder size={15} />
-                      <span>{folder.name}</span>
-                      <small>
-                        {
-                          papers.filter(
-                            (paper) =>
-                              !paper.archived && paper.folderId === folder.id,
-                          ).length
-                        }
-                      </small>
-                    </button>
-                    {selectedFolderId === folder.id && (
-                      <span className="folder-navigation-actions">
-                        <button
-                          type="button"
-                          title="重命名文件夹"
-                          onClick={() => openRenameFolder(folder)}
-                        >
-                          <Pencil size={13} />
-                        </button>
-                        <button
-                          type="button"
-                          title="删除文件夹"
-                          onClick={() => void removeFolder(folder)}
-                        >
-                          <Trash2 size={13} />
-                        </button>
-                      </span>
+      {workspaceView !== "citation" &&
+        workspaceView !== "search" &&
+        workspaceView !== "knowledge" &&
+        workspaceView !== "comparison" &&
+        paperRailVisible && (
+          <>
+            <aside
+              className={`paper-rail${draggingPdf ? " dragging-pdf" : ""}`}
+              onDragEnter={handleDragEnter}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+            >
+              {(draggingPdf || importingDrop) && (
+                <div className="pdf-drop-overlay" aria-live="polite">
+                  <div>
+                    {importingDrop ? (
+                      <LoaderCircle className="spin" size={28} />
+                    ) : (
+                      <Upload size={28} />
                     )}
+                    <strong>
+                      {importingDrop ? "正在导入 PDF" : "松开即可导入 PDF"}
+                    </strong>
+                    <span>支持一次拖入多篇论文</span>
                   </div>
-                ))}
-              </div>
-            </section>
-            <div className="paper-list">
-              {visiblePapers.length === 0 && (
-                <div className="rail-empty">
-                  <FileText size={24} />
-                  <strong>
-                    {papers.length
-                      ? selectedFolder
-                        ? "文件夹中暂无文献"
-                        : "没有匹配结果"
-                      : "尚无文献"}
-                  </strong>
-                  {!papers.length && (
-                    <button
-                      className="secondary-button"
-                      type="button"
-                      onClick={() => void importPdf()}
-                    >
-                      <Upload size={16} />
-                      导入 PDF
-                    </button>
-                  )}
                 </div>
               )}
-              {visiblePapers.map((paper) => (
+              <header className="rail-header">
+                <div>
+                  <span className="eyebrow">
+                    {selectedFolder
+                      ? "FOLDER"
+                      : filter === "starred"
+                        ? "STARRED"
+                        : filter === "archived"
+                          ? "ARCHIVE"
+                          : "LIBRARY"}
+                  </span>
+                  <h1>
+                    {selectedFolder
+                      ? selectedFolder.name
+                      : filter === "starred"
+                        ? "星标文献"
+                        : filter === "archived"
+                          ? "已归档文献"
+                          : "文献库"}
+                  </h1>
+                </div>
                 <button
-                  className={`paper-row ${paper.id === selectedId ? "selected" : ""} ${
-                    paperActionMenu?.paperId === paper.id ? "menu-open" : ""
-                  } ${draggedPaperId === paper.id ? "dragging" : ""} ${
-                    paperDropTarget?.paperId === paper.id
-                      ? `drop-${paperDropTarget.placement}`
-                      : ""
-                  }`}
+                  className="icon-button strong"
                   type="button"
-                  draggable
-                  key={paper.id}
-                  onClick={() => {
-                    closePaperActionMenu();
-                    setSelectedId(paper.id);
-                    setWorkspaceView("reader");
-                  }}
-                  onContextMenu={(event) => openPaperActionMenu(event, paper)}
-                  onDragStart={(event) => startPaperDrag(event, paper)}
-                  onDragOver={(event) => updatePaperDropTarget(event, paper)}
-                  onDragLeave={(event) => {
-                    const relatedTarget = event.relatedTarget;
-                    if (
-                      relatedTarget instanceof Node &&
-                      event.currentTarget.contains(relatedTarget)
-                    ) {
-                      return;
-                    }
-                    setPaperDropTarget((current) =>
-                      current?.paperId === paper.id ? undefined : current,
-                    );
-                  }}
-                  onDrop={(event) => dropPaper(event, paper)}
-                  onDragEnd={resetPaperDragState}
+                  title="导入 PDF"
+                  onClick={() => void importPdf()}
                 >
-                  <span className="paper-row-top">
-                    <span className={`status-marker status-${paper.status}`} />
-                    <strong>{paper.title}</strong>
-                    {paper.starred && <Star size={14} fill="currentColor" />}
-                  </span>
-                  <span className="paper-authors">
-                    {paper.authors.length
-                      ? paper.authors.slice(0, 3).join(", ")
-                      : "作者待补全"}
-                  </span>
-                  <span className="paper-meta">
-                    <span>{paper.year ?? "年份未知"}</span>
-                    <span>
-                      {paper.pageCount
-                        ? `${paper.pageCount} 页`
-                        : statusLabel(paper)}
-                    </span>
-                  </span>
-                  {paper.status === "processing" && (
-                    <span className="mini-progress">
-                      <span style={{ width: `${paper.progress}%` }} />
-                    </span>
-                  )}
+                  <Plus size={18} />
                 </button>
-              ))}
-            </div>
-            {paperActionMenu && paperActionTarget && (
-              <div
-                className="paper-action-menu"
-                ref={paperMenuRef}
-                role="menu"
-                style={{ left: paperActionMenu.x, top: paperActionMenu.y }}
-              >
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => void toggleStar(paperActionTarget)}
-                >
-                  <Star
-                    size={15}
-                    fill={paperActionTarget.starred ? "currentColor" : "none"}
+              </header>
+              <div className="rail-actions">
+                <label className="search-field">
+                  <Search size={16} />
+                  <input
+                    placeholder="搜索标题、作者、DOI 等"
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
                   />
-                  {paperActionTarget.starred ? "取消星标" : "添加星标"}
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() =>
-                    void setPaperArchived(
-                      paperActionTarget,
-                      !paperActionTarget.archived,
-                    )
-                  }
-                >
-                  {paperActionTarget.archived ? (
-                    <ArchiveRestore size={15} />
-                  ) : (
-                    <Archive size={15} />
-                  )}
-                  {paperActionTarget.archived ? "取消归档" : "归档论文"}
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  aria-expanded={folderMoveMenuOpen}
-                  onClick={() => setFolderMoveMenuOpen((current) => !current)}
-                >
-                  <Folder size={15} />
-                  移动至文件夹
-                </button>
-                {folderMoveMenuOpen && (
-                  <div className="paper-action-folder-picker" role="menu">
+                  {query && (
                     <button
-                      className={!paperActionTarget.folderId ? "selected" : ""}
                       type="button"
-                      role="menuitemradio"
-                      aria-checked={!paperActionTarget.folderId}
-                      onClick={() => void movePaperToFolder(paperActionTarget)}
+                      title="清除"
+                      onClick={() => setQuery("")}
                     >
-                      <FolderOpen size={14} />
-                      未分类
+                      <X size={14} />
                     </button>
-                    {folderNavigation.map(({ folder, depth }) => (
+                  )}
+                </label>
+                <button
+                  className="doi-button"
+                  type="button"
+                  title="通过 DOI 或 arXiv 添加论文"
+                  onClick={() => setDoiOpen(true)}
+                >
+                  论文
+                </button>
+                <button
+                  className="zotero-button"
+                  type="button"
+                  title="从 Zotero 拉取"
+                  onClick={() => {
+                    setAppSettingsSection("zotero");
+                    setAppSettingsOpen(true);
+                  }}
+                >
+                  <Download size={15} />
+                </button>
+              </div>
+              <section className="folder-navigation" aria-label="文件夹">
+                <div className="folder-navigation-header">
+                  <span>文件夹</span>
+                  <button
+                    type="button"
+                    title="新建文件夹"
+                    onClick={() => openCreateFolder()}
+                  >
+                    <FolderPlus size={15} />
+                  </button>
+                </div>
+                <div className="folder-navigation-list">
+                  <button
+                    className={`folder-navigation-item ${
+                      !selectedFolderId ? "active" : ""
+                    }`}
+                    type="button"
+                    onClick={() => {
+                      setSelectedFolderId(undefined);
+                      setWorkspaceView("reader");
+                    }}
+                  >
+                    <FolderOpen size={15} />
+                    <span>全部文献</span>
+                    <small>{libraryScopePapers.length}</small>
+                  </button>
+                  {folderNavigation.map(({ folder, depth }) => (
+                    <div className="folder-navigation-row" key={folder.id}>
+                      <button
+                        className={`folder-navigation-item ${
+                          selectedFolderId === folder.id ? "active" : ""
+                        } ${folderDropTargetId === folder.id ? "drop-target" : ""}`}
+                        type="button"
+                        style={{ paddingLeft: `${10 + depth * 14}px` }}
+                        title={folder.name}
+                        onClick={() => {
+                          setSelectedFolderId(folder.id);
+                          setWorkspaceView("reader");
+                        }}
+                        onDragOver={(event) =>
+                          updateFolderDropTarget(event, folder.id)
+                        }
+                        onDragLeave={(event) =>
+                          clearFolderDropTarget(event, folder.id)
+                        }
+                        onDrop={(event) => dropPaperInFolder(event, folder.id)}
+                      >
+                        <Folder size={15} />
+                        <span>{folder.name}</span>
+                        <small>
+                          {
+                            libraryScopePapers.filter(
+                              (paper) => paper.folderId === folder.id,
+                            ).length
+                          }
+                        </small>
+                      </button>
+                      {selectedFolderId === folder.id && (
+                        <span className="folder-navigation-actions">
+                          <button
+                            type="button"
+                            title="重命名文件夹"
+                            onClick={() => openRenameFolder(folder)}
+                          >
+                            <Pencil size={13} />
+                          </button>
+                          <button
+                            type="button"
+                            title="删除文件夹"
+                            onClick={() => void removeFolder(folder)}
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </section>
+              <div className="paper-list">
+                {visiblePapers.length === 0 && (
+                  <div className="rail-empty">
+                    <FileText size={24} />
+                    <strong>
+                      {papers.length
+                        ? selectedFolder
+                          ? "文件夹中暂无文献"
+                          : "没有匹配结果"
+                        : "尚无文献"}
+                    </strong>
+                    {!papers.length && (
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        onClick={() => void importPdf()}
+                      >
+                        <Upload size={16} />
+                        导入 PDF
+                      </button>
+                    )}
+                  </div>
+                )}
+                {visiblePapers.map((paper) => (
+                  <button
+                    className={`paper-row ${paper.id === selectedId ? "selected" : ""} ${
+                      paperActionMenu?.paperId === paper.id ? "menu-open" : ""
+                    } ${draggedPaperId === paper.id ? "dragging" : ""} ${
+                      paperDropTarget?.paperId === paper.id
+                        ? `drop-${paperDropTarget.placement}`
+                        : ""
+                    }`}
+                    type="button"
+                    draggable
+                    key={paper.id}
+                    onClick={() => {
+                      closePaperActionMenu();
+                      setSelectedId(paper.id);
+                      setWorkspaceView("reader");
+                    }}
+                    onContextMenu={(event) => openPaperActionMenu(event, paper)}
+                    onDragStart={(event) => startPaperDrag(event, paper)}
+                    onDragOver={(event) => updatePaperDropTarget(event, paper)}
+                    onDragLeave={(event) => {
+                      const relatedTarget = event.relatedTarget;
+                      if (
+                        relatedTarget instanceof Node &&
+                        event.currentTarget.contains(relatedTarget)
+                      ) {
+                        return;
+                      }
+                      setPaperDropTarget((current) =>
+                        current?.paperId === paper.id ? undefined : current,
+                      );
+                    }}
+                    onDrop={(event) => dropPaper(event, paper)}
+                    onDragEnd={resetPaperDragState}
+                  >
+                    <span className="paper-row-top">
+                      <span
+                        className={`status-marker status-${paper.status}`}
+                      />
+                      <strong>{paper.title}</strong>
+                      {paper.starred && <Star size={14} fill="currentColor" />}
+                    </span>
+                    <span className="paper-authors">
+                      {paper.authors.length
+                        ? paper.authors.slice(0, 3).join(", ")
+                        : "作者待补全"}
+                    </span>
+                    <span className="paper-meta">
+                      <span>{paper.year ?? "年份未知"}</span>
+                      <span>
+                        {paper.pageCount
+                          ? `${paper.pageCount} 页`
+                          : statusLabel(paper)}
+                      </span>
+                    </span>
+                    {paper.status === "processing" && (
+                      <span className="mini-progress">
+                        <span style={{ width: `${paper.progress}%` }} />
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+              {paperActionMenu && paperActionTarget && (
+                <div
+                  className="paper-action-menu"
+                  ref={paperMenuRef}
+                  role="menu"
+                  style={{ left: paperActionMenu.x, top: paperActionMenu.y }}
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => void toggleStar(paperActionTarget)}
+                  >
+                    <Star
+                      size={15}
+                      fill={paperActionTarget.starred ? "currentColor" : "none"}
+                    />
+                    {paperActionTarget.starred ? "取消星标" : "添加星标"}
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() =>
+                      void setPaperArchived(
+                        paperActionTarget,
+                        !paperActionTarget.archived,
+                      )
+                    }
+                  >
+                    {paperActionTarget.archived ? (
+                      <ArchiveRestore size={15} />
+                    ) : (
+                      <Archive size={15} />
+                    )}
+                    {paperActionTarget.archived ? "取消归档" : "归档论文"}
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    aria-expanded={folderMoveMenuOpen}
+                    onClick={() => setFolderMoveMenuOpen((current) => !current)}
+                  >
+                    <Folder size={15} />
+                    移动至文件夹
+                  </button>
+                  {folderMoveMenuOpen && (
+                    <div className="paper-action-folder-picker" role="menu">
                       <button
                         className={
-                          paperActionTarget.folderId === folder.id
-                            ? "selected"
-                            : ""
+                          !paperActionTarget.folderId ? "selected" : ""
                         }
                         type="button"
                         role="menuitemradio"
-                        aria-checked={paperActionTarget.folderId === folder.id}
-                        key={folder.id}
-                        style={{ paddingLeft: `${9 + depth * 12}px` }}
+                        aria-checked={!paperActionTarget.folderId}
                         onClick={() =>
-                          void movePaperToFolder(paperActionTarget, folder.id)
+                          void movePaperToFolder(paperActionTarget)
                         }
                       >
-                        <Folder size={14} />
-                        {folder.name}
+                        <FolderOpen size={14} />
+                        未分类
                       </button>
-                    ))}
+                      {folderNavigation.map(({ folder, depth }) => (
+                        <button
+                          className={
+                            paperActionTarget.folderId === folder.id
+                              ? "selected"
+                              : ""
+                          }
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={
+                            paperActionTarget.folderId === folder.id
+                          }
+                          key={folder.id}
+                          style={{ paddingLeft: `${9 + depth * 12}px` }}
+                          onClick={() =>
+                            void movePaperToFolder(paperActionTarget, folder.id)
+                          }
+                        >
+                          <Folder size={14} />
+                          {folder.name}
+                        </button>
+                      ))}
+                      <button
+                        className="paper-action-new-folder"
+                        type="button"
+                        role="menuitem"
+                        onClick={() => openCreateFolder(paperActionTarget.id)}
+                      >
+                        <FolderPlus size={14} />
+                        新建文件夹
+                      </button>
+                    </div>
+                  )}
+                  {paperActionTarget.sourceUrl && (
                     <button
-                      className="paper-action-new-folder"
                       type="button"
                       role="menuitem"
-                      onClick={() => openCreateFolder(paperActionTarget.id)}
+                      onClick={() => {
+                        closePaperActionMenu();
+                        void window.paperxcel.papers.openSource(
+                          paperActionTarget.id,
+                        );
+                      }}
                     >
-                      <FolderPlus size={14} />
-                      新建文件夹
+                      <ExternalLink size={15} />
+                      打开来源
                     </button>
-                  </div>
-                )}
-                {paperActionTarget.sourceUrl && (
+                  )}
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => void reprocessPaper(paperActionTarget)}
+                  >
+                    <RefreshCw size={15} />
+                    重新解析信息与索引
+                  </button>
                   <button
                     type="button"
                     role="menuitem"
                     onClick={() => {
                       closePaperActionMenu();
-                      void window.paperxcel.papers.openSource(
+                      void importPdf(paperActionTarget.id);
+                    }}
+                  >
+                    <Upload size={15} />
+                    替换 PDF
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      closePaperActionMenu();
+                      void window.paperxcel.papers.showInFolder(
                         paperActionTarget.id,
                       );
                     }}
                   >
-                    <ExternalLink size={15} />
-                    打开来源
+                    <FolderOpen size={15} />
+                    在资源管理器中显示
                   </button>
-                )}
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => void reprocessPaper(paperActionTarget)}
-                >
-                  <RefreshCw size={15} />
-                  重新解析信息与索引
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    closePaperActionMenu();
-                    void importPdf(paperActionTarget.id);
-                  }}
-                >
-                  <Upload size={15} />
-                  替换 PDF
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    closePaperActionMenu();
-                    void window.paperxcel.papers.showInFolder(
-                      paperActionTarget.id,
-                    );
-                  }}
-                >
-                  <FolderOpen size={15} />
-                  在资源管理器中显示
-                </button>
-                {paperActionTarget.doi && (
+                  {paperActionTarget.doi && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        closePaperActionMenu();
+                        void copyDoi(paperActionTarget.doi!);
+                      }}
+                    >
+                      <Copy size={15} />
+                      复制 DOI
+                    </button>
+                  )}
+                  <span className="paper-action-divider" />
                   <button
+                    className="paper-action-danger"
                     type="button"
                     role="menuitem"
-                    onClick={() => {
-                      closePaperActionMenu();
-                      void copyDoi(paperActionTarget.doi!);
-                    }}
+                    onClick={() => void removePaper(paperActionTarget)}
                   >
-                    <Copy size={15} />
-                    复制 DOI
+                    <Trash2 size={15} />
+                    删除论文
                   </button>
-                )}
-                <span className="paper-action-divider" />
-                <button
-                  className="paper-action-danger"
-                  type="button"
-                  role="menuitem"
-                  onClick={() => void removePaper(paperActionTarget)}
-                >
-                  <Trash2 size={15} />
-                  删除论文
-                </button>
-              </div>
-            )}
-          </aside>
-          <div
-            className="panel-resize-handle paper-rail-resize-handle"
-            role="separator"
-            aria-label="调整文献栏宽度"
-            aria-orientation="vertical"
-            aria-valuemin={MIN_PAPER_RAIL_WIDTH}
-            aria-valuemax={MAX_PAPER_RAIL_WIDTH}
-            aria-valuenow={paperRailWidth}
-            tabIndex={0}
-            onPointerDown={(event) => startPanelResize("library", event)}
-            onKeyDown={(event) => resizePanelWithKeyboard("library", event)}
-          />
-        </>
-      )}
+                </div>
+              )}
+            </aside>
+            <div
+              className="panel-resize-handle paper-rail-resize-handle"
+              role="separator"
+              aria-label="调整文献栏宽度"
+              aria-orientation="vertical"
+              aria-valuemin={MIN_PAPER_RAIL_WIDTH}
+              aria-valuemax={MAX_PAPER_RAIL_WIDTH}
+              aria-valuenow={paperRailWidth}
+              tabIndex={0}
+              onPointerDown={(event) => startPanelResize("library", event)}
+              onKeyDown={(event) => resizePanelWithKeyboard("library", event)}
+            />
+          </>
+        )}
 
       <main className="workspace">
         {citationWorkspaceMounted && (
@@ -2121,7 +2700,7 @@ export default function App(): React.JSX.Element {
             aria-hidden={workspaceView !== "citation"}
           >
             <CitationGraphWorkspace
-              papers={papers}
+              papers={activePapers}
               folders={folders}
               onOpenPaper={openGraphPaper}
               onPaperImported={(paper) =>
@@ -2141,17 +2720,30 @@ export default function App(): React.JSX.Element {
         {workspaceView === "citation" ? null : workspaceView === "search" ? (
           <LibrarySearchWorkspace
             papers={papers}
+            provider={provider}
+            models={selectableModels}
             query={librarySearchQuery}
             results={librarySearchResults}
             searching={librarySearching}
             searched={librarySearched}
+            reasoningEffort={reasoningEffort}
+            onModelChange={changeProviderModel}
+            onReasoningChange={setReasoningEffort}
             onQueryChange={setLibrarySearchQuery}
             onSearch={(nextQuery) => void searchLibrary(nextQuery)}
             onOpenHit={openComparisonCitation}
+            onError={setNotice}
+          />
+        ) : workspaceView === "knowledge" ? (
+          <KnowledgeWorkspace
+            papers={activePapers}
+            provider={provider}
+            onError={setNotice}
+            onNotice={setNotice}
           />
         ) : workspaceView === "comparison" ? (
           <ComparisonWorkspace
-            papers={papers}
+            papers={activePapers}
             provider={provider}
             onOpenCitation={openComparisonCitation}
             onError={setNotice}
@@ -2159,7 +2751,7 @@ export default function App(): React.JSX.Element {
         ) : !selectedPaper ? (
           <section className="workspace-empty">
             <div className="empty-symbol">
-              <FlaskConical size={28} />
+              <BookOpen size={28} />
             </div>
             <h2>PaperXcel</h2>
             <div className="empty-actions">
@@ -2280,12 +2872,18 @@ export default function App(): React.JSX.Element {
                   </div>
                 )}
                 {selectedPaper.status === "ready" && fileUrl && (
-                  <PdfViewer
+                  <PaperReader
                     key={selectedPaper.id}
+                    paper={selectedPaper}
                     url={fileUrl}
                     page={currentPage}
                     onPageChange={setCurrentPage}
                     onReferenceSelection={addPaperReference}
+                    provider={provider}
+                    refreshToken={markdownRefreshTokens[selectedPaper.id]}
+                    onNotice={(message) => setNotice(message)}
+                    onRepairMarkdown={repairMarkdownThroughAssistant}
+                    onCancelRepair={cancelMarkdownThroughAssistant}
                     onTranslateSelection={(selection) => {
                       if (!selection.imageOnly) {
                         void translateSelectedText(selection.text);
@@ -2314,7 +2912,10 @@ export default function App(): React.JSX.Element {
                 />
               )}
               {assistantPaneVisible && (
-                <aside className="ai-pane">
+                <aside
+                  className="ai-pane"
+                  onPointerDownCapture={resetTransientDragState}
+                >
                   <header className="ai-header">
                     <div className="ai-title">
                       <span className="ai-icon">
@@ -2382,567 +2983,682 @@ export default function App(): React.JSX.Element {
                       aria-selected={assistantView === "notes"}
                       onClick={() => setAssistantView("notes")}
                     >
-                      <NotebookPen size={14} />
+                      {generatingNotePaperIds.has(selectedPaper.id) ? (
+                        <LoaderCircle className="spin" size={14} />
+                      ) : (
+                        <NotebookPen size={14} />
+                      )}
                       笔记
                     </button>
                   </div>
-                  {assistantView === "chat" ? (
-                    <>
-                      <div className="chat-scroll" ref={chatScrollRef}>
-                        {!paperMessages.length && (
-                          <div className="chat-start">
-                            <div className="chat-start-heading">
-                              <Bot size={21} />
-                              <span>第 {currentPage} 页</span>
-                            </div>
-                            <div className="prompt-grid">
-                              {prompts.map((item) => (
-                                <button
-                                  type="button"
-                                  key={item.label}
-                                  disabled={selectedPaper.status !== "ready"}
-                                  onClick={() => void ask(item.prompt)}
-                                >
-                                  {item.label}
-                                </button>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                        {paperMessages.map((message, messageIndex) => {
-                          const evidence = message.citations?.find(
-                            (citation) =>
-                              expandedCitation ===
-                              `${message.id}-${citation.page}`,
-                          );
-                          const canEditMessage = message.role === "user";
-                          const isEditing =
-                            canEditMessage && editingMessageId === message.id;
-                          return (
-                            <article
-                              className={`message message-${message.role}`}
-                              key={message.id}
-                            >
-                              <div className="message-label">
-                                {message.role === "user" ? (
-                                  <>
-                                    <MessageSquareText size={14} /> 你
-                                  </>
-                                ) : (
-                                  <>
-                                    <Sparkles size={14} /> PaperXcel
-                                  </>
-                                )}
-                              </div>
-                              {isEditing ? (
-                                <div className="message-edit-panel">
-                                  <textarea
-                                    className="message-edit-textarea"
-                                    rows={3}
-                                    value={editingMessageText}
-                                    placeholder="修改这轮提问"
-                                    disabled={asking}
-                                    onChange={(event) =>
-                                      setEditingMessageText(event.target.value)
-                                    }
-                                    onKeyDown={(event) => {
-                                      if (
-                                        event.key === "Enter" &&
-                                        !event.shiftKey
-                                      ) {
-                                        event.preventDefault();
-                                        void submitMessageEdit(
-                                          message,
-                                          messageIndex,
-                                        );
-                                      }
-                                      if (event.key === "Escape") {
-                                        event.preventDefault();
-                                        cancelEditingMessage();
-                                      }
-                                    }}
-                                  />
-                                  {paperReferences.length > 0 && (
-                                    <div
-                                      className="message-edit-references"
-                                      aria-label="正在编辑的引用"
-                                    >
-                                      {paperReferences.map((reference) => (
-                                        <div
-                                          className="message-edit-reference"
-                                          key={reference.id}
-                                        >
-                                          {referenceImageUrl(reference) ? (
-                                            <img
-                                              src={referenceImageUrl(reference)}
-                                              alt=""
-                                            />
-                                          ) : (
-                                            <Quote size={14} />
-                                          )}
-                                          <span>
-                                            <strong>p.{reference.page}</strong>
-                                            {reference.imageOnly
-                                              ? " 图片选区"
-                                              : ` ${reference.text}`}
-                                          </span>
-                                        </div>
-                                      ))}
-                                    </div>
-                                  )}
-                                  <div className="message-edit-actions">
-                                    <button
-                                      className="message-edit-cancel"
-                                      type="button"
-                                      disabled={asking}
-                                      onClick={cancelEditingMessage}
-                                    >
-                                      取消
-                                    </button>
-                                    <button
-                                      className="message-edit-submit"
-                                      type="button"
-                                      disabled={
-                                        asking || !editingMessageText.trim()
-                                      }
-                                      onClick={() =>
-                                        void submitMessageEdit(
-                                          message,
-                                          messageIndex,
-                                        )
-                                      }
-                                    >
-                                      发送
-                                    </button>
-                                  </div>
-                                </div>
-                              ) : (
-                                <>
-                                  <div className="message-content">
-                                    {message.role === "assistant" ? (
-                                      <MarkdownMessage
-                                        content={message.content}
-                                      />
-                                    ) : (
-                                      <>
-                                        <div className="message-user-prompt">
-                                          {extractPromptFromMessage(message)}
-                                        </div>
-                                        {extractReferencesFromMessage(message)
-                                          .length > 0 && (
-                                          <div
-                                            className="message-user-references"
-                                            aria-label="已发送的引用"
-                                          >
-                                            {extractReferencesFromMessage(
-                                              message,
-                                            ).map(
-                                              (reference, referenceIndex) => (
-                                                <button
-                                                  className="message-user-reference"
-                                                  type="button"
-                                                  key={`${message.id}-${referenceIndex}`}
-                                                  title={`查看第 ${reference.page} 页引用`}
-                                                  onClick={() =>
-                                                    setCurrentPage(
-                                                      reference.page,
-                                                    )
-                                                  }
-                                                >
-                                                  {referenceImageUrl(
-                                                    reference,
-                                                  ) ? (
-                                                    <img
-                                                      src={referenceImageUrl(
-                                                        reference,
-                                                      )}
-                                                      alt={`第 ${reference.page} 页图片选区`}
-                                                    />
-                                                  ) : (
-                                                    <Quote size={14} />
-                                                  )}
-                                                  <span>
-                                                    p.{reference.page} ·{" "}
-                                                    {reference.imageOnly
-                                                      ? "图片选区"
-                                                      : reference.text}
-                                                  </span>
-                                                </button>
-                                              ),
-                                            )}
-                                          </div>
-                                        )}
-                                      </>
-                                    )}
-                                  </div>
-                                  <div
-                                    className="message-actions"
-                                    aria-label="消息操作"
-                                  >
-                                    <span className="message-time">
-                                      {formatMessageTime(message.createdAt)}
-                                    </span>
-                                    <button
-                                      className={`message-action-button ${
-                                        copiedMessageId === message.id
-                                          ? "copied"
-                                          : ""
-                                      }`}
-                                      type="button"
-                                      title={
-                                        copiedMessageId === message.id
-                                          ? "已复制"
-                                          : "复制"
-                                      }
-                                      onClick={() => void copyMessage(message)}
-                                    >
-                                      {copiedMessageId === message.id ? (
-                                        <Check size={14} />
-                                      ) : (
-                                        <Copy size={14} />
-                                      )}
-                                    </button>
-                                    {canEditMessage && (
-                                      <button
-                                        className="message-action-button"
-                                        type="button"
-                                        title="编辑"
-                                        disabled={asking}
-                                        onClick={() =>
-                                          startEditingMessage(message)
-                                        }
-                                      >
-                                        <Pencil size={14} />
-                                      </button>
-                                    )}
-                                  </div>
-                                </>
-                              )}
-                              {!isEditing &&
-                                message.citations &&
-                                message.citations.length > 0 && (
-                                  <div className="citation-list">
-                                    {message.citations.map((citation) => {
-                                      const citationId = `${message.id}-${citation.page}`;
-                                      return (
-                                        <button
-                                          className={
-                                            expandedCitation === citationId
-                                              ? "active"
-                                              : ""
-                                          }
-                                          type="button"
-                                          key={citationId}
-                                          title={`跳转至第 ${citation.page} 页并查看证据`}
-                                          aria-expanded={
-                                            expandedCitation === citationId
-                                          }
-                                          onClick={() => {
-                                            setCurrentPage(citation.page);
-                                            setExpandedCitation((current) =>
-                                              citation.excerpt &&
-                                              current !== citationId
-                                                ? citationId
-                                                : undefined,
-                                            );
-                                          }}
-                                        >
-                                          p.{citation.page}
-                                        </button>
-                                      );
-                                    })}
-                                  </div>
-                                )}
-                              {!isEditing && evidence?.excerpt && (
-                                <div className="citation-evidence">
-                                  <div>
-                                    <Quote size={13} />
-                                    <strong>
-                                      原文证据 · p.{evidence.page}
-                                    </strong>
-                                  </div>
-                                  <p>{evidence.excerpt}</p>
-                                </div>
-                              )}
-                            </article>
-                          );
-                        })}
-                        {asking && (
-                          <article className="message message-assistant pending-message">
-                            <LoaderCircle className="spin" size={17} />
-                            <span>正在核对论文证据</span>
-                          </article>
-                        )}
+                  <div
+                    className={`assistant-view-panel${
+                      draggingChatFile ? " is-file-dragging" : ""
+                    }`}
+                    hidden={assistantView !== "chat"}
+                    data-chat-file-dropzone
+                    onDragEnter={handleChatDragEnter}
+                    onDragOver={handleChatDragOver}
+                    onDragLeave={handleChatDragLeave}
+                    onDrop={handleChatDrop}
+                  >
+                    {draggingChatFile && (
+                      <div
+                        className="chat-file-drop-overlay"
+                        aria-hidden="true"
+                      >
+                        <Upload size={22} />
+                        <span>松开以添加文件</span>
                       </div>
-                      <div className="composer">
-                        <div className="composer-context">
-                          <span>当前页 p.{currentPage}</span>
-                          <span>{selectedPaper.statusText}</span>
-                        </div>
-                        {paperReferences.length > 0 && (
-                          <div
-                            className="composer-references"
-                            aria-label="引用原文"
-                          >
-                            {paperReferences.map((reference) => (
-                              <div
-                                className="composer-reference"
-                                key={reference.id}
+                    )}
+                    <div className="chat-scroll" ref={chatScrollRef}>
+                      {!paperMessages.length && (
+                        <div className="chat-start">
+                          <div className="chat-start-heading">
+                            <Bot size={21} />
+                            <span>第 {currentPage} 页</span>
+                          </div>
+                          <div className="prompt-grid">
+                            {prompts.map((item) => (
+                              <button
+                                type="button"
+                                key={item.label}
+                                disabled={selectedPaper.status !== "ready"}
+                                onClick={() =>
+                                  item.task === "repair-markdown"
+                                    ? void prepareMarkdownPrompt()
+                                    : void ask(item.prompt)
+                                }
                               >
-                                {referenceImageUrl(reference) ? (
-                                  <img
-                                    src={referenceImageUrl(reference)}
-                                    alt=""
-                                  />
-                                ) : (
-                                  <Quote size={13} />
-                                )}
-                                <span>
-                                  p.{reference.page} ·{" "}
-                                  {reference.imageOnly
-                                    ? "图片选区"
-                                    : reference.text}
-                                </span>
-                                <button
-                                  type="button"
-                                  title="移除引用"
-                                  onClick={() =>
-                                    removePaperReference(reference.id)
-                                  }
-                                >
-                                  <X size={13} />
-                                </button>
-                              </div>
+                                {item.label}
+                              </button>
                             ))}
                           </div>
-                        )}
-                        <div className="composer-box">
-                          <textarea
-                            ref={questionRef}
-                            rows={3}
-                            placeholder="询问公式、方法、计算细节或结论"
-                            disabled={selectedPaper.status !== "ready"}
-                            value={question}
-                            onChange={(event) =>
-                              setQuestion(event.target.value)
-                            }
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter" && !event.shiftKey) {
-                                event.preventDefault();
-                                void ask();
-                              }
-                            }}
-                          />
-                          <div className="composer-actions">
-                            <div
-                              className="composer-model-picker"
-                              ref={composerMenuRef}
-                            >
-                              <button
-                                className="composer-model-trigger"
-                                type="button"
-                                title="选择模型和推理强度"
-                                disabled={!provider}
-                                aria-haspopup="menu"
-                                aria-expanded={composerMenuOpen}
-                                onClick={() => {
-                                  closePaperActionMenu();
-                                  if (composerMenuOpen) {
-                                    closeComposerMenu();
-                                  } else {
-                                    setComposerMenuOpen(true);
+                        </div>
+                      )}
+                      {paperMessages.map((message, messageIndex) => {
+                        const evidence = message.citations?.find(
+                          (citation) =>
+                            expandedCitation ===
+                            `${message.id}-${citation.page}`,
+                        );
+                        const canEditMessage =
+                          message.role === "user" &&
+                          !message.attachments?.length;
+                        const isEditing =
+                          canEditMessage && editingMessageId === message.id;
+                        return (
+                          <article
+                            className={`message message-${message.role}`}
+                            key={message.id}
+                          >
+                            <div className="message-label">
+                              {message.role === "user" ? (
+                                <>
+                                  <MessageSquareText size={14} /> 你
+                                </>
+                              ) : (
+                                <>
+                                  <Sparkles size={14} /> PaperXcel
+                                </>
+                              )}
+                            </div>
+                            {isEditing ? (
+                              <div className="message-edit-panel">
+                                <textarea
+                                  className="message-edit-textarea"
+                                  rows={3}
+                                  value={editingMessageText}
+                                  placeholder="修改这轮提问"
+                                  disabled={asking}
+                                  onChange={(event) =>
+                                    setEditingMessageText(event.target.value)
                                   }
-                                }}
-                              >
-                                <span className="composer-model-trigger-model">
-                                  {provider?.model ?? "未配置模型"}
-                                </span>
-                                <span className="composer-model-trigger-reasoning">
-                                  {reasoningLabel}
-                                </span>
-                                <ChevronDown size={16} />
-                              </button>
-
-                              {composerMenuOpen && (
-                                <div
-                                  className="composer-model-popover"
-                                  role="menu"
-                                  aria-label="模型设置"
-                                >
-                                  <button
-                                    className="composer-model-popover-title"
-                                    type="button"
-                                    onClick={closeComposerMenu}
-                                  >
-                                    <span>高级</span>
-                                    <ChevronUp size={15} />
-                                  </button>
-                                  <div className="composer-model-popover-divider" />
-                                  <button
-                                    className={`composer-model-row ${
-                                      composerMenuSection === "model"
-                                        ? "active"
-                                        : ""
-                                    }`}
-                                    type="button"
-                                    role="menuitem"
-                                    onClick={() =>
-                                      setComposerMenuSection((current) =>
-                                        current === "model"
-                                          ? undefined
-                                          : "model",
-                                      )
+                                  onKeyDown={(event) => {
+                                    if (
+                                      event.key === "Enter" &&
+                                      !event.shiftKey
+                                    ) {
+                                      event.preventDefault();
+                                      void submitMessageEdit(
+                                        message,
+                                        messageIndex,
+                                      );
                                     }
-                                  >
-                                    <span>模型</span>
-                                    <span className="composer-model-row-value">
-                                      {provider?.model ?? "未配置"}
-                                    </span>
-                                    <ChevronRight size={17} />
-                                  </button>
-                                  <button
-                                    className={`composer-model-row ${
-                                      composerMenuSection === "reasoning"
-                                        ? "active"
-                                        : ""
-                                    }`}
-                                    type="button"
-                                    role="menuitem"
-                                    onClick={() =>
-                                      setComposerMenuSection((current) =>
-                                        current === "reasoning"
-                                          ? undefined
-                                          : "reasoning",
-                                      )
+                                    if (event.key === "Escape") {
+                                      event.preventDefault();
+                                      cancelEditingMessage();
                                     }
+                                  }}
+                                />
+                                {paperReferences.length > 0 && (
+                                  <div
+                                    className="message-edit-references"
+                                    aria-label="正在编辑的引用"
                                   >
-                                    <span>推理强度</span>
-                                    <span className="composer-model-row-value">
-                                      {reasoningLabel}
-                                    </span>
-                                    <ChevronRight size={17} />
-                                  </button>
-
-                                  {composerMenuSection === "model" && (
-                                    <div
-                                      className="composer-model-submenu"
-                                      role="menu"
-                                      aria-label="模型"
-                                    >
-                                      <div className="composer-model-submenu-title">
-                                        模型
-                                      </div>
-                                      <div className="composer-model-option-list">
-                                        {selectableModels.length ? (
-                                          selectableModels.map((model) => (
-                                            <button
-                                              className={`composer-model-option ${
-                                                model === provider?.model
-                                                  ? "selected"
-                                                  : ""
-                                              }`}
-                                              type="button"
-                                              role="menuitemradio"
-                                              aria-checked={
-                                                model === provider?.model
-                                              }
-                                              key={model}
-                                              onClick={() => {
-                                                closeComposerMenu();
-                                                void changeProviderModel(model);
-                                              }}
-                                            >
-                                              <span>{model}</span>
-                                              {model === provider?.model && (
-                                                <Check size={17} />
-                                              )}
-                                            </button>
-                                          ))
+                                    {paperReferences.map((reference) => (
+                                      <div
+                                        className="message-edit-reference"
+                                        key={reference.id}
+                                      >
+                                        {referenceImageUrl(reference) ? (
+                                          <img
+                                            src={referenceImageUrl(reference)}
+                                            alt=""
+                                          />
                                         ) : (
-                                          <div className="composer-model-option-empty">
-                                            暂无可用模型
-                                          </div>
+                                          <Quote size={14} />
                                         )}
+                                        <span>
+                                          <strong>p.{reference.page}</strong>
+                                          {reference.imageOnly
+                                            ? " 图片选区"
+                                            : ` ${reference.text}`}
+                                        </span>
                                       </div>
-                                    </div>
+                                    ))}
+                                  </div>
+                                )}
+                                <div className="message-edit-actions">
+                                  <button
+                                    className="message-edit-cancel"
+                                    type="button"
+                                    disabled={asking}
+                                    onClick={cancelEditingMessage}
+                                  >
+                                    取消
+                                  </button>
+                                  <button
+                                    className="message-edit-submit"
+                                    type="button"
+                                    disabled={
+                                      asking || !editingMessageText.trim()
+                                    }
+                                    onClick={() =>
+                                      void submitMessageEdit(
+                                        message,
+                                        messageIndex,
+                                      )
+                                    }
+                                  >
+                                    发送
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <>
+                                {message.role === "assistant" &&
+                                  (message.reasoningContent ||
+                                    message.processingDurationMs !==
+                                      undefined) && (
+                                    <ThinkingBlock
+                                      content={message.reasoningContent}
+                                      durationMs={message.processingDurationMs}
+                                    />
                                   )}
-
-                                  {composerMenuSection === "reasoning" && (
-                                    <div
-                                      className="composer-model-submenu"
-                                      role="menu"
-                                      aria-label="推理强度"
-                                    >
-                                      <div className="composer-model-submenu-title">
-                                        推理强度
+                                <div className="message-content">
+                                  {message.role === "assistant" ? (
+                                    <MarkdownMessage
+                                      content={message.content}
+                                    />
+                                  ) : (
+                                    <>
+                                      <div className="message-user-prompt">
+                                        {extractPromptFromMessage(message)}
                                       </div>
-                                      <div className="composer-model-option-list">
-                                        {reasoningOptions.map((option) => (
+                                      {message.attachments?.map(
+                                        (attachment) => (
+                                          <div
+                                            className="message-user-file"
+                                            key={`${message.id}-${attachment.id}`}
+                                          >
+                                            <FileText size={15} />
+                                            <span>
+                                              {getAttachmentDisplayName(
+                                                attachment,
+                                              )}
+                                            </span>
+                                            <small>
+                                              {formatAttachmentSize(
+                                                attachment.size,
+                                              )}
+                                            </small>
+                                          </div>
+                                        ),
+                                      )}
+                                      {extractReferencesFromMessage(message)
+                                        .length > 0 && (
+                                        <div
+                                          className="message-user-references"
+                                          aria-label="已发送的引用"
+                                        >
+                                          {extractReferencesFromMessage(
+                                            message,
+                                          ).map((reference, referenceIndex) => (
+                                            <button
+                                              className="message-user-reference"
+                                              type="button"
+                                              key={`${message.id}-${referenceIndex}`}
+                                              title={`查看第 ${reference.page} 页引用`}
+                                              onClick={() =>
+                                                setCurrentPage(reference.page)
+                                              }
+                                            >
+                                              {referenceImageUrl(reference) ? (
+                                                <img
+                                                  src={referenceImageUrl(
+                                                    reference,
+                                                  )}
+                                                  alt={`第 ${reference.page} 页图片选区`}
+                                                />
+                                              ) : (
+                                                <Quote size={14} />
+                                              )}
+                                              <span>
+                                                p.{reference.page} ·{" "}
+                                                {reference.imageOnly
+                                                  ? "图片选区"
+                                                  : reference.text}
+                                              </span>
+                                            </button>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </>
+                                  )}
+                                </div>
+                                <div
+                                  className="message-actions"
+                                  aria-label="消息操作"
+                                >
+                                  <span className="message-time">
+                                    {formatMessageTime(message.createdAt)}
+                                  </span>
+                                  <button
+                                    className={`message-action-button ${
+                                      copiedMessageId === message.id
+                                        ? "copied"
+                                        : ""
+                                    }`}
+                                    type="button"
+                                    title={
+                                      copiedMessageId === message.id
+                                        ? "已复制"
+                                        : "复制"
+                                    }
+                                    onClick={() => void copyMessage(message)}
+                                  >
+                                    {copiedMessageId === message.id ? (
+                                      <Check size={14} />
+                                    ) : (
+                                      <Copy size={14} />
+                                    )}
+                                  </button>
+                                  {canEditMessage && (
+                                    <button
+                                      className="message-action-button"
+                                      type="button"
+                                      title="编辑"
+                                      disabled={asking}
+                                      onClick={() =>
+                                        startEditingMessage(message)
+                                      }
+                                    >
+                                      <Pencil size={14} />
+                                    </button>
+                                  )}
+                                </div>
+                              </>
+                            )}
+                            {!isEditing &&
+                              message.citations &&
+                              message.citations.length > 0 && (
+                                <div className="citation-list">
+                                  {message.citations.map((citation) => {
+                                    const citationId = `${message.id}-${citation.page}`;
+                                    return (
+                                      <button
+                                        className={
+                                          expandedCitation === citationId
+                                            ? "active"
+                                            : ""
+                                        }
+                                        type="button"
+                                        key={citationId}
+                                        title={`跳转至第 ${citation.page} 页并查看证据`}
+                                        aria-expanded={
+                                          expandedCitation === citationId
+                                        }
+                                        onClick={() => {
+                                          setCurrentPage(citation.page);
+                                          setExpandedCitation((current) =>
+                                            citation.excerpt &&
+                                            current !== citationId
+                                              ? citationId
+                                              : undefined,
+                                          );
+                                        }}
+                                      >
+                                        p.{citation.page}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            {!isEditing && evidence?.excerpt && (
+                              <div className="citation-evidence">
+                                <div>
+                                  <Quote size={13} />
+                                  <strong>原文证据 · p.{evidence.page}</strong>
+                                </div>
+                                <p>{evidence.excerpt}</p>
+                              </div>
+                            )}
+                          </article>
+                        );
+                      })}
+                      {asking && (
+                        <article className="message message-assistant pending-message">
+                          {askReasoning && (
+                            <ThinkingBlock
+                              content={askReasoning}
+                              durationMs={askElapsedMs}
+                              isStreaming
+                            />
+                          )}
+                          {!askReasoning && !askAnswer && (
+                            <div className="pending-status" role="status">
+                              <LoaderCircle className="spin" size={15} />
+                              <span>{askProgress || "等待模型响应"}</span>
+                              {formatProcessingDuration(askElapsedMs) && (
+                                <small>
+                                  {formatProcessingDuration(askElapsedMs)}
+                                </small>
+                              )}
+                            </div>
+                          )}
+                          {askAnswer && (
+                            <div className="message-content pending-answer-content">
+                              <MarkdownMessage content={askAnswer} />
+                            </div>
+                          )}
+                        </article>
+                      )}
+                    </div>
+                    <div className="composer">
+                      <div className="composer-context">
+                        <span>当前页 p.{currentPage}</span>
+                        <span>
+                          {selectedPaper.fileName
+                            ? "自动附带当前 PDF"
+                            : selectedPaper.statusText}
+                        </span>
+                      </div>
+                      {paperReferences.length > 0 && (
+                        <div
+                          className="composer-references"
+                          aria-label="引用原文"
+                        >
+                          {paperReferences.map((reference) => (
+                            <div
+                              className="composer-reference"
+                              key={reference.id}
+                            >
+                              {referenceImageUrl(reference) ? (
+                                <img
+                                  src={referenceImageUrl(reference)}
+                                  alt=""
+                                />
+                              ) : (
+                                <Quote size={13} />
+                              )}
+                              <span>
+                                p.{reference.page} ·{" "}
+                                {reference.imageOnly
+                                  ? "图片选区"
+                                  : reference.text}
+                              </span>
+                              <button
+                                type="button"
+                                title="移除引用"
+                                onClick={() =>
+                                  removePaperReference(reference.id)
+                                }
+                              >
+                                <X size={13} />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {(composerAttachments.length > 0 ||
+                        uploadingAttachmentCount > 0) && (
+                        <div
+                          className="composer-attachments"
+                          aria-label="本轮对话附件"
+                        >
+                          {composerAttachments.map((attachment) => (
+                            <div
+                              className="composer-attachment"
+                              key={attachment.id}
+                              title={`${getAttachmentDisplayName(attachment)} · ${formatAttachmentSize(
+                                attachment.size,
+                              )}`}
+                            >
+                              <FileText size={14} />
+                              <span>
+                                {getAttachmentDisplayName(attachment)}
+                              </span>
+                              <small>
+                                {formatAttachmentSize(attachment.size)}
+                              </small>
+                              <button
+                                type="button"
+                                aria-label={`移除附件 ${getAttachmentDisplayName(attachment)}`}
+                                title="移除附件"
+                                onClick={() =>
+                                  void removeComposerAttachment(attachment)
+                                }
+                              >
+                                <X size={13} />
+                              </button>
+                            </div>
+                          ))}
+                          {uploadingAttachmentCount > 0 && (
+                            <div className="composer-uploading" role="status">
+                              <LoaderCircle className="spin" size={14} />
+                              正在添加 {uploadingAttachmentCount} 个附件
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <div className="composer-box">
+                        <textarea
+                          ref={questionRef}
+                          rows={3}
+                          placeholder="询问研究问题、方法、数据、结果或局限"
+                          disabled={selectedPaper.status !== "ready"}
+                          value={question}
+                          onChange={(event) => setQuestion(event.target.value)}
+                          onPaste={handleChatPaste}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" && !event.shiftKey) {
+                              event.preventDefault();
+                              void ask();
+                            }
+                          }}
+                        />
+                        <div className="composer-actions">
+                          <div
+                            className="composer-model-picker"
+                            ref={composerMenuRef}
+                          >
+                            <button
+                              className="composer-model-trigger"
+                              type="button"
+                              title="选择模型和推理强度"
+                              disabled={!provider}
+                              aria-haspopup="menu"
+                              aria-expanded={composerMenuOpen}
+                              onClick={() => {
+                                closePaperActionMenu();
+                                if (composerMenuOpen) {
+                                  closeComposerMenu();
+                                } else {
+                                  setComposerMenuOpen(true);
+                                }
+                              }}
+                            >
+                              <span className="composer-model-trigger-model">
+                                {provider?.model ?? "未配置模型"}
+                              </span>
+                              <span className="composer-model-trigger-reasoning">
+                                {reasoningLabel}
+                              </span>
+                              <ChevronDown size={16} />
+                            </button>
+
+                            {composerMenuOpen && (
+                              <div
+                                className="composer-model-popover"
+                                role="menu"
+                                aria-label="模型设置"
+                              >
+                                <button
+                                  className="composer-model-popover-title"
+                                  type="button"
+                                  onClick={closeComposerMenu}
+                                >
+                                  <span>高级</span>
+                                  <ChevronUp size={15} />
+                                </button>
+                                <div className="composer-model-popover-divider" />
+                                <button
+                                  className={`composer-model-row ${
+                                    composerMenuSection === "model"
+                                      ? "active"
+                                      : ""
+                                  }`}
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() =>
+                                    setComposerMenuSection((current) =>
+                                      current === "model" ? undefined : "model",
+                                    )
+                                  }
+                                >
+                                  <span>模型</span>
+                                  <span className="composer-model-row-value">
+                                    {provider?.model ?? "未配置"}
+                                  </span>
+                                  <ChevronRight size={17} />
+                                </button>
+                                <button
+                                  className={`composer-model-row ${
+                                    composerMenuSection === "reasoning"
+                                      ? "active"
+                                      : ""
+                                  }`}
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() =>
+                                    setComposerMenuSection((current) =>
+                                      current === "reasoning"
+                                        ? undefined
+                                        : "reasoning",
+                                    )
+                                  }
+                                >
+                                  <span>推理强度</span>
+                                  <span className="composer-model-row-value">
+                                    {reasoningLabel}
+                                  </span>
+                                  <ChevronRight size={17} />
+                                </button>
+
+                                {composerMenuSection === "model" && (
+                                  <div
+                                    className="composer-model-submenu"
+                                    role="menu"
+                                    aria-label="模型"
+                                  >
+                                    <div className="composer-model-submenu-title">
+                                      模型
+                                    </div>
+                                    <div className="composer-model-option-list">
+                                      {selectableModels.length ? (
+                                        selectableModels.map((model) => (
                                           <button
                                             className={`composer-model-option ${
-                                              option.value === reasoningEffort
+                                              model === provider?.model
                                                 ? "selected"
                                                 : ""
                                             }`}
                                             type="button"
                                             role="menuitemradio"
                                             aria-checked={
-                                              option.value === reasoningEffort
+                                              model === provider?.model
                                             }
-                                            key={option.value}
+                                            key={model}
                                             onClick={() => {
-                                              setReasoningEffort(option.value);
                                               closeComposerMenu();
+                                              void changeProviderModel(model);
                                             }}
                                           >
-                                            <span>{option.label}</span>
-                                            {option.value ===
-                                              reasoningEffort && (
+                                            <span>{model}</span>
+                                            {model === provider?.model && (
                                               <Check size={17} />
                                             )}
                                           </button>
-                                        ))}
-                                      </div>
+                                        ))
+                                      ) : (
+                                        <div className="composer-model-option-empty">
+                                          暂无可用模型
+                                        </div>
+                                      )}
                                     </div>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                            <button
-                              className={`send-button ${asking ? "stop-button" : ""}`}
-                              type="button"
-                              title={asking ? "停止生成" : "发送"}
-                              disabled={
-                                asking
-                                  ? stoppingAsk
-                                  : !question.trim() ||
-                                    selectedPaper.status !== "ready"
-                              }
-                              onClick={() =>
-                                asking ? void stopAsking() : void ask()
-                              }
-                            >
-                              {asking ? (
-                                <Square
-                                  size={12}
-                                  fill="currentColor"
-                                  strokeWidth={0}
-                                />
-                              ) : (
-                                <ArrowUp size={16} />
-                              )}
-                            </button>
+                                  </div>
+                                )}
+
+                                {composerMenuSection === "reasoning" && (
+                                  <div
+                                    className="composer-model-submenu"
+                                    role="menu"
+                                    aria-label="推理强度"
+                                  >
+                                    <div className="composer-model-submenu-title">
+                                      推理强度
+                                    </div>
+                                    <div className="composer-model-option-list">
+                                      {reasoningOptions.map((option) => (
+                                        <button
+                                          className={`composer-model-option ${
+                                            option.value === reasoningEffort
+                                              ? "selected"
+                                              : ""
+                                          }`}
+                                          type="button"
+                                          role="menuitemradio"
+                                          aria-checked={
+                                            option.value === reasoningEffort
+                                          }
+                                          key={option.value}
+                                          onClick={() => {
+                                            setReasoningEffort(option.value);
+                                            closeComposerMenu();
+                                          }}
+                                        >
+                                          <span>{option.label}</span>
+                                          {option.value === reasoningEffort && (
+                                            <Check size={17} />
+                                          )}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            )}
                           </div>
+                          <button
+                            className={`send-button ${asking ? "stop-button" : ""}`}
+                            type="button"
+                            title={asking ? "停止生成" : "发送"}
+                            disabled={
+                              asking
+                                ? stoppingAsk
+                                : !question.trim() ||
+                                  selectedPaper.status !== "ready"
+                            }
+                            onClick={() =>
+                              asking ? void stopAsking() : void ask()
+                            }
+                          >
+                            {asking ? (
+                              <Square
+                                size={12}
+                                fill="currentColor"
+                                strokeWidth={0}
+                              />
+                            ) : (
+                              <ArrowUp size={16} />
+                            )}
+                          </button>
                         </div>
                       </div>
-                    </>
-                  ) : (
+                    </div>
+                  </div>
+                  <div
+                    className="assistant-view-panel"
+                    hidden={assistantView !== "notes"}
+                  >
                     <PaperNotes
                       key={selectedPaper.id}
                       paper={selectedPaper}
                       onError={setNotice}
+                      onGeneratingChange={handleNoteGeneratingChange}
                     />
-                  )}
+                  </div>
                 </aside>
               )}
             </div>
@@ -3079,6 +3795,54 @@ export default function App(): React.JSX.Element {
   );
 }
 
+function ThinkingBlock({
+  content,
+  durationMs,
+  isStreaming = false,
+}: {
+  content?: string;
+  durationMs?: number;
+  isStreaming?: boolean;
+}): React.JSX.Element {
+  const [expanded, setExpanded] = useState(isStreaming);
+  const hasReasoning = Boolean(content?.trim());
+  const duration = formatProcessingDuration(durationMs);
+  const title = isStreaming
+    ? `模型推理中${duration ? ` ${duration}` : ""}`
+    : hasReasoning
+      ? `模型推理${duration ? ` · ${duration}` : ""}`
+      : `已处理${duration ? ` ${duration}` : ""}`;
+
+  useEffect(() => {
+    if (isStreaming) setExpanded(true);
+  }, [isStreaming]);
+
+  if (!hasReasoning) {
+    return <div className="processing-duration">{title}</div>;
+  }
+
+  return (
+    <section className={`thinking-block${isStreaming ? " is-streaming" : ""}`}>
+      <button
+        className="thinking-block-toggle"
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        <span>{title}</span>
+      </button>
+      {expanded && (
+        <div className="thinking-block-content">
+          <div className="thinking-summary">
+            <MarkdownMessage content={content ?? ""} />
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function MarkdownMessage({ content }: { content: string }): React.JSX.Element {
   const normalizedContent = normalizeMarkdownMath(content);
 
@@ -3101,6 +3865,14 @@ function isAbortError(error: unknown): boolean {
     error.name === "AbortError" ||
     /aborted|aborterror|cancelled|canceled/i.test(error.message)
   );
+}
+
+function formatAttachmentSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) {
+    return `${Math.max(0.1, bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function formatMessageTime(value: string): string {

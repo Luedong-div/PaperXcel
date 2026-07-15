@@ -7,10 +7,17 @@ import {
   type CitationGraphCache,
 } from "../shared/citationGraph";
 import { normalizeZoteroUserLibraryId } from "../shared/zotero";
+import {
+  readPaperChatHistory,
+  removePaperChatHistory,
+  writePaperChatHistory,
+} from "./chat-history";
+import { paperArtifactDirectory } from "./paper-artifacts";
 import type {
   ChatMessage,
   ComparisonReport,
   CreateLibraryFolderInput,
+  LibraryReview,
   LibraryFolder,
   LibraryFolderRemovalResult,
   Paper,
@@ -57,8 +64,8 @@ interface StoreSchema {
   papers: Paper[];
   paperOrder: string[];
   folders: LibraryFolder[];
-  chats: Record<string, ChatMessage[]>;
   notes: Record<string, PaperNote>;
+  reviews: LibraryReview[];
   comparisons: ComparisonReport[];
   providers: StoredProvider[];
   activeProviderId: string;
@@ -74,6 +81,7 @@ const DEFAULT_PROVIDER_ID = "openai";
 const MAX_CHAT_MESSAGES = 200;
 const MAX_NOTE_LENGTH = 200_000;
 const MAX_COMPARISON_REPORTS = 50;
+const MAX_LIBRARY_REVIEWS = 30;
 
 export class AppStore {
   private readonly store: Store<StoreSchema>;
@@ -85,8 +93,8 @@ export class AppStore {
         papers: [],
         paperOrder: [],
         folders: [],
-        chats: {},
         notes: {},
+        reviews: [],
         comparisons: [],
         providers: [
           {
@@ -94,7 +102,7 @@ export class AppStore {
             name: "OpenAI",
             baseUrl: "https://api.openai.com/v1",
             model: "gpt-5.4-mini",
-            protocol: "responses",
+            protocol: "auto",
           },
         ],
         activeProviderId: DEFAULT_PROVIDER_ID,
@@ -111,6 +119,9 @@ export class AppStore {
         translation: {},
       },
     });
+    (this.store as unknown as { delete: (key: string) => void }).delete(
+      "summaries",
+    );
   }
 
   listPapers(): Paper[] {
@@ -305,12 +316,15 @@ export class AppStore {
       "paperOrder",
       this.store.get("paperOrder").filter((paperId) => paperId !== id),
     );
-    const chats = { ...this.store.get("chats") };
-    delete chats[id];
-    this.store.set("chats", chats);
     const notes = { ...this.store.get("notes") };
     delete notes[id];
     this.store.set("notes", notes);
+    this.store.set(
+      "reviews",
+      this.store
+        .get("reviews")
+        .filter((review) => !review.paperIds.includes(id)),
+    );
     this.store.set(
       "comparisons",
       this.store
@@ -320,31 +334,38 @@ export class AppStore {
   }
 
   listChatMessages(paperId: string): ChatMessage[] {
-    return (this.store.get("chats")[paperId] ?? []).map(cloneChatMessage);
+    try {
+      const messages = readPaperChatHistory(
+        this.paperArtifactDirectory(paperId),
+        paperId,
+      );
+      return messages?.map(cloneChatMessage) ?? [];
+    } catch (error) {
+      console.error(
+        `[chat-history] Failed to read ${paperId}: ${formatError(error)}`,
+      );
+      return [];
+    }
   }
 
   appendChatMessage(paperId: string, message: ChatMessage): ChatMessage[] {
     if (!this.getPaper(paperId)) throw new Error("文献不存在。");
-    const chats = this.store.get("chats");
     const next = [
-      ...(chats[paperId] ?? []).map(cloneChatMessage),
+      ...this.listChatMessages(paperId),
       cloneChatMessage(message),
     ].slice(-MAX_CHAT_MESSAGES);
-    this.store.set("chats", { ...chats, [paperId]: next });
+    this.persistChatMessages(paperId, next);
     return next.map(cloneChatMessage);
   }
 
   clearChatMessages(paperId: string): void {
-    const chats = { ...this.store.get("chats") };
-    delete chats[paperId];
-    this.store.set("chats", chats);
+    removePaperChatHistory(this.paperArtifactDirectory(paperId));
   }
 
   replaceChatMessages(paperId: string, messages: ChatMessage[]): ChatMessage[] {
     if (!this.getPaper(paperId)) throw new Error("Paper does not exist.");
-    const chats = this.store.get("chats");
     const next = messages.map(cloneChatMessage).slice(-MAX_CHAT_MESSAGES);
-    this.store.set("chats", { ...chats, [paperId]: next });
+    this.persistChatMessages(paperId, next);
     return next.map(cloneChatMessage);
   }
 
@@ -368,6 +389,40 @@ export class AppStore {
       [paperId]: note,
     });
     return { ...note };
+  }
+
+  listPaperNotes(): PaperNote[] {
+    return Object.values(this.store.get("notes")).map((note) => ({ ...note }));
+  }
+
+  listLibraryReviews(): LibraryReview[] {
+    return this.store
+      .get("reviews")
+      .map(cloneLibraryReview)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  getLibraryReview(id: string): LibraryReview | undefined {
+    const review = this.store.get("reviews").find((item) => item.id === id);
+    return review ? cloneLibraryReview(review) : undefined;
+  }
+
+  saveLibraryReview(review: LibraryReview): LibraryReview {
+    const reports = this.store
+      .get("reviews")
+      .filter((item) => item.id !== review.id);
+    this.store.set(
+      "reviews",
+      [cloneLibraryReview(review), ...reports].slice(0, MAX_LIBRARY_REVIEWS),
+    );
+    return cloneLibraryReview(review);
+  }
+
+  removeLibraryReview(id: string): void {
+    this.store.set(
+      "reviews",
+      this.store.get("reviews").filter((review) => review.id !== id),
+    );
   }
 
   listComparisonReports(): ComparisonReport[] {
@@ -575,6 +630,10 @@ export class AppStore {
           {
             ...work,
             authors: [...work.authors],
+            issn: work.issn ? [...work.issn] : undefined,
+            metadataSources: work.metadataSources
+              ? [...work.metadataSources]
+              : undefined,
             referencedOpenAlexIds: [...work.referencedOpenAlexIds],
           },
         ]),
@@ -596,6 +655,19 @@ export class AppStore {
   saveCitationGraphCache(cache: CitationGraphCache): CitationGraphCache {
     this.store.set("citationGraph", cache);
     return this.getCitationGraphCache();
+  }
+
+  clearCitationGraphCache(): {
+    clearedWorks: number;
+    clearedPapers: number;
+  } {
+    const cache = this.store.get("citationGraph");
+    const result = {
+      clearedWorks: Object.keys(cache.works).length,
+      clearedPapers: Object.keys(cache.cores).length,
+    };
+    this.store.set("citationGraph", emptyCitationGraphCache());
+    return result;
   }
 
   getZoteroConfig(): ZoteroConfig {
@@ -668,6 +740,18 @@ export class AppStore {
     return candidates.find((filePath) => existsSync(filePath)) ?? null;
   }
 
+  private paperArtifactDirectory(paperId: string): string {
+    return paperArtifactDirectory(app.getPath("userData"), paperId);
+  }
+
+  private persistChatMessages(paperId: string, messages: ChatMessage[]): void {
+    writePaperChatHistory(
+      this.paperArtifactDirectory(paperId),
+      paperId,
+      messages.map(cloneChatMessage),
+    );
+  }
+
   private encryptSecret(secret: string): string {
     if (!safeStorage.isEncryptionAvailable()) {
       throw new Error(
@@ -700,6 +784,9 @@ function normalizeFolderName(input: string): string {
 function cloneChatMessage(message: ChatMessage): ChatMessage {
   return {
     ...message,
+    attachments: message.attachments?.map((attachment) => ({
+      ...attachment,
+    })),
     selectedSnippets: message.selectedSnippets?.map((snippet) => ({
       ...snippet,
     })),
@@ -707,11 +794,22 @@ function cloneChatMessage(message: ChatMessage): ChatMessage {
   };
 }
 
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function cloneComparisonReport(report: ComparisonReport): ComparisonReport {
   return {
     ...report,
     paperIds: [...report.paperIds],
     citations: report.citations.map((citation) => ({ ...citation })),
+  };
+}
+
+function cloneLibraryReview(review: LibraryReview): LibraryReview {
+  return {
+    ...review,
+    paperIds: [...review.paperIds],
   };
 }
 
