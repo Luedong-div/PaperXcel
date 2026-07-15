@@ -8,7 +8,6 @@ import type {
   ChatMessage,
   CitationGraphEdge,
   CitationGraphNode,
-  ComparisonReport,
   DocumentPageText,
   GeneratePaperNoteResult,
   LibraryAskHistoryMessage,
@@ -24,9 +23,9 @@ import type {
 import { normalizeCitationDoi } from "../shared/citationGraph";
 import { extractCitations } from "../shared/citations";
 import {
-  extractComparisonCitations,
-  type ComparisonSource,
-} from "../shared/comparisons";
+  extractLibraryCitations,
+  type LibraryCitationSource,
+} from "../shared/libraryCitations";
 import {
   getProviderRequestId,
   isTransientProviderError,
@@ -37,7 +36,10 @@ import {
   readChatAttachmentDataUrl,
   type ResolvedChatAttachment,
 } from "./chat-attachments";
-import type { WorkerClient } from "./worker-client";
+import type {
+  CitationReferenceSearchHint,
+  CitationReferenceSearchRequest,
+} from "./reference-resolver";
 
 interface ProviderCredentials {
   name: string;
@@ -45,13 +47,6 @@ interface ProviderCredentials {
   model: string;
   protocol: ProviderProtocol;
   apiKey: string;
-}
-
-interface SearchHit {
-  chunk_id: string;
-  page: number;
-  text: string;
-  score: number;
 }
 
 interface ProviderRequestOptions {
@@ -82,23 +77,6 @@ const NOTE_SYSTEM_PROMPT = `你是 PaperXcel 的通用学术研究笔记助手�
 4. 对论文文件中未确认但应核查的栏目写“论文中未确认”，不要用常识补齐。
 5. 明确区分论文结论、作者假设和你的推断；推断必须标为“推断”。
 6. 使用简洁中文，不要输出代码围栏，也不要重复论文标题。`;
-
-const COMPARISON_SYSTEM_PROMPT = `你是 PaperXcel 的通用跨文献分析助手。
-根据多篇论文的检索证据生成可审计的 Markdown 研究矩阵。
-规则：
-1. 严格使用以下二级标题：对比结论、研究问题与范围、方法与研究设计、证据与可复现性、结果差异、可比性与局限、待核查问题。
-2. 每个事实必须使用“【P1 p.页码】”格式引用对应论文；只能引用证据中明确给出的论文编号和页码。
-3. 方法矩阵应逐篇列出研究目标、对象或范围、理论框架或研究设计、数据或材料、关键假设、实施参数、软件或仪器、评价指标、主要结果与局限；不适用项写“不适用”，未确认项写“当前证据未确认”。
-4. 比较不同研究对象、样本、材料、数据集、任务、实验条件或评价指标时，先说明可比性，禁止把对象或条件差异直接归因于方法优劣。
-5. 明确区分作者结论与跨文献推断；推断必须标为“跨文献推断”并给出支持它的多篇引用。
-6. 保留英文术语、公式与单位，默认使用简洁中文，不要输出代码围栏。`;
-
-const COMPARISON_SEARCH_QUERIES = [
-  "research question objective scope hypothesis contribution background",
-  "method methodology theoretical framework study design experiment algorithm model assumption",
-  "data dataset sample material instrument software parameter statistical analysis metric reproducibility",
-  "main result evidence benchmark effect uncertainty robustness limitation conclusion applicability",
-];
 
 const LIBRARY_QA_SYSTEM_PROMPT = `你是 PaperXcel 的全库证据问答助手。
 规则：
@@ -150,6 +128,15 @@ const MAX_AI_FILE_INPUT_BYTES = 50 * 1024 * 1024;
 const AI_FILE_COMPLETION_TIMEOUT_MS = 10 * 60_000;
 const TRANSIENT_PROVIDER_RETRY_COUNT = 1;
 const TRANSIENT_PROVIDER_RETRY_DELAY_MS = 300;
+const CITATION_REFERENCE_HINT_BATCH_SIZE = 24;
+const CITATION_REFERENCE_HINT_SYSTEM_PROMPT = `你是学术论文参考文献检索线索提取器。
+输入只包含已经无法通过 OpenAlex 和 Crossref 常规匹配的原始书目。
+规则：
+1. 只从每条 rawCitation 中提取可用于再次检索的 title、authors、year、doi，不要直接判断匹配结果。
+2. 不得使用常识补写原文没有支持的信息，不得猜测 DOI；字段不确定时省略。
+3. id 必须原样返回，不得新增、删除、合并或调换引用。
+4. 只输出严格 JSON，不要使用 Markdown 代码围栏或其它说明：
+{"hints":[{"id":"REF_xxx","title":"Article title","authors":["Author"],"year":1948,"doi":"10.xxxx/xxxx"}]}`;
 
 type CitationPatchChanges = Partial<
   Pick<
@@ -570,7 +557,7 @@ export async function answerLibraryQuestion(
     question: string;
     reasoningEffort?: ModelReasoningEffort;
     papers: Array<{ id: string; label: string; title: string }>;
-    sources: ComparisonSource[];
+    sources: LibraryCitationSource[];
     history?: LibraryAskHistoryMessage[];
     sourceMode?: "selected" | "retrieved";
   },
@@ -613,95 +600,43 @@ export async function answerLibraryQuestion(
   );
   return {
     content: result.content,
-    citations: extractComparisonCitations(result.content, input.sources),
+    citations: extractLibraryCitations(result.content, input.sources),
     protocol: result.protocol,
     model: credentials.model,
   };
 }
 
-export async function comparePapers(
+export async function extractCitationReferenceSearchHints(
   credentials: ProviderCredentials,
-  worker: WorkerClient,
-  input: {
-    papers: Array<{ id: string; title: string }>;
-    question: string;
-    indexDir?: string;
-  },
-): Promise<Omit<ComparisonReport, "id" | "createdAt">> {
-  if (input.papers.length < 2 || input.papers.length > 5) {
-    throw new Error("请选择 2 至 5 篇已完成索引的文献。");
-  }
-  const question = input.question.trim();
-  if (!question) throw new Error("请输入跨文献研究问题。");
-  if (question.length > 2000) {
-    throw new Error("跨文献研究问题不能超过 2,000 个字符。");
-  }
+  references: CitationReferenceSearchRequest[],
+): Promise<CitationReferenceSearchHint[]> {
+  const normalized = references
+    .map((reference) => ({
+      id: reference.id.trim(),
+      rawCitation: reference.rawCitation.trim(),
+    }))
+    .filter((reference) => reference.id && reference.rawCitation);
+  if (!normalized.length) return [];
 
-  const sources: ComparisonSource[] = [];
-  for (const [index, paper] of input.papers.entries()) {
-    const paperLabel = `P${index + 1}`;
-    const uniqueHits = new Map<string, SearchHit>();
-    for (const query of [question, ...COMPARISON_SEARCH_QUERIES]) {
-      const hits = await worker.request<SearchHit[]>("search", {
-        paper_id: paper.id,
-        query,
-        current_page: null,
-        index_dir: input.indexDir,
-        limit: 4,
-      });
-      for (const hit of hits) {
-        const existing = uniqueHits.get(hit.chunk_id);
-        if (!existing || hit.score > existing.score) {
-          uniqueHits.set(hit.chunk_id, hit);
-        }
-      }
-    }
-    const hits = [...uniqueHits.values()]
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 7)
-      .sort((a, b) => a.page - b.page);
-    if (hits.length === 0) {
-      throw new Error(`“${paper.title}”尚未检索到可用证据。`);
-    }
-    sources.push(
-      ...hits.map((hit) => ({
-        paperId: paper.id,
-        paperLabel,
-        chunk_id: hit.chunk_id,
-        page: hit.page,
-        text: hit.text,
-      })),
+  const hints: CitationReferenceSearchHint[] = [];
+  for (const batch of chunkValues(
+    normalized,
+    CITATION_REFERENCE_HINT_BATCH_SIZE,
+  )) {
+    const result = await completeWithProvider(
+      credentials,
+      CITATION_REFERENCE_HINT_SYSTEM_PROMPT,
+      [],
+      JSON.stringify({ references: batch }),
+    );
+    hints.push(
+      ...parseCitationReferenceSearchHints(
+        result.content,
+        new Set(batch.map((reference) => reference.id)),
+      ),
     );
   }
-
-  const context = input.papers
-    .map((paper, index) => {
-      const paperLabel = `P${index + 1}`;
-      const evidence = sources
-        .filter((source) => source.paperId === paper.id)
-        .map(
-          (source) =>
-            `[${paperLabel} | PAGE ${source.page} | CHUNK ${source.chunk_id}]\n${source.text.trim()}`,
-        )
-        .join("\n\n");
-      return `${paperLabel} 标题：${paper.title}\n\n${evidence}`;
-    })
-    .join("\n\n==========\n\n");
-  const userPrompt = `研究问题：${question}\n\n跨文献证据如下：\n\n${context}\n\n请生成跨文献研究矩阵。`;
-  const result = await completeWithProvider(
-    credentials,
-    COMPARISON_SYSTEM_PROMPT,
-    [],
-    userPrompt,
-  );
-  return {
-    paperIds: input.papers.map((paper) => paper.id),
-    question,
-    content: result.content,
-    citations: extractComparisonCitations(result.content, sources),
-    protocol: result.protocol,
-    model: credentials.model,
-  };
+  return hints;
 }
 
 export async function testProvider(
@@ -2047,6 +1982,56 @@ function parseKnowledgeCitationRepair(
     }
   }
   return patches;
+}
+
+function parseCitationReferenceSearchHints(
+  value: string,
+  allowedIds: Set<string>,
+): CitationReferenceSearchHint[] {
+  const parsed = parseModelJson(value);
+  const record =
+    parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  const rawHints = Array.isArray(record.hints) ? record.hints : [];
+  const hints = new Map<string, CitationReferenceSearchHint>();
+  for (const item of rawHints) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const hint = item as Record<string, unknown>;
+    const id = typeof hint.id === "string" ? hint.id.trim() : "";
+    if (!allowedIds.has(id)) continue;
+
+    const title = optionalModelText(hint.title, 500);
+    const authors = Array.isArray(hint.authors)
+      ? [
+          ...new Set(
+            hint.authors
+              .filter((author): author is string => typeof author === "string")
+              .map((author) => normalizeModelText(author).slice(0, 180))
+              .filter(Boolean),
+          ),
+        ].slice(0, 20)
+      : [];
+    const rawYear = Number(hint.year);
+    const year =
+      Number.isInteger(rawYear) &&
+      rawYear >= 1400 &&
+      rawYear <= new Date().getFullYear() + 1
+        ? rawYear
+        : undefined;
+    const doi =
+      typeof hint.doi === "string" ? normalizeCitationDoi(hint.doi) : undefined;
+    if (!title && !doi) continue;
+
+    hints.set(id, {
+      id,
+      title,
+      authors: authors.length ? authors : undefined,
+      year,
+      doi,
+    });
+  }
+  return [...hints.values()];
 }
 
 function buildCitationRepairEvidence(pages: DocumentPageText[]): string {

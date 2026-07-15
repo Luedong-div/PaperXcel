@@ -16,6 +16,20 @@ import { extractNumberedReferenceCitations } from "./reference-citations";
 const MAX_CHUNK_CHARS = 1_600;
 const CHUNK_OVERLAP_CHARS = 180;
 const MAX_EMBEDDING_TOKENS = 512;
+const EMBEDDING_DIMENSIONS = 512;
+export const CURRENT_EMBEDDING_PROFILE =
+  "bge-small-zh-v1.5-cls-query-instruction-v1";
+export const LEGACY_EMBEDDING_PROFILE = "bge-small-zh-v1.5-mean-v0";
+const BGE_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章：";
+
+export type EmbeddingProfile =
+  | typeof CURRENT_EMBEDDING_PROFILE
+  | typeof LEGACY_EMBEDDING_PROFILE;
+export type EmbeddingRole = "document" | "query";
+type QueryEmbeddingCache = Map<
+  EmbeddingProfile,
+  Promise<Float32Array | undefined>
+>;
 
 interface Chunk {
   chunkId: string;
@@ -231,7 +245,8 @@ export class DocumentEngine {
     if (
       !params.force &&
       current?.sourceKind === "markdown" &&
-      current.sourceDigest === digest
+      current.sourceDigest === digest &&
+      current.embeddingProfile === CURRENT_EMBEDDING_PROFILE
     ) {
       return {
         page_count: current.pageCount,
@@ -273,12 +288,9 @@ export class DocumentEngine {
       throw new Error("Document index has not been created.");
     const limit = clampNumber(params.limit, 1, 30, 10);
     const currentPage = Number(params.current_page) || undefined;
-    return this.searchIndex(
-      indexPath,
-      String(params.query ?? ""),
-      limit,
-      currentPage,
-    );
+    const query = String(params.query ?? "").trim();
+    if (!query) return [];
+    return this.searchIndex(indexPath, query, limit, currentPage);
   }
 
   private async searchLibrary(
@@ -293,8 +305,10 @@ export class DocumentEngine {
     const indexDir = String(params.index_dir ?? "");
     const limit = clampNumber(params.limit, 1, 80, 30);
     const perPaperLimit = clampNumber(params.per_paper_limit, 1, 10, 4);
-    const query = String(params.query ?? "");
+    const query = String(params.query ?? "").trim();
+    if (!query) return [];
     const hits: SearchHit[] = [];
+    const queryEmbeddings: QueryEmbeddingCache = new Map();
     // 全库检索没有创建一个“全库总数据库”。这里逐篇打开
     // indexes/<paperId>.sqlite3，检索后再把各论文结果汇总。
     for (const paperId of paperIds) {
@@ -304,6 +318,8 @@ export class DocumentEngine {
         indexPath,
         query,
         perPaperLimit * 3,
+        undefined,
+        queryEmbeddings,
       );
       hits.push(...paperHits.map((hit) => ({ ...hit, paper_id: paperId })));
     }
@@ -315,13 +331,17 @@ export class DocumentEngine {
     query: string,
     limit: number,
     currentPage?: number,
+    queryEmbeddings: QueryEmbeddingCache = new Map(),
   ): Promise<SearchHit[]> {
     const database = new DatabaseSync(indexPath, { readOnly: true });
     try {
       // lexical 使用 SQLite FTS5/BM25；semantic 使用 BGE query embedding
       // 与 chunks.embedding 做余弦相似度。最后用排名融合得到统一分数。
       const lexical = lexicalSearch(database, query, limit * 3);
-      const queryEmbedding = await this.embedText(query);
+      const embeddingProfile = readIndexEmbeddingProfile(database);
+      const queryEmbedding = embeddingProfile
+        ? await this.queryEmbedding(query, embeddingProfile, queryEmbeddings)
+        : undefined;
       const semantic = queryEmbedding
         ? semanticSearch(database, queryEmbedding, limit * 3)
         : [];
@@ -390,6 +410,7 @@ export class DocumentEngine {
         ["source_kind", source.kind],
         ["source_path", source.path],
         ["source_digest", source.digest ?? ""],
+        ["embedding_profile", CURRENT_EMBEDDING_PROFILE],
         ["indexed_at", new Date().toISOString()],
         ["page_count", String(new Set(chunks.map((chunk) => chunk.page)).size)],
         ["chunk_count", String(chunks.length)],
@@ -536,10 +557,37 @@ export class DocumentEngine {
   ): Promise<Array<Float32Array | undefined>> {
     const embedderReady = await this.ensureEmbedder();
     if (!embedderReady) return chunks.map(() => undefined);
-    return Promise.all(chunks.map((chunk) => this.embedText(chunk.text)));
+    return Promise.all(
+      chunks.map((chunk) =>
+        this.embedText(
+          prepareEmbeddingText(chunk.text, "document"),
+          CURRENT_EMBEDDING_PROFILE,
+        ),
+      ),
+    );
   }
 
-  private async embedText(text: string): Promise<Float32Array | undefined> {
+  private queryEmbedding(
+    query: string,
+    profile: EmbeddingProfile,
+    cache: QueryEmbeddingCache,
+  ): Promise<Float32Array | undefined> {
+    const cached = cache.get(profile);
+    if (cached) return cached;
+    // 全库检索会逐篇读取 SQLite，但同一条 query 不应为每篇论文重复跑 ONNX。
+    // 以 embedding profile 为键缓存 Promise，混合新旧索引时也最多只调用两次。
+    const pending = this.embedText(
+      prepareEmbeddingText(query, "query", profile),
+      profile,
+    );
+    cache.set(profile, pending);
+    return pending;
+  }
+
+  private async embedText(
+    text: string,
+    profile: EmbeddingProfile,
+  ): Promise<Float32Array | undefined> {
     if (!(await this.ensureEmbedder()) || !this.tokenizer || !this.session)
       return undefined;
     try {
@@ -581,25 +629,7 @@ export class DocumentEngine {
       };
       const output = await this.session.run(feeds);
       const values = output.last_hidden_state.data as Float32Array;
-      const embedding = new Float32Array(512);
-      let count = 0;
-      for (let token = 0; token < length; token += 1) {
-        if (!attentionMask[token]) continue;
-        count += 1;
-        const offset = token * 512;
-        for (let dimension = 0; dimension < 512; dimension += 1) {
-          embedding[dimension] += values[offset + dimension];
-        }
-      }
-      let norm = 0;
-      for (let index = 0; index < embedding.length; index += 1) {
-        embedding[index] /= Math.max(count, 1);
-        norm += embedding[index] ** 2;
-      }
-      norm = Math.sqrt(norm) || 1;
-      for (let index = 0; index < embedding.length; index += 1)
-        embedding[index] /= norm;
-      return embedding;
+      return poolEmbedding(values, attentionMask, length, profile);
     } catch (error) {
       this.embeddingError =
         error instanceof Error ? error.message : String(error);
@@ -630,6 +660,65 @@ export class DocumentEngine {
       return false;
     }
   }
+}
+
+export function prepareEmbeddingText(
+  text: string,
+  role: EmbeddingRole,
+  profile: EmbeddingProfile = CURRENT_EMBEDDING_PROFILE,
+): string {
+  const normalized = text.trim();
+  if (role !== "query" || profile === LEGACY_EMBEDDING_PROFILE) {
+    return normalized;
+  }
+  // BGE 的检索 instruction 只加在 query 上；文档向量保持原文，
+  // 否则两侧都加提示会改变模型训练时约定的检索空间。
+  return `${BGE_QUERY_INSTRUCTION}${normalized}`;
+}
+
+export function poolEmbedding(
+  values: Float32Array,
+  attentionMask: number[],
+  tokenCount: number,
+  profile: EmbeddingProfile = CURRENT_EMBEDDING_PROFILE,
+): Float32Array {
+  if (tokenCount < 1 || values.length < tokenCount * EMBEDDING_DIMENSIONS) {
+    throw new Error("Embedding model returned an invalid hidden state.");
+  }
+
+  const embedding = new Float32Array(EMBEDDING_DIMENSIONS);
+  if (profile === CURRENT_EMBEDDING_PROFILE) {
+    // BGE 官方用最后一层的 [CLS] token 作为句向量，再进行 L2 normalize。
+    embedding.set(values.subarray(0, EMBEDDING_DIMENSIONS));
+  } else {
+    // 旧版 PaperXcel 使用 attention-mask mean pooling。保留该分支只为读取
+    // 已经落盘的旧向量；新索引统一写入带版本标记的 CLS 向量。
+    let includedTokens = 0;
+    for (let token = 0; token < tokenCount; token += 1) {
+      if (!attentionMask[token]) continue;
+      includedTokens += 1;
+      const offset = token * EMBEDDING_DIMENSIONS;
+      for (
+        let dimension = 0;
+        dimension < EMBEDDING_DIMENSIONS;
+        dimension += 1
+      ) {
+        embedding[dimension] += values[offset + dimension];
+      }
+    }
+    const divisor = Math.max(includedTokens, 1);
+    for (let index = 0; index < embedding.length; index += 1) {
+      embedding[index] /= divisor;
+    }
+  }
+
+  let norm = 0;
+  for (const value of embedding) norm += value ** 2;
+  norm = Math.sqrt(norm) || 1;
+  for (let index = 0; index < embedding.length; index += 1) {
+    embedding[index] /= norm;
+  }
+  return embedding;
 }
 
 export function parseMarkdownPages(markdown: string): DocumentPageText[] {
@@ -679,10 +768,33 @@ function markdownPageNumber(line: string): number | undefined {
   return Number.isInteger(page) && page > 0 ? page : undefined;
 }
 
+function readIndexEmbeddingProfile(
+  database: DatabaseSync,
+): EmbeddingProfile | undefined {
+  try {
+    const row = database
+      .prepare("SELECT value FROM index_metadata WHERE key = ?")
+      .get("embedding_profile") as { value?: string } | undefined;
+    if (!row?.value) return LEGACY_EMBEDDING_PROFILE;
+    if (
+      row.value === CURRENT_EMBEDDING_PROFILE ||
+      row.value === LEGACY_EMBEDDING_PROFILE
+    ) {
+      return row.value;
+    }
+    // 显式标记但当前代码不认识的版本不能猜测 pooling 方式，否则会混算向量。
+    return undefined;
+  } catch {
+    // embedding_profile 引入前的索引没有该元数据，均由旧 mean pooling 生成。
+    return LEGACY_EMBEDDING_PROFILE;
+  }
+}
+
 function readIndexSummary(indexPath: string):
   | {
       sourceKind?: string;
       sourceDigest?: string;
+      embeddingProfile?: string;
       pageCount: number;
       chunkCount: number;
       semanticReady: boolean;
@@ -704,6 +816,7 @@ function readIndexSummary(indexPath: string):
     return {
       sourceKind: metadata.get("source_kind"),
       sourceDigest: metadata.get("source_digest"),
+      embeddingProfile: metadata.get("embedding_profile"),
       pageCount: Number(metadata.get("page_count")) || 0,
       chunkCount: Number(metadata.get("chunk_count")) || 0,
       semanticReady: metadata.get("semantic_ready") === "true",

@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type PointerEvent,
+} from "react";
 import dagre from "@dagrejs/dagre";
 import {
   Background,
@@ -13,6 +22,7 @@ import {
   type Edge,
   type Node,
   type NodeProps,
+  type Viewport,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import {
@@ -25,9 +35,13 @@ import {
   ChevronUp,
   CircleHelp,
   Copy,
+  Braces,
+  ChartNetwork,
+  Compass,
   Database,
+  Download,
   ExternalLink,
-  FilePlus2,
+  FileCode2,
   FileText,
   Filter,
   FolderOpen,
@@ -42,20 +56,35 @@ import {
   X,
 } from "lucide-react";
 import type {
+  CitationDiscoveryResult,
   CitationGraphNode,
   CitationGraphSnapshot,
+  CitationGraphExportFormat,
   CitationMatchStatus,
   CitationMetadataSource,
+  CitationNetworkAnalysis,
   LibraryFolder,
   Paper,
 } from "../../shared/contracts";
 import { normalizeCitationDoi } from "../../shared/citationGraph";
+import { CitationAnalysisPanel } from "./CitationAnalysisPanel";
+import { CitationDiscoveryPanel } from "./CitationDiscoveryPanel";
+import {
+  buildCitationGraphExportDocument,
+  buildCitationGraphExportScene,
+  buildCitationGraphInteractiveHtml,
+  serializeCitationGraphExportDocument,
+} from "./citationGraphExport";
 
 interface CitationGraphWorkspaceProps {
   papers: Paper[];
   folders: LibraryFolder[];
+  sidebarWidth: number;
+  sidebarMinWidth: number;
+  sidebarMaxWidth: number;
+  onSidebarResizePointerDown: (event: PointerEvent<HTMLDivElement>) => void;
+  onSidebarResizeKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
   onOpenPaper: (paperId: string) => void;
-  onPaperImported: (paper: Paper) => void;
   onOpenSettings: () => void;
   onError: (message: string) => void;
 }
@@ -67,10 +96,16 @@ interface CitationNodeData extends Record<string, unknown> {
 
 type CitationFlowNode = Node<CitationNodeData, "citation">;
 type DetailTab = "details" | "abstract" | "notes" | "relations";
+type CitationWorkspaceView = "graph" | "discovery" | "analysis";
 
 interface DetailPanelPosition {
   left: number;
   top: number;
+}
+
+interface SavedGraphViewport {
+  layoutKey: string;
+  viewport: Viewport;
 }
 
 const nodeTypes = { citation: CitationNode };
@@ -104,20 +139,35 @@ export function CitationGraphWorkspace(
 function CitationGraphWorkspaceContent({
   papers,
   folders,
+  sidebarWidth,
+  sidebarMinWidth,
+  sidebarMaxWidth,
+  onSidebarResizePointerDown,
+  onSidebarResizeKeyDown,
   onOpenPaper,
-  onPaperImported,
   onOpenSettings,
   onError,
 }: CitationGraphWorkspaceProps): React.JSX.Element {
-  const { fitView } = useReactFlow();
+  const { fitView, getViewport, setViewport } = useReactFlow();
   const [snapshot, setSnapshot] = useState<CitationGraphSnapshot>({
     nodes: [],
     edges: [],
     errors: [],
   });
+  const [viewMode, setViewMode] = useState<CitationWorkspaceView>("graph");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [importing, setImporting] = useState(false);
+  const [discovering, setDiscovering] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [discoveryQuery, setDiscoveryQuery] = useState("");
+  const [discoveryResult, setDiscoveryResult] =
+    useState<CitationDiscoveryResult>();
+  const [analysis, setAnalysis] = useState<CitationNetworkAnalysis>();
+  const [analysisFocusIds, setAnalysisFocusIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [exporting, setExporting] = useState<CitationGraphExportFormat>();
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [localPickerOpen, setLocalPickerOpen] = useState(true);
   const [selectedPaperIds, setSelectedPaperIds] = useState<Set<string>>(
@@ -143,6 +193,11 @@ function CitationGraphWorkspaceContent({
   const [activeTab, setActiveTab] = useState<DetailTab>("details");
   const [noteContent, setNoteContent] = useState("");
   const [noteLoading, setNoteLoading] = useState(false);
+  const exportMenuRef = useRef<HTMLDivElement>(null);
+  const fittedLayoutKeyRef = useRef<string | undefined>(undefined);
+  const savedGraphViewportRef = useRef<SavedGraphViewport | undefined>(
+    undefined,
+  );
   const detailDragRef = useRef<
     | {
         pointerId: number;
@@ -155,6 +210,9 @@ function CitationGraphWorkspaceContent({
   useEffect(() => {
     const clearSnapshot = (): void => {
       setSnapshot({ nodes: [], edges: [], errors: [] });
+      setDiscoveryResult(undefined);
+      setAnalysis(undefined);
+      setAnalysisFocusIds(new Set());
       setSelectedId(undefined);
       setDetailMinimized(false);
     };
@@ -229,6 +287,7 @@ function CitationGraphWorkspaceContent({
       );
       if (selectionScopeRef.current !== requestedScope) return;
       setSnapshot(result.snapshot);
+      setAnalysis(undefined);
       if (result.failedPapers > 0) {
         onError(`图谱已更新，但有 ${result.failedPapers} 篇论文同步失败。`);
       }
@@ -241,6 +300,58 @@ function CitationGraphWorkspaceContent({
     }
   };
 
+  const discover = async (): Promise<void> => {
+    if (discovering || selectedPaperIdList.length === 0) return;
+    const requestedScope = selectionScopeKey;
+    setDiscovering(true);
+    try {
+      const result = await window.paperxcel.citationGraph.discover({
+        paperIds: selectedPaperIdList,
+        query: discoveryQuery,
+        limit: 80,
+      });
+      if (selectionScopeRef.current === requestedScope) {
+        setDiscoveryResult(result);
+      }
+    } catch (error) {
+      if (selectionScopeRef.current === requestedScope) {
+        onError(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
+  const analyze = useCallback(async (): Promise<void> => {
+    if (analyzing || selectedPaperIdList.length === 0) return;
+    const requestedScope = selectionScopeKey;
+    setAnalyzing(true);
+    try {
+      const result =
+        await window.paperxcel.citationGraph.analyze(selectedPaperIdList);
+      if (selectionScopeRef.current === requestedScope) {
+        setAnalysis(result);
+      }
+    } catch (error) {
+      if (selectionScopeRef.current === requestedScope) {
+        onError(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      setAnalyzing(false);
+    }
+  }, [analyzing, onError, selectedPaperIdList, selectionScopeKey]);
+
+  useEffect(() => {
+    if (
+      viewMode === "analysis" &&
+      selectedPaperIdList.length > 0 &&
+      !analysis &&
+      !analyzing
+    ) {
+      void analyze();
+    }
+  }, [analysis, analyze, analyzing, selectedPaperIdList.length, viewMode]);
+
   const updateSelectedPaperIds = (next: Set<string>): void => {
     selectionScopeRef.current = papers
       .filter((paper) => next.has(paper.id))
@@ -248,6 +359,9 @@ function CitationGraphWorkspaceContent({
       .join("\u0000");
     setSelectedPaperIds(next);
     setSnapshot({ nodes: [], edges: [], errors: [] });
+    setDiscoveryResult(undefined);
+    setAnalysis(undefined);
+    setAnalysisFocusIds(new Set());
     setLoading(true);
     setSelectedId(undefined);
     setDetailMinimized(false);
@@ -292,14 +406,21 @@ function CitationGraphWorkspaceContent({
   useEffect(() => {
     if (
       selectedId &&
-      !scopedSnapshot.nodes.some((node) => node.id === selectedId)
+      !scopedSnapshot.nodes.some((node) => node.id === selectedId) &&
+      !discoveryResult?.candidates.some(
+        (candidate) => candidate.work.id === selectedId,
+      )
     ) {
       setSelectedId(undefined);
       setDetailMinimized(false);
     }
-  }, [scopedSnapshot.nodes, selectedId]);
+  }, [discoveryResult, scopedSnapshot.nodes, selectedId]);
 
-  const selected = scopedSnapshot.nodes.find((node) => node.id === selectedId);
+  const selected =
+    scopedSnapshot.nodes.find((node) => node.id === selectedId) ??
+    discoveryResult?.candidates.find(
+      (candidate) => candidate.work.id === selectedId,
+    )?.work;
   const selectedPaper = useMemo(() => {
     if (!selected) return undefined;
     if (selected.paperId) {
@@ -423,12 +544,57 @@ function CitationGraphWorkspaceContent({
   ]);
 
   const flow = useMemo(
-    () => buildFlowGraph(visibleSnapshot.nodes, visibleSnapshot.edges, query),
-    [query, visibleSnapshot.edges, visibleSnapshot.nodes],
+    () =>
+      buildFlowGraph(
+        visibleSnapshot.nodes,
+        visibleSnapshot.edges,
+        query,
+        analysisFocusIds,
+      ),
+    [analysisFocusIds, query, visibleSnapshot.edges, visibleSnapshot.nodes],
   );
 
+  useLayoutEffect(() => {
+    if (viewMode !== "graph") return;
+    const saved = savedGraphViewportRef.current;
+    if (!saved || saved.layoutKey !== flow.layoutKey) return;
+    const frame = window.requestAnimationFrame(() => {
+      void setViewport(saved.viewport, { duration: 0 });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [flow.layoutKey, setViewport, viewMode]);
+
   useEffect(() => {
-    if (!flow.nodes.length) return;
+    if (!exportMenuOpen) return;
+    const closeOnPointerDown = (event: globalThis.PointerEvent): void => {
+      if (
+        event.target instanceof Node &&
+        exportMenuRef.current?.contains(event.target)
+      ) {
+        return;
+      }
+      setExportMenuOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent): void => {
+      if (event.key === "Escape") setExportMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnPointerDown);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnPointerDown);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [exportMenuOpen]);
+
+  useEffect(() => {
+    if (
+      viewMode !== "graph" ||
+      !flow.nodes.length ||
+      fittedLayoutKeyRef.current === flow.layoutKey
+    ) {
+      return;
+    }
+    fittedLayoutKeyRef.current = flow.layoutKey;
     let secondFrame: number | undefined;
     const fit = (): void => {
       void fitView({ padding: 0.16, duration: 0 });
@@ -444,11 +610,12 @@ function CitationGraphWorkspaceContent({
       }
       window.clearTimeout(retry);
     };
-  }, [fitView, flow.layoutKey, flow.nodes.length]);
+  }, [fitView, flow.layoutKey, flow.nodes.length, viewMode]);
 
   useEffect(() => {
     let timeout: number | undefined;
     const handleResize = (): void => {
+      if (viewMode !== "graph") return;
       window.clearTimeout(timeout);
       timeout = window.setTimeout(() => {
         void fitView({ padding: 0.16, duration: 0 });
@@ -459,31 +626,66 @@ function CitationGraphWorkspaceContent({
       window.clearTimeout(timeout);
       window.removeEventListener("resize", handleResize);
     };
-  }, [fitView]);
-
-  const importSelected = async (): Promise<void> => {
-    if (!selected?.doi || importing) return;
-    setImporting(true);
-    try {
-      const paper = await window.paperxcel.papers.addFromIdentifier(
-        selected.doi,
-      );
-      onPaperImported(paper);
-      await loadSnapshot();
-      setSelectedId(`paper:${paper.id}`);
-      setDetailMinimized(false);
-    } catch (error) {
-      onError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setImporting(false);
-    }
-  };
+  }, [fitView, viewMode]);
 
   const copyDoi = async (): Promise<void> => {
     if (!selected?.doi) return;
     await window.paperxcel.clipboard.writeText(selected.doi);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1400);
+  };
+
+  const exportGraph = async (
+    format: CitationGraphExportFormat,
+  ): Promise<void> => {
+    if (exporting || !flow.nodes.length) return;
+    setExportMenuOpen(false);
+    setExporting(format);
+    try {
+      const exportedAt = new Date();
+      const filterLabels = [
+        selectedScopeLabel,
+        selectedYearLabel ? `年份 ${selectedYearLabel}` : undefined,
+        query.trim() ? `搜索“${query.trim()}”` : undefined,
+      ].filter((label): label is string => Boolean(label));
+      const document = buildCitationGraphExportDocument({
+        exportedAt: exportedAt.toISOString(),
+        title: "PaperXcel 引文图谱",
+        subtitle: `${visibleSnapshot.nodes.length} 个节点 · ${visibleSnapshot.edges.length} 条关系 · ${filterLabels.join(" · ")}`,
+        sourceUpdatedAt: snapshot.updatedAt,
+        filters: {
+          selectedPaperIds: selectedPaperIdList,
+          selectedScopeLabel,
+          yearRange: selectedYearRange,
+          query,
+          showLocal,
+          showExternal,
+          showReferences,
+          showCiting,
+        },
+        nodes: flow.nodes.map((node) => ({
+          id: node.id,
+          x: node.position.x,
+          y: node.position.y,
+          width: nodeWidth,
+          height: nodeHeight,
+          citation: node.data.citation,
+          dimmed: node.data.dimmed,
+        })),
+        edges: visibleSnapshot.edges,
+        errors: snapshot.errors,
+      });
+      const scene = buildCitationGraphExportScene(document);
+      const content =
+        format === "json"
+          ? serializeCitationGraphExportDocument(document)
+          : buildCitationGraphInteractiveHtml(document, scene);
+      await window.paperxcel.citationGraph.export({ format, content });
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setExporting(undefined);
+    }
   };
 
   const openSelectedSource = (): void => {
@@ -505,6 +707,32 @@ function CitationGraphWorkspaceContent({
 
   const closeDetails = (): void => {
     setSelectedId(undefined);
+    setDetailMinimized(false);
+  };
+
+  const changeViewMode = (nextViewMode: CitationWorkspaceView): void => {
+    if (viewMode === "graph" && nextViewMode !== "graph") {
+      savedGraphViewportRef.current = {
+        layoutKey: flow.layoutKey,
+        viewport: getViewport(),
+      };
+    }
+    setViewMode(nextViewMode);
+  };
+
+  const focusGraphNodes = (nodeIds: string[]): void => {
+    setAnalysisFocusIds(new Set(nodeIds));
+    setShowLocal(true);
+    setShowExternal(true);
+    setShowReferences(true);
+    setShowCiting(true);
+    setSelectedYearRange(undefined);
+    changeViewMode("graph");
+  };
+
+  const selectAnalysisNode = (nodeId: string): void => {
+    focusGraphNodes([nodeId]);
+    setSelectedId(nodeId);
     setDetailMinimized(false);
   };
 
@@ -566,25 +794,128 @@ function CitationGraphWorkspaceContent({
           <div>
             <h2>引文图谱</h2>
             <p title={selectedScopeLabel}>
-              {selectedScopeLabel} · OpenAlex / Crossref 引文网络
+              {selectedScopeLabel} ·{" "}
+              {viewMode === "graph"
+                ? "OpenAlex / Crossref 引文网络"
+                : viewMode === "discovery"
+                  ? "外部论文发现"
+                  : "引文网络分析"}
             </p>
           </div>
         </div>
-        <label className="citation-browser-search">
-          <Search size={15} />
-          <input
-            value={query}
-            placeholder="搜索标题、作者、DOI 等"
-            aria-label="搜索引文图谱"
-            onChange={(event) => setQuery(event.target.value)}
-          />
-          {query && (
-            <button type="button" title="清除搜索" onClick={() => setQuery("")}>
-              <X size={14} />
+        <div className="citation-browser-center">
+          <div className="citation-workspace-tabs" role="tablist">
+            <button
+              className={viewMode === "graph" ? "active" : ""}
+              type="button"
+              role="tab"
+              aria-selected={viewMode === "graph"}
+              onClick={() => changeViewMode("graph")}
+            >
+              <Network size={14} />
+              图谱
             </button>
+            <button
+              className={viewMode === "discovery" ? "active" : ""}
+              type="button"
+              role="tab"
+              aria-selected={viewMode === "discovery"}
+              onClick={() => changeViewMode("discovery")}
+            >
+              <Compass size={14} />
+              发现
+            </button>
+            <button
+              className={viewMode === "analysis" ? "active" : ""}
+              type="button"
+              role="tab"
+              aria-selected={viewMode === "analysis"}
+              onClick={() => changeViewMode("analysis")}
+            >
+              <ChartNetwork size={14} />
+              分析
+            </button>
+          </div>
+          {viewMode !== "analysis" && (
+            <label className="citation-browser-search">
+              <Search size={15} />
+              <input
+                value={viewMode === "graph" ? query : discoveryQuery}
+                placeholder={
+                  viewMode === "graph"
+                    ? "搜索标题、作者、DOI 等"
+                    : "输入主题关键词，可留空使用选中文献"
+                }
+                aria-label={
+                  viewMode === "graph" ? "搜索引文图谱" : "外部论文发现关键词"
+                }
+                onChange={(event) => {
+                  if (viewMode === "graph") setQuery(event.target.value);
+                  else setDiscoveryQuery(event.target.value);
+                }}
+                onKeyDown={(event) => {
+                  if (viewMode === "discovery" && event.key === "Enter") {
+                    void discover();
+                  }
+                }}
+              />
+              {(viewMode === "graph" ? query : discoveryQuery) && (
+                <button
+                  type="button"
+                  title="清除搜索"
+                  onClick={() => {
+                    if (viewMode === "graph") setQuery("");
+                    else setDiscoveryQuery("");
+                  }}
+                >
+                  <X size={14} />
+                </button>
+              )}
+            </label>
           )}
-        </label>
+        </div>
         <div className="citation-browser-header-actions">
+          {viewMode === "graph" && (
+            <div className="citation-graph-export" ref={exportMenuRef}>
+              <button
+                className="citation-browser-export-trigger"
+                type="button"
+                title="导出当前图谱"
+                aria-haspopup="menu"
+                aria-expanded={exportMenuOpen}
+                disabled={Boolean(exporting) || flow.nodes.length === 0}
+                onClick={() => setExportMenuOpen((open) => !open)}
+              >
+                {exporting ? (
+                  <LoaderCircle className="spin" size={15} />
+                ) : (
+                  <Download size={15} />
+                )}
+                导出
+                <ChevronDown size={13} />
+              </button>
+              {exportMenuOpen && (
+                <div className="citation-graph-export-menu" role="menu">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => void exportGraph("json")}
+                  >
+                    <Braces size={16} />
+                    JSON 数据
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => void exportGraph("html")}
+                  >
+                    <FileCode2 size={16} />
+                    交互式 HTML
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
           <button
             className="citation-browser-icon-control"
             type="button"
@@ -596,20 +927,41 @@ function CitationGraphWorkspaceContent({
           <button
             className="citation-browser-refresh"
             type="button"
-            disabled={refreshing || selectedPaperIdList.length === 0}
-            onClick={() => void refresh(false)}
+            disabled={
+              selectedPaperIdList.length === 0 ||
+              (viewMode === "graph"
+                ? refreshing
+                : viewMode === "discovery"
+                  ? discovering
+                  : analyzing)
+            }
+            onClick={() => {
+              if (viewMode === "graph") void refresh(false);
+              else if (viewMode === "discovery") void discover();
+              else void analyze();
+            }}
           >
-            {refreshing ? (
+            {(viewMode === "graph" && refreshing) ||
+            (viewMode === "discovery" && discovering) ||
+            (viewMode === "analysis" && analyzing) ? (
               <LoaderCircle className="spin" size={15} />
+            ) : viewMode === "discovery" ? (
+              <Compass size={15} />
+            ) : viewMode === "analysis" ? (
+              <ChartNetwork size={15} />
             ) : (
               <RefreshCw size={15} />
             )}
-            刷新
+            {viewMode === "graph"
+              ? "刷新"
+              : viewMode === "discovery"
+                ? "发现论文"
+                : "重新分析"}
           </button>
         </div>
       </header>
 
-      {snapshot.errors.length > 0 && (
+      {viewMode === "graph" && snapshot.errors.length > 0 && (
         <div className="citation-browser-error">
           <CircleErrorText errors={snapshot.errors} />
           <button type="button" onClick={() => void refresh(true)}>
@@ -677,162 +1029,234 @@ function CitationGraphWorkspaceContent({
               </div>
             )}
           </section>
-          <p>引文网络视图</p>
+          {viewMode === "graph" && (
+            <>
+              <p>引文网络视图</p>
 
-          <section className="citation-filter-section">
-            <span className="citation-filter-label">数据源</span>
-            <label className="citation-filter-toggle">
-              <input
-                type="checkbox"
-                checked={showLocal}
-                onChange={(event) => setShowLocal(event.target.checked)}
-              />
-              <span className="citation-toggle-mark local" />
-              本地节点
-              <small>{libraryCount}</small>
-            </label>
-            <label className="citation-filter-toggle">
-              <input
-                type="checkbox"
-                checked={showExternal}
-                onChange={(event) => setShowExternal(event.target.checked)}
-              />
-              <span className="citation-toggle-mark external" />
-              外部节点
-              <small>{externalCount}</small>
-            </label>
-          </section>
+              <section className="citation-filter-section">
+                <span className="citation-filter-label">数据源</span>
+                <label className="citation-filter-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showLocal}
+                    onChange={(event) => setShowLocal(event.target.checked)}
+                  />
+                  <span className="citation-toggle-mark local" />
+                  本地节点
+                  <small>{libraryCount}</small>
+                </label>
+                <label className="citation-filter-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showExternal}
+                    onChange={(event) => setShowExternal(event.target.checked)}
+                  />
+                  <span className="citation-toggle-mark external" />
+                  外部节点
+                  <small>{externalCount}</small>
+                </label>
+              </section>
 
-          <section className="citation-filter-section">
-            <span className="citation-filter-label">关系类型</span>
-            <label className="citation-filter-toggle">
-              <input
-                type="checkbox"
-                checked={showReferences}
-                onChange={(event) => setShowReferences(event.target.checked)}
-              />
-              <ArrowDownLeft size={14} />
-              参考文献
-              <small className="citation-reference-count">
-                {referenceCount}
-              </small>
-            </label>
-            <label className="citation-filter-toggle">
-              <input
-                type="checkbox"
-                checked={showCiting}
-                onChange={(event) => setShowCiting(event.target.checked)}
-              />
-              <ArrowUpRight size={14} />
-              引用本文
-              <small className="citation-citing-count">{citingCount}</small>
-            </label>
-          </section>
+              <section className="citation-filter-section">
+                <span className="citation-filter-label">关系类型</span>
+                <label className="citation-filter-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showReferences}
+                    onChange={(event) =>
+                      setShowReferences(event.target.checked)
+                    }
+                  />
+                  <ArrowDownLeft size={14} />
+                  参考文献
+                  <small className="citation-reference-count">
+                    {referenceCount}
+                  </small>
+                </label>
+                <label className="citation-filter-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showCiting}
+                    onChange={(event) => setShowCiting(event.target.checked)}
+                  />
+                  <ArrowUpRight size={14} />
+                  引用本文
+                  <small className="citation-citing-count">{citingCount}</small>
+                </label>
+              </section>
 
-          <section className="citation-filter-section citation-timeline">
-            <button
-              className="citation-timeline-heading"
-              type="button"
-              onClick={() => setTimelineOpen((open) => !open)}
-              aria-expanded={timelineOpen}
-            >
-              <span>
-                <Filter size={14} />
-                时间范围
-              </span>
-              {timelineOpen ? (
-                <ChevronUp size={15} />
-              ) : (
-                <ChevronDown size={15} />
-              )}
-            </button>
-            {timelineOpen && (
-              <>
+              <section className="citation-filter-section citation-timeline">
                 <button
-                  className={`citation-year-all ${
-                    selectedYearRange ? "" : "active"
-                  }`}
+                  className="citation-timeline-heading"
                   type="button"
-                  onClick={() => setSelectedYearRange(undefined)}
+                  onClick={() => setTimelineOpen((open) => !open)}
+                  aria-expanded={timelineOpen}
                 >
-                  所有年份
+                  <span>
+                    <Filter size={14} />
+                    时间范围
+                  </span>
+                  {timelineOpen ? (
+                    <ChevronUp size={15} />
+                  ) : (
+                    <ChevronDown size={15} />
+                  )}
                 </button>
-                <div
-                  className="citation-year-range-controls"
-                  aria-label="年份范围"
-                >
-                  <label>
-                    <span>起始</span>
-                    <select
-                      aria-label="起始年份"
-                      disabled={timeline.length === 0}
-                      value={rangeStartYear ?? ""}
-                      onChange={(event) =>
-                        updateRangeStart(Number(event.target.value))
-                      }
-                    >
-                      {timeline.map(({ year }) => (
-                        <option key={year} value={year}>
-                          {year}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <span>至</span>
-                  <label>
-                    <span>结束</span>
-                    <select
-                      aria-label="结束年份"
-                      disabled={timeline.length === 0}
-                      value={rangeEndYear ?? ""}
-                      onChange={(event) =>
-                        updateRangeEnd(Number(event.target.value))
-                      }
-                    >
-                      {timeline.map(({ year }) => (
-                        <option key={year} value={year}>
-                          {year}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                </div>
-                <div className="citation-year-chart">
-                  {timeline.map(({ year, count }) => (
+                {timelineOpen && (
+                  <>
                     <button
-                      className={
-                        selectedYearRange &&
-                        year >= selectedYearRange[0] &&
-                        year <= selectedYearRange[1]
-                          ? "active"
-                          : ""
-                      }
-                      key={year}
+                      className={`citation-year-all ${
+                        selectedYearRange ? "" : "active"
+                      }`}
                       type="button"
-                      title={`${year}: ${count} 篇论文`}
-                      onClick={() =>
-                        setSelectedYearRange((current) =>
-                          current?.[0] === year && current[1] === year
-                            ? undefined
-                            : [year, year],
-                        )
-                      }
+                      onClick={() => setSelectedYearRange(undefined)}
                     >
-                      <small>{year}</small>
-                      <span className="citation-year-bar" aria-hidden="true">
-                        <span
-                          style={{
-                            width: `${Math.max(5, Math.min(112, count * 6))}px`,
-                          }}
-                        />
-                      </span>
-                      <strong>{count}</strong>
+                      所有年份
                     </button>
-                  ))}
+                    <div
+                      className="citation-year-range-controls"
+                      aria-label="年份范围"
+                    >
+                      <label>
+                        <span>起始</span>
+                        <select
+                          aria-label="起始年份"
+                          disabled={timeline.length === 0}
+                          value={rangeStartYear ?? ""}
+                          onChange={(event) =>
+                            updateRangeStart(Number(event.target.value))
+                          }
+                        >
+                          {timeline.map(({ year }) => (
+                            <option key={year} value={year}>
+                              {year}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <span>至</span>
+                      <label>
+                        <span>结束</span>
+                        <select
+                          aria-label="结束年份"
+                          disabled={timeline.length === 0}
+                          value={rangeEndYear ?? ""}
+                          onChange={(event) =>
+                            updateRangeEnd(Number(event.target.value))
+                          }
+                        >
+                          {timeline.map(({ year }) => (
+                            <option key={year} value={year}>
+                              {year}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <div className="citation-year-chart">
+                      {timeline.map(({ year, count }) => (
+                        <button
+                          className={
+                            selectedYearRange &&
+                            year >= selectedYearRange[0] &&
+                            year <= selectedYearRange[1]
+                              ? "active"
+                              : ""
+                          }
+                          key={year}
+                          type="button"
+                          title={`${year}: ${count} 篇论文`}
+                          onClick={() =>
+                            setSelectedYearRange((current) =>
+                              current?.[0] === year && current[1] === year
+                                ? undefined
+                                : [year, year],
+                            )
+                          }
+                        >
+                          <small>{year}</small>
+                          <span
+                            className="citation-year-bar"
+                            aria-hidden="true"
+                          >
+                            <span
+                              style={{
+                                width: `${Math.max(
+                                  5,
+                                  Math.min(112, count * 6),
+                                )}px`,
+                              }}
+                            />
+                          </span>
+                          <strong>{count}</strong>
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </section>
+            </>
+          )}
+
+          {viewMode === "discovery" && (
+            <>
+              <p>外部论文发现</p>
+              <section className="citation-filter-section citation-research-sidebar">
+                <span className="citation-filter-label">推荐信号</span>
+                <div>
+                  <Compass size={14} />
+                  <span>内容关键词匹配</span>
                 </div>
-              </>
-            )}
-          </section>
+                <div>
+                  <ArrowUpRight size={14} />
+                  <span>引用库内论文</span>
+                </div>
+                <div>
+                  <Link2 size={14} />
+                  <span>共享参考文献</span>
+                </div>
+              </section>
+              {discoveryResult && (
+                <section className="citation-filter-section citation-research-sidebar">
+                  <span className="citation-filter-label">本次结果</span>
+                  <div>
+                    <FileText size={14} />
+                    <span>候选论文</span>
+                    <small>{discoveryResult.candidates.length}</small>
+                  </div>
+                  <div>
+                    <Database size={14} />
+                    <span>内容关键词</span>
+                    <small>{discoveryResult.terms.length}</small>
+                  </div>
+                </section>
+              )}
+            </>
+          )}
+
+          {viewMode === "analysis" && (
+            <>
+              <p>网络结构分析</p>
+              <section className="citation-filter-section citation-research-sidebar">
+                <span className="citation-filter-label">分析结果</span>
+                <div>
+                  <ChartNetwork size={14} />
+                  <span>研究社区</span>
+                  <small>{analysis?.metrics.communityCount ?? 0}</small>
+                </div>
+                <div>
+                  <Link2 size={14} />
+                  <span>文献耦合</span>
+                  <small>{analysis?.bibliographicCoupling.length ?? 0}</small>
+                </div>
+                <div>
+                  <Network size={14} />
+                  <span>关键路径</span>
+                  <small>{analysis?.keyPaths.length ?? 0}</small>
+                </div>
+              </section>
+            </>
+          )}
 
           <div className="citation-filter-footer">
             <Database size={14} />
@@ -841,123 +1265,172 @@ function CitationGraphWorkspaceContent({
           </div>
         </aside>
 
-        <main className="citation-browser-canvas citation-graph-canvas">
-          <div className="citation-canvas-caption">
-            <div>
-              <span>引文网络</span>
-              <strong>
-                {visibleSnapshot.nodes.length} 个节点 ·{" "}
-                {visibleSnapshot.edges.length} 条关系
-              </strong>
-            </div>
-            {selectedYearLabel && (
-              <button
-                type="button"
-                onClick={() => setSelectedYearRange(undefined)}
-              >
-                {selectedYearLabel} <X size={13} />
-              </button>
-            )}
-          </div>
+        <div
+          className="panel-resize-handle citation-sidebar-resize-handle"
+          role="separator"
+          aria-label="调整引文图谱筛选栏宽度"
+          aria-orientation="vertical"
+          aria-valuemin={sidebarMinWidth}
+          aria-valuemax={sidebarMaxWidth}
+          aria-valuenow={sidebarWidth}
+          tabIndex={0}
+          onPointerDown={onSidebarResizePointerDown}
+          onKeyDown={onSidebarResizeKeyDown}
+        />
 
-          {loading ? (
-            <EmptyGraphState
-              icon={<LoaderCircle className="spin" size={24} />}
-              title="正在载入图谱"
-              description="正在读取已同步的引文关系。"
-            />
-          ) : selectedPaperIdList.length === 0 ? (
-            <EmptyGraphState
-              icon={<FolderOpen size={34} />}
-              title="先选择需要分析的论文"
-              description="在左侧展开本地文献，勾选一篇或多篇论文后，再点击右上角刷新构建引文网络。"
-            />
-          ) : scopedSnapshot.nodes.length === 0 ||
-            scopedSnapshot.edges.length === 0 ? (
-            <EmptyGraphState
-              icon={<Network size={34} />}
-              title="建立论文之间的关系"
-              description="刷新后会结合 OpenAlex、Crossref 与 PDF 文末书目补齐并校验参考文献，同时获取引用本文的高被引论文。"
-              action={
-                <button
-                  className="citation-empty-refresh"
-                  type="button"
-                  disabled={refreshing || selectedPaperIdList.length === 0}
-                  onClick={() => void refresh(false)}
-                >
-                  <RefreshCw size={15} />
-                  刷新图谱
-                </button>
-              }
-            />
-          ) : flow.nodes.length === 0 ? (
-            <EmptyGraphState
-              icon={<Filter size={30} />}
-              title="当前筛选条件没有匹配的论文"
-              description="调整左侧的数据源、关系或时间范围，重新显示图谱节点。"
-              action={
-                <button
-                  className="citation-empty-refresh"
-                  type="button"
-                  onClick={() => {
-                    setShowLocal(true);
-                    setShowExternal(true);
-                    setShowReferences(true);
-                    setShowCiting(true);
-                    setSelectedYearRange(undefined);
+        <main
+          className={`citation-browser-canvas citation-graph-canvas citation-view-${viewMode}`}
+        >
+          {viewMode === "graph" ? (
+            <>
+              <div className="citation-canvas-caption">
+                <div>
+                  <span>引文网络</span>
+                  <strong>
+                    {visibleSnapshot.nodes.length} 个节点 ·{" "}
+                    {visibleSnapshot.edges.length} 条关系
+                  </strong>
+                </div>
+                {selectedYearLabel && (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedYearRange(undefined)}
+                  >
+                    {selectedYearLabel} <X size={13} />
+                  </button>
+                )}
+                {analysisFocusIds.size > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setAnalysisFocusIds(new Set())}
+                  >
+                    高亮 {analysisFocusIds.size} 个节点 <X size={13} />
+                  </button>
+                )}
+              </div>
+
+              {loading ? (
+                <EmptyGraphState
+                  icon={<LoaderCircle className="spin" size={24} />}
+                  title="正在载入图谱"
+                  description="正在读取已同步的引文关系。"
+                />
+              ) : selectedPaperIdList.length === 0 ? (
+                <EmptyGraphState
+                  icon={<FolderOpen size={34} />}
+                  title="先选择需要分析的论文"
+                  description="在左侧展开本地文献，勾选一篇或多篇论文后，再点击右上角刷新构建引文网络。"
+                />
+              ) : scopedSnapshot.nodes.length === 0 ||
+                scopedSnapshot.edges.length === 0 ? (
+                <EmptyGraphState
+                  icon={<Network size={34} />}
+                  title="建立论文之间的关系"
+                  description="刷新后会结合 OpenAlex、Crossref 与 PDF 文末书目补齐并校验参考文献，同时获取引用本文的高被引论文。"
+                  action={
+                    <button
+                      className="citation-empty-refresh"
+                      type="button"
+                      disabled={refreshing || selectedPaperIdList.length === 0}
+                      onClick={() => void refresh(false)}
+                    >
+                      <RefreshCw size={15} />
+                      刷新图谱
+                    </button>
+                  }
+                />
+              ) : flow.nodes.length === 0 ? (
+                <EmptyGraphState
+                  icon={<Filter size={30} />}
+                  title="当前筛选条件没有匹配的论文"
+                  description="调整左侧的数据源、关系或时间范围，重新显示图谱节点。"
+                  action={
+                    <button
+                      className="citation-empty-refresh"
+                      type="button"
+                      onClick={() => {
+                        setShowLocal(true);
+                        setShowExternal(true);
+                        setShowReferences(true);
+                        setShowCiting(true);
+                        setSelectedYearRange(undefined);
+                      }}
+                    >
+                      重置筛选
+                    </button>
+                  }
+                />
+              ) : (
+                <ReactFlow
+                  nodes={flow.nodes}
+                  edges={flow.edges}
+                  nodeTypes={nodeTypes}
+                  minZoom={0.2}
+                  maxZoom={1.8}
+                  nodesDraggable
+                  nodesConnectable={false}
+                  elementsSelectable
+                  onMoveEnd={(_event, viewport) => {
+                    savedGraphViewportRef.current = {
+                      layoutKey: flow.layoutKey,
+                      viewport,
+                    };
                   }}
+                  onNodeClick={(_event, node) => openDetails(node.id)}
+                  onPaneClick={closeDetails}
                 >
-                  重置筛选
-                </button>
-              }
+                  <Background color="#dfe5e3" gap={26} size={1} />
+                  <Controls showInteractive={false} />
+                  <MiniMap
+                    className="citation-graph-minimap"
+                    nodeColor={(node) =>
+                      (node.data as CitationNodeData).citation.kind ===
+                      "library"
+                        ? "#247c70"
+                        : "#5aa59e"
+                    }
+                    maskColor="rgba(233, 239, 237, 0.68)"
+                  />
+                </ReactFlow>
+              )}
+
+              <div className="citation-canvas-key" aria-label="图例">
+                <span>
+                  <i className="local" />
+                  本地资料库
+                </span>
+                <span>
+                  <i className="reference" />
+                  参考文献
+                </span>
+                <span>
+                  <i className="citing" />
+                  引用本文
+                </span>
+              </div>
+            </>
+          ) : viewMode === "discovery" ? (
+            <CitationDiscoveryPanel
+              result={discoveryResult}
+              loading={discovering}
+              selectedPaperCount={selectedPaperIdList.length}
+              onOpenDetails={(work) => openDetails(work.id)}
+              onOpenSource={(sourceUrl) => window.open(sourceUrl, "_blank")}
             />
           ) : (
-            <ReactFlow
-              nodes={flow.nodes}
-              edges={flow.edges}
-              nodeTypes={nodeTypes}
-              minZoom={0.2}
-              maxZoom={1.8}
-              fitView
-              fitViewOptions={{ padding: 0.16, duration: 0 }}
-              nodesDraggable
-              nodesConnectable={false}
-              elementsSelectable
-              onNodeClick={(_event, node) => openDetails(node.id)}
-              onPaneClick={closeDetails}
-            >
-              <Background color="#dfe5e3" gap={26} size={1} />
-              <Controls showInteractive={false} />
-              <MiniMap
-                className="citation-graph-minimap"
-                nodeColor={(node) =>
-                  (node.data as CitationNodeData).citation.kind === "library"
-                    ? "#247c70"
-                    : "#5aa59e"
-                }
-                maskColor="rgba(233, 239, 237, 0.68)"
-              />
-            </ReactFlow>
+            <CitationAnalysisPanel
+              analysis={analysis}
+              snapshot={scopedSnapshot}
+              loading={analyzing}
+              selectedPaperCount={selectedPaperIdList.length}
+              onFocusNodes={focusGraphNodes}
+              onSelectNode={selectAnalysisNode}
+            />
           )}
-
-          <div className="citation-canvas-key" aria-label="图例">
-            <span>
-              <i className="local" />
-              本地资料库
-            </span>
-            <span>
-              <i className="reference" />
-              参考文献
-            </span>
-            <span>
-              <i className="citing" />
-              引用本文
-            </span>
-          </div>
         </main>
       </div>
 
-      {selected && !detailMinimized && (
+      {viewMode !== "analysis" && selected && !detailMinimized && (
         <aside
           className="citation-browser-details citation-detail-popover citation-graph-inspector"
           style={{
@@ -1103,26 +1576,12 @@ function CitationGraphWorkspaceContent({
                 <FolderOpen size={15} />
                 在资料库中打开
               </button>
-            ) : selected.doi ? (
-              <button
-                className="citation-library-action"
-                type="button"
-                disabled={importing}
-                onClick={() => void importSelected()}
-              >
-                {importing ? (
-                  <LoaderCircle className="spin" size={15} />
-                ) : (
-                  <FilePlus2 size={15} />
-                )}
-                导入到资料库
-              </button>
             ) : null}
           </footer>
         </aside>
       )}
 
-      {selected && detailMinimized && (
+      {viewMode !== "analysis" && selected && detailMinimized && (
         <button
           className="citation-detail-minimized"
           type="button"
@@ -1747,6 +2206,7 @@ function buildFlowGraph(
   citationNodes: CitationGraphNode[],
   citationEdges: CitationGraphSnapshot["edges"],
   query: string,
+  focusedNodeIds: ReadonlySet<string> = new Set(),
 ): { nodes: CitationFlowNode[]; edges: Edge[]; layoutKey: string } {
   const graph = new dagre.graphlib.Graph();
   graph.setDefaultEdgeLabel(() => ({}));
@@ -1787,7 +2247,8 @@ function buildFlowGraph(
         data: {
           citation,
           dimmed: Boolean(
-            normalizedQuery && !haystack.includes(normalizedQuery),
+            (normalizedQuery && !haystack.includes(normalizedQuery)) ||
+            (focusedNodeIds.size > 0 && !focusedNodeIds.has(citation.id)),
           ),
         },
       };
@@ -1813,6 +2274,8 @@ function buildFlowGraph(
         style: { stroke: color, strokeWidth: 1.35 },
       };
     }),
+    // 高亮只改变节点明暗，不改变 dagre 布局。不要把 focusedNodeIds 写入
+    // layoutKey，否则从“分析”返回图谱时会误触发 fitView 并重置用户缩放。
     layoutKey: `${citationNodes.map((node) => node.id).join("|")}:${citationEdges
       .map((edge) => edge.id)
       .join("|")}`,

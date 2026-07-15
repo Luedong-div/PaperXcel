@@ -18,7 +18,10 @@ import { normalizeMarkdownMath } from "./markdown";
 interface PaperNotesProps {
   paper: Paper;
   onError: (message: string) => void;
+  onContentChange?: (paperId: string, content: string) => void;
   onGeneratingChange?: (paperId: string, generating: boolean) => void;
+  showGenerate?: boolean;
+  emptyMessage?: string;
 }
 
 type SaveState =
@@ -49,7 +52,10 @@ const NOTE_PLACEHOLDER = `## 研究问题
 export function PaperNotes({
   paper,
   onError,
+  onContentChange,
   onGeneratingChange,
+  showGenerate = true,
+  emptyMessage,
 }: PaperNotesProps): React.JSX.Element {
   const [content, setContent] = useState("");
   const [view, setView] = useState<NoteView>(readStoredNoteView);
@@ -76,6 +82,7 @@ export function PaperNotes({
         savedRef.current = next;
         loadedRef.current = true;
         setContent(next);
+        onContentChange?.(paper.id, next);
         setSaveState("saved");
       })
       .catch((error: unknown) => {
@@ -96,7 +103,7 @@ export function PaperNotes({
         );
       }
     };
-  }, [onError, paper.id]);
+  }, [onContentChange, onError, paper.id]);
 
   useEffect(() => {
     try {
@@ -132,6 +139,7 @@ export function PaperNotes({
   const updateContent = (next: string): void => {
     setContent(next);
     draftRef.current = next;
+    onContentChange?.(paper.id, next);
     setSaveState("saving");
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = setTimeout(() => {
@@ -159,6 +167,7 @@ export function PaperNotes({
       draftRef.current = result.note.content;
       savedRef.current = result.note.content;
       setContent(result.note.content);
+      onContentChange?.(paper.id, result.note.content);
       setSaveState("generated");
       if (result.warning) onError(result.warning);
     } catch (error) {
@@ -224,26 +233,28 @@ export function PaperNotes({
           >
             <Download size={16} />
           </button>
-          <button
-            className="note-generate-button"
-            type="button"
-            disabled={paper.status !== "ready" || generating}
-            onClick={() => void generate()}
-          >
-            {generating ? (
-              <LoaderCircle className="spin" size={15} />
-            ) : (
-              <Sparkles size={15} />
-            )}
-            {generating ? "生成中" : "AI 生成"}
-          </button>
+          {showGenerate ? (
+            <button
+              className="note-generate-button"
+              type="button"
+              disabled={paper.status !== "ready" || generating}
+              onClick={() => void generate()}
+            >
+              {generating ? (
+                <LoaderCircle className="spin" size={15} />
+              ) : (
+                <Sparkles size={15} />
+              )}
+              {generating ? "生成中" : "AI 生成"}
+            </button>
+          ) : null}
         </div>
       </header>
       {view === "edit" ? (
         <textarea
           className="note-editor"
           aria-label="阅读笔记"
-          placeholder={NOTE_PLACEHOLDER}
+          placeholder={emptyMessage ?? NOTE_PLACEHOLDER}
           disabled={saveState === "loading" || generating}
           value={content}
           onChange={(event) => updateContent(event.target.value)}
@@ -263,7 +274,9 @@ export function PaperNotes({
               {normalizeMarkdownMath(content)}
             </ReactMarkdown>
           ) : (
-            <p className="note-preview-empty">还没有可预览的笔记。</p>
+            <p className="note-preview-empty">
+              {emptyMessage ?? "还没有可预览的笔记。"}
+            </p>
           )}
         </div>
       )}

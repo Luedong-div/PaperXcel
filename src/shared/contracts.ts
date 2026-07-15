@@ -303,28 +303,12 @@ export interface DocumentPageText {
   text: string;
 }
 
-export interface ComparisonCitation {
+export interface LibraryCitation {
   paperId: string;
   paperLabel: string;
   page: number;
   chunkId?: string;
   excerpt?: string;
-}
-
-export interface ComparisonReport {
-  id: string;
-  paperIds: string[];
-  question: string;
-  content: string;
-  citations: ComparisonCitation[];
-  protocol: Exclude<ProviderProtocol, "auto">;
-  model: string;
-  createdAt: string;
-}
-
-export interface ComparePapersInput {
-  paperIds: string[];
-  question: string;
 }
 
 export interface LibrarySearchInput {
@@ -354,7 +338,7 @@ export interface LibraryAskInput {
 
 export interface LibraryAskResult {
   content: string;
-  citations: ComparisonCitation[];
+  citations: LibraryCitation[];
   protocol: Exclude<ProviderProtocol, "auto">;
   model: string;
 }
@@ -447,9 +431,99 @@ export interface CitationGraphRefreshResult {
   failedPapers: number;
 }
 
+export type CitationDiscoveryReason =
+  | "topic-match"
+  | "cites-library"
+  | "shared-references";
+
+export type CitationContentMatchPriority = "low" | "standard" | "high";
+
+export interface CitationDiscoveryInput {
+  paperIds?: string[];
+  query?: string;
+  limit?: number;
+}
+
+export interface CitationDiscoveryCandidate {
+  work: CitationGraphNode;
+  score: number;
+  relevanceScore: number;
+  citationImpactScore: number;
+  recencyScore: number;
+  sharedReferenceCount: number;
+  matchedPaperIds: string[];
+  reasons: CitationDiscoveryReason[];
+}
+
+export interface CitationDiscoveryResult {
+  candidates: CitationDiscoveryCandidate[];
+  query: string;
+  terms: string[];
+  searchedAt: string;
+  warnings: string[];
+}
+
+export interface CitationNetworkCommunity {
+  id: string;
+  label: string;
+  nodeIds: string[];
+  size: number;
+  libraryCount: number;
+  externalCount: number;
+  topTerms: string[];
+  startYear?: number;
+  endYear?: number;
+  citedByCount: number;
+}
+
+export interface CitationNetworkSimilarity {
+  source: string;
+  target: string;
+  score: number;
+  sharedCount: number;
+}
+
+export interface CitationNetworkPath {
+  id: string;
+  nodeIds: string[];
+  score: number;
+  startYear?: number;
+  endYear?: number;
+}
+
+export interface CitationNetworkBridge {
+  nodeId: string;
+  score: number;
+  degree: number;
+  connectedCommunities: number;
+}
+
+export interface CitationNetworkAnalysis {
+  generatedAt: string;
+  metrics: {
+    nodeCount: number;
+    edgeCount: number;
+    density: number;
+    componentCount: number;
+    communityCount: number;
+  };
+  communities: CitationNetworkCommunity[];
+  bibliographicCoupling: CitationNetworkSimilarity[];
+  coCitation: CitationNetworkSimilarity[];
+  keyPaths: CitationNetworkPath[];
+  bridges: CitationNetworkBridge[];
+}
+
 export interface CitationGraphClearResult {
   clearedWorks: number;
   clearedPapers: number;
+}
+
+export type CitationGraphExportFormat = "json" | "html";
+
+export interface CitationGraphExportRequest {
+  format: CitationGraphExportFormat;
+  content: string;
 }
 
 export interface WorkerStatus {
@@ -559,6 +633,7 @@ export interface PaperXcelApi {
     translate: (input: TranslationInput) => Promise<TranslationResult>;
   };
   notes: {
+    list: () => Promise<PaperNote[]>;
     get: (paperId: string) => Promise<PaperNote | null>;
     save: (paperId: string, content: string) => Promise<PaperNote>;
     generate: (paperId: string) => Promise<GeneratePaperNoteResult>;
@@ -586,12 +661,6 @@ export interface PaperXcelApi {
       listener: (progress: KnowledgeBaseRepairProgress) => void,
     ) => () => void;
   };
-  comparisons: {
-    list: () => Promise<ComparisonReport[]>;
-    generate: (input: ComparePapersInput) => Promise<ComparisonReport>;
-    remove: (reportId: string) => Promise<void>;
-    exportMarkdown: (reportId: string) => Promise<boolean>;
-  };
   search: {
     library: (input: LibrarySearchInput) => Promise<LibrarySearchHit[]>;
     askLibrary: (input: LibraryAskInput) => Promise<LibraryAskResult>;
@@ -599,6 +668,14 @@ export interface PaperXcelApi {
   settings: {
     getScihubEnabled: () => Promise<boolean>;
     setScihubEnabled: (enabled: boolean) => Promise<boolean>;
+    getPreprintFallbackEnabled: () => Promise<boolean>;
+    setPreprintFallbackEnabled: (enabled: boolean) => Promise<boolean>;
+    getCitationAiOptimizationEnabled: () => Promise<boolean>;
+    setCitationAiOptimizationEnabled: (enabled: boolean) => Promise<boolean>;
+    getCitationContentMatchPriority: () => Promise<CitationContentMatchPriority>;
+    setCitationContentMatchPriority: (
+      priority: CitationContentMatchPriority,
+    ) => Promise<CitationContentMatchPriority>;
   };
   openAlex: {
     getConfig: () => Promise<OpenAlexConfig>;
@@ -611,7 +688,12 @@ export interface PaperXcelApi {
       force?: boolean,
       paperIds?: string[],
     ) => Promise<CitationGraphRefreshResult>;
+    discover: (
+      input: CitationDiscoveryInput,
+    ) => Promise<CitationDiscoveryResult>;
+    analyze: (paperIds?: string[]) => Promise<CitationNetworkAnalysis>;
     clear: () => Promise<CitationGraphClearResult>;
+    export: (request: CitationGraphExportRequest) => Promise<boolean>;
   };
   zotero: {
     getConfig: () => Promise<ZoteroConfig>;

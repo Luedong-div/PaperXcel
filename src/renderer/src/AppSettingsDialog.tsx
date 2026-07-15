@@ -7,6 +7,7 @@ import {
   KeyRound,
   Languages,
   Library,
+  ListChecks,
   LoaderCircle,
   RefreshCw,
   Save,
@@ -16,6 +17,7 @@ import {
 } from "lucide-react";
 import { normalizeZoteroUserLibraryId } from "../../shared/zotero";
 import type {
+  CitationContentMatchPriority,
   OpenAlexConfigInput,
   OpenAlexTestResult,
   Paper,
@@ -32,7 +34,12 @@ interface AppSettingsDialogProps {
   onImported: (papers: Paper[], detail: string) => void;
 }
 
-type AppSettingsSection = "doi" | "zotero" | "openalex" | "translation";
+type AppSettingsSection =
+  | "doi"
+  | "parsing"
+  | "zotero"
+  | "openalex"
+  | "translation";
 
 const emptyZoteroConfig: ZoteroConfigInput = {
   mode: "local",
@@ -45,13 +52,20 @@ const emptyZoteroConfig: ZoteroConfigInput = {
 
 const openAccessSources = [
   "Crossref PDF links",
-  "ChemRxiv",
   "Europe PMC",
-  "Unpaywall",
   "OpenAlex",
-  "Semantic Scholar",
-  "arXiv",
   "CORE",
+  "arXiv",
+  "ChemRxiv",
+];
+
+const citationContentMatchPriorities: Array<{
+  value: CitationContentMatchPriority;
+  label: string;
+}> = [
+  { value: "low", label: "低" },
+  { value: "standard", label: "标准" },
+  { value: "high", label: "高" },
 ];
 
 export function AppSettingsDialog({
@@ -62,8 +76,17 @@ export function AppSettingsDialog({
 }: AppSettingsDialogProps): React.JSX.Element | null {
   const [section, setSection] = useState<AppSettingsSection>(initialSection);
   const [scihubEnabled, setScihubEnabled] = useState(false);
+  const [preprintFallbackEnabled, setPreprintFallbackEnabled] = useState(false);
+  const [citationAiOptimizationEnabled, setCitationAiOptimizationEnabled] =
+    useState(false);
+  const [citationContentMatchPriority, setCitationContentMatchPriority] =
+    useState<CitationContentMatchPriority>("standard");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [preprintSaving, setPreprintSaving] = useState(false);
+  const [citationAiSaving, setCitationAiSaving] = useState(false);
+  const [citationContentPrioritySaving, setCitationContentPrioritySaving] =
+    useState(false);
   const [zotero, setZotero] = useState<ZoteroConfigInput>(emptyZoteroConfig);
   const [zoteroHasApiKey, setZoteroHasApiKey] = useState(false);
   const [zoteroBusy, setZoteroBusy] = useState<
@@ -95,31 +118,47 @@ export function AppSettingsDialog({
     setLoading(true);
     Promise.all([
       window.paperxcel.settings.getScihubEnabled(),
+      window.paperxcel.settings.getPreprintFallbackEnabled(),
+      window.paperxcel.settings.getCitationAiOptimizationEnabled(),
+      window.paperxcel.settings.getCitationContentMatchPriority(),
       window.paperxcel.zotero.getConfig(),
       window.paperxcel.openAlex.getConfig(),
       window.paperxcel.translation.getConfig(),
     ])
-      .then(([enabled, config, openAlexConfig, translationConfig]) => {
-        if (cancelled) return;
-        setScihubEnabled(enabled);
-        setZotero({
-          mode: config.mode,
-          libraryType: config.libraryType,
-          libraryId: config.libraryId,
-          collection: config.collection,
-          dataDir: config.dataDir,
-          apiKey: "",
-        });
-        setZoteroHasApiKey(config.hasApiKey);
-        setZoteroResult(undefined);
-        setOpenAlex({ apiKey: "" });
-        setOpenAlexHasApiKey(openAlexConfig.hasApiKey);
-        setOpenAlexResult(undefined);
-        setTranslation({ appId: "", secretKey: "" });
-        setTranslationHasAppId(translationConfig.hasAppId);
-        setTranslationHasSecretKey(translationConfig.hasSecretKey);
-        setTranslationResult(undefined);
-      })
+      .then(
+        ([
+          enabled,
+          preprintEnabled,
+          citationAiEnabled,
+          contentMatchPriority,
+          config,
+          openAlexConfig,
+          translationConfig,
+        ]) => {
+          if (cancelled) return;
+          setScihubEnabled(enabled);
+          setPreprintFallbackEnabled(preprintEnabled);
+          setCitationAiOptimizationEnabled(citationAiEnabled);
+          setCitationContentMatchPriority(contentMatchPriority);
+          setZotero({
+            mode: config.mode,
+            libraryType: config.libraryType,
+            libraryId: config.libraryId,
+            collection: config.collection,
+            dataDir: config.dataDir,
+            apiKey: "",
+          });
+          setZoteroHasApiKey(config.hasApiKey);
+          setZoteroResult(undefined);
+          setOpenAlex({ apiKey: "" });
+          setOpenAlexHasApiKey(openAlexConfig.hasApiKey);
+          setOpenAlexResult(undefined);
+          setTranslation({ appId: "", secretKey: "" });
+          setTranslationHasAppId(translationConfig.hasAppId);
+          setTranslationHasSecretKey(translationConfig.hasSecretKey);
+          setTranslationResult(undefined);
+        },
+      )
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
@@ -127,6 +166,19 @@ export function AppSettingsDialog({
       cancelled = true;
     };
   }, [initialSection, open]);
+
+  useEffect(() => {
+    if (!open) return;
+
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") onClose();
+    };
+
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [onClose, open]);
 
   if (!open) return null;
 
@@ -137,6 +189,43 @@ export function AppSettingsDialog({
       setScihubEnabled(saved);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const toggleCitationAiOptimization = async (next: boolean): Promise<void> => {
+    setCitationAiSaving(true);
+    try {
+      const saved =
+        await window.paperxcel.settings.setCitationAiOptimizationEnabled(next);
+      setCitationAiOptimizationEnabled(saved);
+    } finally {
+      setCitationAiSaving(false);
+    }
+  };
+
+  const saveCitationContentMatchPriority = async (
+    priority: CitationContentMatchPriority,
+  ): Promise<void> => {
+    setCitationContentPrioritySaving(true);
+    try {
+      const saved =
+        await window.paperxcel.settings.setCitationContentMatchPriority(
+          priority,
+        );
+      setCitationContentMatchPriority(saved);
+    } finally {
+      setCitationContentPrioritySaving(false);
+    }
+  };
+
+  const togglePreprintFallback = async (next: boolean): Promise<void> => {
+    setPreprintSaving(true);
+    try {
+      const saved =
+        await window.paperxcel.settings.setPreprintFallbackEnabled(next);
+      setPreprintFallbackEnabled(saved);
+    } finally {
+      setPreprintSaving(false);
     }
   };
 
@@ -292,7 +381,13 @@ export function AppSettingsDialog({
   };
 
   return (
-    <div className="dialog-backdrop" role="presentation">
+    <div
+      className="dialog-backdrop"
+      role="presentation"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
       <section
         className="dialog app-settings-dialog"
         role="dialog"
@@ -321,6 +416,14 @@ export function AppSettingsDialog({
             >
               <CircleAlert size={16} />
               论文文件下载
+            </button>
+            <button
+              className={section === "parsing" ? "active" : ""}
+              type="button"
+              onClick={() => setSection("parsing")}
+            >
+              <ListChecks size={16} />
+              解析设置
             </button>
             <button
               className={section === "zotero" ? "active" : ""}
@@ -385,6 +488,38 @@ export function AppSettingsDialog({
 
                 <section className="settings-section">
                   <div className="settings-section-heading">
+                    <FlaskConical size={18} />
+                    <div>
+                      <h3>预印本回退</h3>
+                    </div>
+                  </div>
+                  <div className="parsing-option">
+                    <div>
+                      <strong>允许下载 ChemRxiv / arXiv 预印本</strong>
+                      <p>
+                        常规开放获取来源均失败后，按
+                        DOI、题名与作者信息匹配预印本并下载。 直接输入
+                        ChemRxiv、arXiv 的链接、DOI 或 ID
+                        时始终允许，不受此开关影响。
+                      </p>
+                    </div>
+                    <label className="settings-switch">
+                      <input
+                        type="checkbox"
+                        aria-label="允许下载 ChemRxiv 或 arXiv 预印本"
+                        checked={preprintFallbackEnabled}
+                        disabled={loading || preprintSaving}
+                        onChange={(event) =>
+                          void togglePreprintFallback(event.target.checked)
+                        }
+                      />
+                      <span />
+                    </label>
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <div className="settings-section-heading">
                     <FileText size={18} />
                     <div>
                       <h3>数据来源</h3>
@@ -400,6 +535,76 @@ export function AppSettingsDialog({
                   </div>
                 </section>
               </>
+            ) : section === "parsing" ? (
+              <section className="settings-section parsing-settings-section">
+                <div className="settings-section-heading">
+                  <ListChecks size={18} />
+                  <div>
+                    <h3>引文解析</h3>
+                    <p>注意：对早期论文的解析出错率会提高！</p>
+                  </div>
+                </div>
+
+                <div className="parsing-option">
+                  <div>
+                    <strong>使用 AI 优化引文解析</strong>
+                    <p>
+                      先使用 OpenAlex 和 Crossref
+                      常规匹配；仅对未解析或结果冲突的书目，由当前模型提取题名、作者、年份和
+                      DOI 后再次检索。
+                    </p>
+                  </div>
+                  <label className="settings-switch">
+                    <input
+                      type="checkbox"
+                      aria-label="使用 AI 优化引文解析"
+                      checked={citationAiOptimizationEnabled}
+                      disabled={loading || citationAiSaving}
+                      onChange={(event) =>
+                        void toggleCitationAiOptimization(event.target.checked)
+                      }
+                    />
+                    <span aria-hidden="true" />
+                  </label>
+                </div>
+
+                <div className="parsing-option">
+                  <div>
+                    <strong>内容关键词匹配优先级</strong>
+                    <p>
+                      控制“发现论文”推荐分中内容匹配所占权重。低、标准、高三档分别最多计入
+                      25、45、65 分；共享参考文献、引用库内论文等信号不受影响。
+                    </p>
+                  </div>
+                  <div
+                    className="segmented-control citation-content-priority"
+                    role="radiogroup"
+                    aria-label="内容关键词匹配优先级"
+                  >
+                    {citationContentMatchPriorities.map((priority) => (
+                      <button
+                        className={
+                          citationContentMatchPriority === priority.value
+                            ? "active"
+                            : ""
+                        }
+                        type="button"
+                        role="radio"
+                        aria-checked={
+                          citationContentMatchPriority === priority.value
+                        }
+                        disabled={loading || citationContentPrioritySaving}
+                        key={priority.value}
+                        onClick={() =>
+                          void saveCitationContentMatchPriority(priority.value)
+                        }
+                      >
+                        {priority.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </section>
             ) : section === "zotero" ? (
               <section className="settings-section zotero-settings-section">
                 <div className="settings-section-heading">

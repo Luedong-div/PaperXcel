@@ -1,6 +1,6 @@
 ---
 name: paperxcel-research-workflow
-description: Use when working with PaperXcel PDFs, search hits, notes, structured summaries, comparison reports, citation graphs, or exported knowledge bases to answer research questions, compare papers, synthesize literature, identify gaps, or build an evidence-backed reading path across any discipline.
+description: Use when working with PaperXcel PDFs, search hits, notes, structured summaries, library answers, citation graphs, or exported knowledge bases to answer research questions, compare papers, synthesize literature, identify gaps, or build an evidence-backed reading path across any discipline.
 ---
 
 # PaperXcel Research Workflow
@@ -23,7 +23,7 @@ Use PaperXcel artifacts as an auditable evidence base. Adapt the analysis fields
 3. Gather the smallest sufficient evidence set. Prefer page text over summaries and summaries over metadata-only inference.
 4. Build a compact evidence table before synthesizing multiple papers.
 5. Check comparability across populations, systems, datasets, materials, tasks, conditions, and metrics.
-6. Produce the requested answer, matrix, review, or reading path with citations attached to each important claim.
+6. Produce the requested answer, review, or reading path with citations attached to each important claim.
 7. End with unresolved questions or verification targets when evidence remains incomplete.
 
 ## Task Modes

@@ -103,6 +103,7 @@ export function buildCitationGraphSnapshot(
     if (doi) libraryByDoi.set(doi, paper);
     const core = cache.cores[paper.id];
     const openAlexId = normalizeOpenAlexId(core?.openAlexId);
+    const openAlexWork = openAlexId ? cache.works[openAlexId] : undefined;
     if (openAlexId) libraryByOpenAlexId.set(openAlexId, paper);
     nodes.set(libraryNodeId(paper.id), {
       id: libraryNodeId(paper.id),
@@ -114,17 +115,15 @@ export function buildCitationGraphSnapshot(
       authors: [...paper.authors],
       journal: paper.journal,
       year: paper.year,
-      abstract: paper.abstract,
-      citedByCount: openAlexId
-        ? cache.works[openAlexId]?.citedByCount
-        : undefined,
+      // 本地论文同样已经在刷新图谱时解析为 OpenAlex Work。资料库元数据
+      // 没有摘要时复用该结果，避免只有外围卡片有摘要、核心卡片反而为空。
+      abstract:
+        paper.abstract?.trim() || openAlexWork?.abstract?.trim() || undefined,
+      citedByCount: openAlexId ? openAlexWork?.citedByCount : undefined,
       referencedByLibrary: false,
       citesLibrary: false,
       sourceUrl: paper.sourceUrl,
-      metadataSources: [
-        "library",
-        ...(openAlexId ? (cache.works[openAlexId]?.metadataSources ?? []) : []),
-      ],
+      metadataSources: ["library", ...(openAlexWork?.metadataSources ?? [])],
       matchStatus: "verified",
       matchConfidence: 100,
     });

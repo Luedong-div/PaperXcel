@@ -1,0 +1,371 @@
+import type {
+  CitationContentMatchPriority,
+  CitationDiscoveryCandidate,
+  CitationDiscoveryReason,
+  CitationGraphNode,
+  Paper,
+} from "./contracts";
+import {
+  normalizeCitationDoi,
+  normalizeOpenAlexId,
+  type CitationWorkRecord,
+} from "./citationGraph";
+
+export interface CitationDiscoveryWorkInput {
+  work: CitationWorkRecord;
+  reasons?: CitationDiscoveryReason[];
+  matchedPaperIds?: string[];
+}
+
+export interface RankCitationDiscoveryInput {
+  papers: Paper[];
+  candidates: CitationDiscoveryWorkInput[];
+  query?: string;
+  seedOpenAlexIds?: Record<string, string | undefined>;
+  seedReferences?: Record<string, string[]>;
+  limit?: number;
+  contentMatchPriority?: CitationContentMatchPriority;
+  now?: Date;
+}
+
+const CONTENT_MATCH_MAX_SCORE: Record<CitationContentMatchPriority, number> = {
+  low: 25,
+  standard: 45,
+  high: 65,
+};
+
+const STOP_WORDS = new Set([
+  "about",
+  "after",
+  "against",
+  "also",
+  "and",
+  "among",
+  "analysis",
+  "based",
+  "between",
+  "both",
+  "for",
+  "from",
+  "have",
+  "into",
+  "of",
+  "on",
+  "method",
+  "methods",
+  "paper",
+  "results",
+  "study",
+  "that",
+  "the",
+  "their",
+  "these",
+  "this",
+  "through",
+  "to",
+  "using",
+  "with",
+  "without",
+  "研究",
+  "方法",
+  "结果",
+  "论文",
+  "基于",
+  "一种",
+]);
+
+export function buildCitationDiscoveryTerms(
+  papers: Paper[],
+  query = "",
+  limit = 14,
+): string[] {
+  const scores = new Map<string, number>();
+  const add = (value: string | undefined, weight: number): void => {
+    for (const token of tokenizeResearchText(value ?? "")) {
+      scores.set(token, (scores.get(token) ?? 0) + weight);
+    }
+  };
+
+  add(query, 12);
+  for (const paper of papers) {
+    add(paper.title, 4);
+    add(paper.abstract, 1);
+    for (const tag of paper.tags) add(tag, 7);
+  }
+
+  return [...scores.entries()]
+    .sort(
+      ([firstTerm, firstScore], [secondTerm, secondScore]) =>
+        secondScore - firstScore ||
+        secondTerm.length - firstTerm.length ||
+        firstTerm.localeCompare(secondTerm),
+    )
+    .slice(0, Math.max(1, limit))
+    .map(([term]) => term);
+}
+
+export function buildCitationDiscoveryQueries(
+  papers: Paper[],
+  query = "",
+): string[] {
+  const normalizedQuery = normalizeSpace(query);
+  const terms = buildCitationDiscoveryTerms(papers, normalizedQuery, 10);
+  const queries = [
+    normalizedQuery,
+    terms.slice(0, 8).join(" "),
+    ...papers.slice(0, normalizedQuery ? 1 : 2).map((paper) => paper.title),
+  ]
+    .map((value) => normalizeSpace(value).slice(0, 360))
+    .filter(Boolean);
+  return [...new Set(queries)].slice(0, 3);
+}
+
+export function rankCitationDiscoveryCandidates({
+  papers,
+  candidates,
+  query = "",
+  seedOpenAlexIds = {},
+  seedReferences = {},
+  limit = 80,
+  contentMatchPriority = "standard",
+  now = new Date(),
+}: RankCitationDiscoveryInput): CitationDiscoveryCandidate[] {
+  const localDois = new Set(
+    papers
+      .map((paper) => normalizeCitationDoi(paper.doi))
+      .filter((doi): doi is string => Boolean(doi)),
+  );
+  const localOpenAlexIds = new Set(
+    Object.values(seedOpenAlexIds)
+      .map(normalizeOpenAlexId)
+      .filter((id): id is string => Boolean(id)),
+  );
+  const localTitles = new Set(
+    papers.map((paper) => normalizeTitle(paper.title)).filter(Boolean),
+  );
+  const terms = buildCitationDiscoveryTerms(papers, query);
+  const seedReferenceSets = new Map(
+    Object.entries(seedReferences).map(([paperId, ids]) => [
+      paperId,
+      new Set(ids.map(normalizeOpenAlexId).filter(Boolean)),
+    ]),
+  );
+  const seedOpenAlexByPaper = new Map(
+    Object.entries(seedOpenAlexIds)
+      .map(([paperId, id]) => [paperId, normalizeOpenAlexId(id)] as const)
+      .filter((entry): entry is readonly [string, string] => Boolean(entry[1])),
+  );
+  const maxCitedBy = Math.max(
+    1,
+    ...candidates.map((candidate) => candidate.work.citedByCount ?? 0),
+  );
+  const merged = new Map<string, CitationDiscoveryWorkInput>();
+
+  for (const candidate of candidates) {
+    const doi = normalizeCitationDoi(candidate.work.doi);
+    const openAlexId = normalizeOpenAlexId(candidate.work.openAlexId);
+    if (
+      (doi && localDois.has(doi)) ||
+      (openAlexId && localOpenAlexIds.has(openAlexId)) ||
+      localTitles.has(normalizeTitle(candidate.work.title))
+    ) {
+      continue;
+    }
+    const identity = openAlexId ?? doi ?? normalizeTitle(candidate.work.title);
+    if (!identity) continue;
+    const previous = merged.get(identity);
+    if (!previous) {
+      merged.set(identity, {
+        work: candidate.work,
+        reasons: unique(candidate.reasons ?? []),
+        matchedPaperIds: unique(candidate.matchedPaperIds ?? []),
+      });
+      continue;
+    }
+    previous.reasons = unique([
+      ...(previous.reasons ?? []),
+      ...(candidate.reasons ?? []),
+    ]);
+    previous.matchedPaperIds = unique([
+      ...(previous.matchedPaperIds ?? []),
+      ...(candidate.matchedPaperIds ?? []),
+    ]);
+  }
+
+  const ranked = [...merged.values()].map((candidate) => {
+    const referenced = new Set(
+      candidate.work.referencedOpenAlexIds
+        .map(normalizeOpenAlexId)
+        .filter((id): id is string => Boolean(id)),
+    );
+    const matchedPaperIds = new Set(candidate.matchedPaperIds ?? []);
+    let sharedReferenceCount = 0;
+    for (const [paperId, seedReferencesForPaper] of seedReferenceSets) {
+      const shared = intersectionSize(referenced, seedReferencesForPaper);
+      if (shared > 0) {
+        sharedReferenceCount += shared;
+        matchedPaperIds.add(paperId);
+      }
+    }
+    let citesLibrary = false;
+    for (const [paperId, seedOpenAlexId] of seedOpenAlexByPaper) {
+      if (!referenced.has(seedOpenAlexId)) continue;
+      citesLibrary = true;
+      matchedPaperIds.add(paperId);
+    }
+
+    const reasons = new Set(candidate.reasons ?? []);
+    if (sharedReferenceCount > 0) reasons.add("shared-references");
+    if (citesLibrary) reasons.add("cites-library");
+    const relevanceScore = scoreRelevance(
+      candidate.work,
+      terms,
+      CONTENT_MATCH_MAX_SCORE[contentMatchPriority],
+    );
+    if (relevanceScore >= 8) reasons.add("topic-match");
+    const citationImpactScore = Math.round(
+      (Math.log1p(candidate.work.citedByCount ?? 0) / Math.log1p(maxCitedBy)) *
+        20,
+    );
+    const recencyScore = scoreRecency(candidate.work.year, now.getFullYear());
+    const relationScore = Math.min(
+      20,
+      (citesLibrary ? 9 : 0) +
+        Math.min(8, sharedReferenceCount * 2) +
+        Math.min(3, matchedPaperIds.size),
+    );
+    const score = Math.min(
+      100,
+      Math.round(
+        relevanceScore + citationImpactScore + recencyScore + relationScore,
+      ),
+    );
+
+    return {
+      work: toDiscoveryNode(candidate.work, citesLibrary),
+      score,
+      relevanceScore,
+      citationImpactScore,
+      recencyScore,
+      sharedReferenceCount,
+      matchedPaperIds: [...matchedPaperIds],
+      reasons: [...reasons],
+    } satisfies CitationDiscoveryCandidate;
+  });
+
+  return ranked
+    .filter((candidate) => candidate.reasons.length > 0)
+    .sort(
+      (first, second) =>
+        second.score - first.score ||
+        second.matchedPaperIds.length - first.matchedPaperIds.length ||
+        (second.work.citedByCount ?? -1) - (first.work.citedByCount ?? -1) ||
+        (second.work.year ?? 0) - (first.work.year ?? 0) ||
+        first.work.title.localeCompare(second.work.title),
+    )
+    .slice(0, Math.max(1, Math.min(limit, 100)));
+}
+
+export function tokenizeResearchText(value: string): string[] {
+  return unique(
+    value
+      .normalize("NFKC")
+      .toLocaleLowerCase()
+      .match(/[\p{L}\p{N}][\p{L}\p{N}-]{1,}/gu)
+      ?.map((token) => token.replace(/^-+|-+$/g, ""))
+      .filter(
+        (token) =>
+          token.length >= 2 &&
+          token.length <= 48 &&
+          !STOP_WORDS.has(token) &&
+          !/^\d+$/.test(token),
+      ) ?? [],
+  );
+}
+
+function scoreRelevance(
+  work: CitationWorkRecord,
+  terms: string[],
+  maxScore: number,
+): number {
+  if (!terms.length) return 0;
+  const title = normalizeSpace(work.title).toLocaleLowerCase();
+  const body = normalizeSpace(
+    [work.title, work.abstract, work.journal, ...work.authors]
+      .filter(Boolean)
+      .join(" "),
+  ).toLocaleLowerCase();
+  let matchedWeight = 0;
+  let totalWeight = 0;
+  for (const [index, term] of terms.entries()) {
+    const weight = Math.max(1, terms.length - index);
+    totalWeight += weight * 3;
+    if (title.includes(term)) matchedWeight += weight * 3;
+    else if (body.includes(term)) matchedWeight += weight;
+  }
+  return Math.round(
+    (matchedWeight / Math.max(1, totalWeight)) * Math.max(0, maxScore),
+  );
+}
+
+function scoreRecency(year: number | undefined, currentYear: number): number {
+  if (!year) return 4;
+  const age = Math.max(0, currentYear - year);
+  return Math.max(2, Math.round(15 - Math.min(18, age) * 0.7));
+}
+
+function toDiscoveryNode(
+  work: CitationWorkRecord,
+  citesLibrary: boolean,
+): CitationGraphNode {
+  const openAlexId = normalizeOpenAlexId(work.openAlexId);
+  return {
+    id: `external:${openAlexId ?? work.openAlexId}`,
+    kind: "external",
+    openAlexId,
+    doi: normalizeCitationDoi(work.doi),
+    title: work.title,
+    authors: [...work.authors],
+    journal: work.journal,
+    year: work.year,
+    abstract: work.abstract,
+    volume: work.volume,
+    issue: work.issue,
+    pages: work.pages,
+    issn: work.issn ? [...work.issn] : undefined,
+    citedByCount: work.citedByCount,
+    referencedByLibrary: false,
+    citesLibrary,
+    sourceUrl: work.sourceUrl,
+    metadataSources: work.metadataSources
+      ? [...work.metadataSources]
+      : ["openalex"],
+    matchStatus: work.matchStatus ?? "verified",
+    matchConfidence: work.matchConfidence ?? 100,
+  };
+}
+
+function intersectionSize<T>(first: Set<T>, second: Set<T>): number {
+  let count = 0;
+  const [small, large] =
+    first.size <= second.size ? [first, second] : [second, first];
+  for (const value of small) {
+    if (large.has(value)) count += 1;
+  }
+  return count;
+}
+
+function normalizeTitle(value: string): string {
+  return normalizeSpace(value)
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+function normalizeSpace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function unique<T>(values: T[]): T[] {
+  return [...new Set(values)];
+}

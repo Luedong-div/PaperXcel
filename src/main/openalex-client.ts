@@ -91,6 +91,22 @@ export class OpenAlexClient {
     return this.getWorksByFilter("doi", normalized);
   }
 
+  async findWorksBySearch(
+    query: string,
+    limit = 5,
+  ): Promise<CitationWorkRecord[]> {
+    const normalized = query.replace(/\s+/g, " ").trim();
+    if (!normalized) return [];
+    const url = new URL(`${OPENALEX_BASE_URL}/works`);
+    url.searchParams.set("search", normalized.slice(0, 800));
+    url.searchParams.set("per_page", String(Math.max(1, Math.min(limit, 100))));
+    url.searchParams.set("select", OPENALEX_SELECT);
+    const payload = await this.request<OpenAlexListPayload>(url);
+    return (payload.results ?? [])
+      .map(parseOpenAlexWork)
+      .filter((work): work is CitationWorkRecord => Boolean(work));
+  }
+
   // OpenAlex 的 cites 过滤器用于反向查询“哪些论文引用了本文”。
   // 服务端按 cited_by_count 倒序，客户端只接收最常被引用的前 limit 篇。
   async getCitingWorks(

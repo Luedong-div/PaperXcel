@@ -15,6 +15,20 @@ const MATCH_CONCURRENCY = 4;
 const OPENALEX_MATCH_THRESHOLD = 58;
 const CROSSREF_MATCH_THRESHOLD = 66;
 const MATCH_MARGIN = 12;
+const AI_RETRY_MATCH_THRESHOLD = 70;
+
+export interface CitationReferenceSearchRequest {
+  id: string;
+  rawCitation: string;
+}
+
+export interface CitationReferenceSearchHint {
+  id: string;
+  title?: string;
+  authors?: string[];
+  year?: number;
+  doi?: string;
+}
 
 interface ReferenceResolverOptions {
   paperId: string;
@@ -23,6 +37,17 @@ interface ReferenceResolverOptions {
   sourceDoi?: string;
   openAlex: OpenAlexClient;
   crossref: CrossrefClient;
+}
+
+interface ReferenceRetryOptions {
+  paperId: string;
+  works: CitationWorkRecord[];
+  sourceDoi?: string;
+  openAlex: OpenAlexClient;
+  crossref: CrossrefClient;
+  extractSearchHints: (
+    references: CitationReferenceSearchRequest[],
+  ) => Promise<CitationReferenceSearchHint[]>;
 }
 
 interface CitationFacts {
@@ -40,6 +65,12 @@ interface CrossrefCandidateChoice {
   work?: CrossrefWorkRecord;
   score: number;
   status: CitationMatchStatus;
+}
+
+interface ReferenceRetryCandidate {
+  crossref?: CrossrefWorkRecord;
+  openAlex?: CitationWorkRecord;
+  score: number;
 }
 
 export async function resolveReferenceWorks({
@@ -166,6 +197,66 @@ export async function resolveReferenceWorks({
   return resolved.filter((work): work is CitationWorkRecord => Boolean(work));
 }
 
+export async function retryUnresolvedReferenceWorksWithAi({
+  paperId,
+  works,
+  sourceDoi,
+  openAlex,
+  crossref,
+  extractSearchHints,
+}: ReferenceRetryOptions): Promise<CitationWorkRecord[]> {
+  const targets = works
+    .map((work, index) => ({ work, index }))
+    .filter(
+      ({ work }) =>
+        (work.matchStatus === "unresolved" ||
+          work.matchStatus === "ambiguous") &&
+        Boolean(work.rawCitation?.trim()),
+    );
+  if (!targets.length) return works;
+
+  const requests = targets.map(({ work }) => ({
+    id: work.openAlexId,
+    rawCitation: work.rawCitation!.trim(),
+  }));
+  const allowedIds = new Set(requests.map((request) => request.id));
+  let extractedHints: CitationReferenceSearchHint[];
+  try {
+    extractedHints = await extractSearchHints(requests);
+  } catch {
+    return works;
+  }
+
+  const hints = new Map<string, CitationReferenceSearchHint>();
+  for (const hint of extractedHints) {
+    const normalized = normalizeReferenceSearchHint(hint, allowedIds);
+    if (normalized) hints.set(normalized.id, normalized);
+  }
+  if (!hints.size) return works;
+
+  const replacements = new Map<string, CitationWorkRecord>();
+  await mapWithConcurrency(
+    targets,
+    MATCH_CONCURRENCY,
+    async ({ work, index }) => {
+      const hint = hints.get(work.openAlexId);
+      if (!hint) return;
+      const replacement = await resolveReferenceSearchHint({
+        paperId,
+        index,
+        original: work,
+        hint,
+        sourceDoi,
+        openAlex,
+        crossref,
+      }).catch(() => undefined);
+      if (replacement) replacements.set(work.openAlexId, replacement);
+    },
+  );
+
+  return works.map((work) => replacements.get(work.openAlexId) ?? work);
+}
+
 export function createCitationFacts(value: string): CitationFacts {
   const rawCitation = value.replace(/\s+/g, " ").trim();
   const quality: CitationTextQuality =
@@ -196,6 +287,105 @@ export function createCitationFacts(value: string): CitationFacts {
     volume,
     firstPage: pageMatch?.[1],
   };
+}
+
+async function resolveReferenceSearchHint({
+  paperId,
+  index,
+  original,
+  hint,
+  sourceDoi,
+  openAlex,
+  crossref,
+}: {
+  paperId: string;
+  index: number;
+  original: CitationWorkRecord;
+  hint: CitationReferenceSearchHint;
+  sourceDoi?: string;
+  openAlex: OpenAlexClient;
+  crossref: CrossrefClient;
+}): Promise<CitationWorkRecord | undefined> {
+  const normalizedSourceDoi = normalizeCitationDoi(sourceDoi);
+  const hintDoi = normalizeCitationDoi(hint.doi);
+  if (hintDoi && hintDoi === normalizedSourceDoi) return undefined;
+
+  const query = buildReferenceSearchQuery(hint);
+  const [doiCrossref, doiOpenAlex, crossrefSearch, openAlexSearch] =
+    await Promise.all([
+      hintDoi
+        ? crossref.getWorkByDoi(hintDoi).catch(() => undefined)
+        : Promise.resolve(undefined),
+      hintDoi
+        ? openAlex.getWorkByDoi(hintDoi).catch(() => undefined)
+        : Promise.resolve(undefined),
+      query
+        ? crossref.findWorksByBibliographic(query).catch(() => [])
+        : Promise.resolve([]),
+      query
+        ? openAlex.findWorksBySearch(query).catch(() => [])
+        : Promise.resolve([]),
+    ]);
+
+  const candidates = new Map<string, ReferenceRetryCandidate>();
+  for (const work of [doiCrossref, ...crossrefSearch]) {
+    if (!work) continue;
+    const key = referenceCandidateKey(work);
+    const candidate = candidates.get(key) ?? { score: 0 };
+    candidate.crossref = work;
+    candidates.set(key, candidate);
+  }
+  for (const work of [doiOpenAlex, ...openAlexSearch]) {
+    if (!work) continue;
+    const key = referenceCandidateKey(work);
+    const candidate = candidates.get(key) ?? { score: 0 };
+    candidate.openAlex = work;
+    candidates.set(key, candidate);
+  }
+
+  const ranked = [...candidates.values()]
+    .map((candidate) => ({
+      ...candidate,
+      score: scoreReferenceSearchHint(
+        hint,
+        candidate.crossref ?? candidate.openAlex!,
+      ),
+    }))
+    .sort((left, right) => right.score - left.score);
+  const best = ranked[0];
+  const second = ranked[1];
+  if (
+    !best ||
+    best.score < AI_RETRY_MATCH_THRESHOLD ||
+    best.score - (second?.score ?? 0) < MATCH_MARGIN
+  ) {
+    return undefined;
+  }
+
+  const originalFacts = createCitationFacts(original.rawCitation ?? "");
+  const citation: CitationFacts = {
+    ...originalFacts,
+    normalizedCitation: normalizeMatchText(
+      [originalFacts.rawCitation, buildReferenceSearchQuery(hint)]
+        .filter(Boolean)
+        .join(" "),
+    ),
+    doi: hintDoi ?? originalFacts.doi,
+    year: hint.year ?? originalFacts.year,
+  };
+  const status: CitationMatchStatus =
+    best.crossref && best.openAlex && best.score >= 85
+      ? "verified"
+      : "probable";
+  return mergeMetadata(
+    paperId,
+    index,
+    citation,
+    best.crossref,
+    best.openAlex,
+    status,
+    best.score,
+  );
 }
 
 async function resolveCrossrefChoices(
@@ -240,6 +430,115 @@ async function resolveCrossrefChoices(
     },
   );
   return choices;
+}
+
+function normalizeReferenceSearchHint(
+  hint: CitationReferenceSearchHint,
+  allowedIds: Set<string>,
+): CitationReferenceSearchHint | undefined {
+  const id = typeof hint.id === "string" ? hint.id.trim() : "";
+  if (!allowedIds.has(id)) return undefined;
+  const title =
+    typeof hint.title === "string"
+      ? hint.title.replace(/\s+/g, " ").trim().slice(0, 500)
+      : undefined;
+  const authors = Array.isArray(hint.authors)
+    ? [
+        ...new Set(
+          hint.authors
+            .filter((author): author is string => typeof author === "string")
+            .map((author) => author.replace(/\s+/g, " ").trim().slice(0, 180))
+            .filter(Boolean),
+        ),
+      ].slice(0, 20)
+    : [];
+  const year = Number(hint.year);
+  const normalizedYear =
+    Number.isInteger(year) &&
+    year >= 1400 &&
+    year <= new Date().getFullYear() + 1
+      ? year
+      : undefined;
+  const doi = normalizeCitationDoi(hint.doi);
+  if (!title && !doi) return undefined;
+  return {
+    id,
+    title: title || undefined,
+    authors: authors.length ? authors : undefined,
+    year: normalizedYear,
+    doi,
+  };
+}
+
+function buildReferenceSearchQuery(hint: CitationReferenceSearchHint): string {
+  return [
+    hint.title,
+    ...(hint.authors?.slice(0, 3) ?? []),
+    hint.year ? String(hint.year) : "",
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .slice(0, 800);
+}
+
+function referenceCandidateKey(
+  work: CitationWorkRecord | CrossrefWorkRecord,
+): string {
+  const doi = normalizeCitationDoi(work.doi);
+  if (doi) return `doi:${doi}`;
+  const title = normalizeMatchText(work.title ?? "");
+  return title
+    ? `title:${title}\0${work.year ?? ""}`
+    : "openAlexId" in work
+      ? `openalex:${work.openAlexId}`
+      : `crossref:${JSON.stringify(work)}`;
+}
+
+function scoreReferenceSearchHint(
+  hint: CitationReferenceSearchHint,
+  work: CitationWorkRecord | CrossrefWorkRecord,
+): number {
+  const hintDoi = normalizeCitationDoi(hint.doi);
+  const workDoi = normalizeCitationDoi(work.doi);
+  if (hintDoi && workDoi === hintDoi) return 100;
+
+  let score = 0;
+  const hintTitleTokens = [
+    ...tokenSet(normalizeMatchText(hint.title ?? "")),
+  ].filter((token) => token.length >= 3);
+  const workTitleTokens = [
+    ...tokenSet(normalizeMatchText(work.title ?? "")),
+  ].filter((token) => token.length >= 3);
+  if (hintTitleTokens.length && workTitleTokens.length) {
+    const workTokenSet = new Set(workTitleTokens);
+    const hintTokenSet = new Set(hintTitleTokens);
+    const overlap = hintTitleTokens.filter((token) =>
+      workTokenSet.has(token),
+    ).length;
+    const recall = overlap / hintTitleTokens.length;
+    const precision =
+      workTitleTokens.filter((token) => hintTokenSet.has(token)).length /
+      workTitleTokens.length;
+    score += Math.round(recall * 65 + precision * 10);
+  }
+
+  const hintAuthors = (hint.authors ?? [])
+    .map(authorSurname)
+    .filter((author) => author.length >= 2);
+  const workAuthors = new Set(
+    work.authors.map(authorSurname).filter((author) => author.length >= 2),
+  );
+  if (hintAuthors[0] && workAuthors.has(hintAuthors[0])) score += 15;
+  score += Math.min(
+    10,
+    hintAuthors.slice(1).filter((author) => workAuthors.has(author)).length * 5,
+  );
+
+  if (hint.year && work.year) {
+    const difference = Math.abs(hint.year - work.year);
+    score += difference === 0 ? 10 : difference === 1 ? 5 : -10;
+  }
+  return Math.max(0, Math.min(100, score));
 }
 
 function createDoiResolvedWork(

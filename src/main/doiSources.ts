@@ -17,16 +17,6 @@ export interface CrossrefMessageWithLinks {
   }>;
 }
 
-export interface UnpaywallLocation {
-  url?: string;
-  url_for_pdf?: string;
-}
-
-export interface UnpaywallResponse {
-  best_oa_location?: UnpaywallLocation | null;
-  oa_locations?: Array<UnpaywallLocation | null>;
-}
-
 export interface OpenAlexLocation {
   pdf_url?: string | null;
 }
@@ -38,12 +28,6 @@ export interface OpenAlexWork {
   best_oa_location?: OpenAlexLocation | null;
   primary_location?: OpenAlexLocation | null;
   locations?: Array<OpenAlexLocation | null>;
-}
-
-export interface SemanticScholarPaper {
-  openAccessPdf?: {
-    url?: string | null;
-  } | null;
 }
 
 export interface EuropePmcFullTextUrl {
@@ -80,10 +64,22 @@ export interface CoreSearchResponse {
 export const DOI_AUTO_FETCH_CUTOFF_YEAR = 2022;
 
 export function normalizeDoiInput(value: string): string {
-  const trimmed = value.trim();
+  const trimmed = decodeInput(value.trim());
   const isDoiUrl = /^https?:\/\/(?:dx\.)?doi\.org\//i.test(trimmed);
-  const withoutPrefix = trimmed.replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "");
-  const doi = isDoiUrl ? withoutPrefix.replace(/[?#].*$/, "") : withoutPrefix;
+  const isChemrxivUrl =
+    /^https?:\/\/(?:www\.)?chemrxiv\.org\/doi\/(?:(?:full|pdf)\/)?/i.test(
+      trimmed,
+    );
+  const withoutPrefix = trimmed
+    .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "")
+    .replace(
+      /^https?:\/\/(?:www\.)?chemrxiv\.org\/doi\/(?:(?:full|pdf)\/)?/i,
+      "",
+    );
+  const doi =
+    isDoiUrl || isChemrxivUrl
+      ? withoutPrefix.replace(/[?#].*$/, "").replace(/\/+$/, "")
+      : withoutPrefix;
   if (!/^10\.\d{4,9}\/\S+$/i.test(doi)) throw new Error("DOI 格式不正确。");
   return doi;
 }
@@ -118,9 +114,7 @@ export function normalizeArxivInput(
 
   const match = candidate.match(NEW_ARXIV_ID) ?? candidate.match(OLD_ARXIV_ID);
   if (!match) {
-    throw new Error(
-      "无法识别论文标识符。请输入 DOI、arXiv ID、arXiv 摘要页或 PDF 链接。",
-    );
+    throw new Error("无法识别论文标识符，请输入 DOI 等相关信息。");
   }
   const version = match[1] ? Number(match[1]) : undefined;
   return {
@@ -133,7 +127,7 @@ export function normalizeArxivInput(
 export function parsePaperIdentifier(value: string): PaperIdentifier {
   const input = value.trim();
   if (!input) {
-    throw new Error("请输入 DOI、arXiv ID 或链接。");
+    throw new Error("请输入 DOI 等相关信息");
   }
 
   const withoutDoiUrl = decodeInput(input).replace(
@@ -153,9 +147,7 @@ export function parsePaperIdentifier(value: string): PaperIdentifier {
   try {
     return { kind: "doi", doi: normalizeDoiInput(input) };
   } catch {
-    throw new Error(
-      "无法识别论文标识符。请输入 DOI、arXiv ID、arXiv 摘要页或 PDF 链接。",
-    );
+    throw new Error("无法识别论文标识符。请输入 DOI 等相关信息。");
   }
 }
 
@@ -193,6 +185,18 @@ export interface ArxivLookupResult {
   pdfCandidates: PdfCandidate[];
 }
 
+export interface CrossrefPreprintWork {
+  DOI?: string;
+  title?: string[];
+  author?: Array<{
+    given?: string;
+    family?: string;
+    name?: string;
+  }>;
+  published?: { "date-parts"?: number[][] };
+  created?: { "date-parts"?: number[][] };
+}
+
 function asArray<T>(value?: T | T[]): T[] {
   if (value === undefined) return [];
   return Array.isArray(value) ? value : [value];
@@ -215,6 +219,10 @@ function publisherDoi(value?: string): string | undefined {
 export function parseArxivAtomFeed(
   atom: string,
 ): ArxivLookupResult | undefined {
+  return parseArxivAtomEntries(atom)[0];
+}
+
+export function parseArxivAtomEntries(atom: string): ArxivLookupResult[] {
   if (XMLValidator.validate(atom) !== true) {
     throw new Error("arXiv 返回了无法解析的数据。");
   }
@@ -231,9 +239,11 @@ export function parseArxivAtomFeed(
     throw new Error("arXiv 返回了无法解析的数据。");
   }
 
-  const entry = asArray(parsed.feed?.entry)[0];
-  if (!entry?.id) return undefined;
-  if (/arxiv\.org\/api\/errors#/i.test(entry.id)) return undefined;
+  return asArray(parsed.feed?.entry).flatMap(parseArxivAtomEntry);
+}
+
+function parseArxivAtomEntry(entry: ArxivAtomEntry): ArxivLookupResult[] {
+  if (!entry.id || /arxiv\.org\/api\/errors#/i.test(entry.id)) return [];
 
   const identifier = normalizeArxivInput(entry.id);
   const resolvedVersionMatch = entry.id.match(/v(\d+)(?:[/?#]|$)/i);
@@ -257,26 +267,28 @@ export function parseArxivAtomFeed(
   }`;
   const submittedYear = Number(entry.published?.slice(0, 4));
 
-  return {
-    metadata: {
-      title: normalizeAtomText(entry.title) || identifier.arxivId,
-      authors,
-      journal: normalizeAtomText(entry.journal_ref),
-      year: Number.isFinite(submittedYear) ? submittedYear : undefined,
-      doi: publisherDoi(normalizeAtomText(entry.doi)),
-      arxivId: identifier.arxivId,
-      arxivVersion: resolvedVersion,
-      abstract: normalizeAtomText(entry.summary),
-      sourceUrl: `https://arxiv.org/abs/${exactArxivId}`,
-    },
-    pdfCandidates: uniquePdfCandidates([
-      ...pdfLinks,
-      {
-        url: `https://arxiv.org/pdf/${exactArxivId}.pdf`,
-        source: "arXiv",
+  return [
+    {
+      metadata: {
+        title: normalizeAtomText(entry.title) || identifier.arxivId,
+        authors,
+        journal: normalizeAtomText(entry.journal_ref),
+        year: Number.isFinite(submittedYear) ? submittedYear : undefined,
+        doi: publisherDoi(normalizeAtomText(entry.doi)),
+        arxivId: identifier.arxivId,
+        arxivVersion: resolvedVersion,
+        abstract: normalizeAtomText(entry.summary),
+        sourceUrl: `https://arxiv.org/abs/${exactArxivId}`,
       },
-    ]),
-  };
+      pdfCandidates: uniquePdfCandidates([
+        ...pdfLinks,
+        {
+          url: `https://arxiv.org/pdf/${exactArxivId}.pdf`,
+          source: "arXiv",
+        },
+      ]),
+    },
+  ];
 }
 
 export function shouldAttemptOpenAccessPdf(year?: number): boolean {
@@ -321,7 +333,7 @@ export function extractChemrxivPdfCandidates(doi: string): PdfCandidate[] {
     return [];
   }
 
-  if (!/^10\.26434\/chemrxiv(?:[-.]\S+)?$/i.test(normalizedDoi)) {
+  if (!isChemrxivDoi(normalizedDoi)) {
     return [];
   }
 
@@ -335,19 +347,81 @@ export function extractChemrxivPdfCandidates(doi: string): PdfCandidate[] {
   ]);
 }
 
-export function extractUnpaywallPdfCandidates(
-  payload: UnpaywallResponse,
+export function isChemrxivDoi(value: string): boolean {
+  try {
+    return /^10\.26434\/chemrxiv(?:[-.]\S+)?$/i.test(normalizeDoiInput(value));
+  } catch {
+    return false;
+  }
+}
+
+export function extractMatchingChemrxivPdfCandidates(
+  metadata: Pick<PaperMetadata, "title" | "authors" | "year">,
+  works: CrossrefPreprintWork[],
 ): PdfCandidate[] {
-  const locations = [payload.best_oa_location, ...(payload.oa_locations ?? [])];
+  const matches = works
+    .flatMap((work) => {
+      const doi = work.DOI?.trim();
+      const title = work.title?.find((value) => value.trim())?.trim();
+      if (!doi || !title || !isChemrxivDoi(doi)) return [];
+      const score = titleMatchScore(metadata.title, title);
+      const authorMatch = authorsOverlap(
+        metadata.authors,
+        (work.author ?? []).map((author) =>
+          author.name?.trim()
+            ? author.name.trim()
+            : [author.given, author.family].filter(Boolean).join(" ").trim(),
+        ),
+      );
+      const year =
+        work.published?.["date-parts"]?.[0]?.[0] ??
+        work.created?.["date-parts"]?.[0]?.[0];
+      if (
+        score < 0.9 &&
+        !(score >= 0.82 && authorMatch) &&
+        normalizeMatchText(metadata.title) !== normalizeMatchText(title)
+      ) {
+        return [];
+      }
+      if (
+        metadata.year &&
+        typeof year === "number" &&
+        year > metadata.year + 1
+      ) {
+        return [];
+      }
+      return [{ doi, score, version: chemrxivVersion(doi) }];
+    })
+    .sort(
+      (left, right) => right.score - left.score || right.version - left.version,
+    );
+
   return uniquePdfCandidates(
-    locations.flatMap((location) => {
-      if (!location) return [];
-      return [location.url_for_pdf, location.url].map((url) => ({
-        url: url ?? "",
-        source: "Unpaywall",
-      }));
-    }),
+    matches.flatMap(({ doi }) => extractChemrxivPdfCandidates(doi)),
   );
+}
+
+export function findMatchingArxivResult(
+  metadata: Pick<PaperMetadata, "title" | "authors" | "year">,
+  results: ArxivLookupResult[],
+): ArxivLookupResult | undefined {
+  const matches = results
+    .map((result) => ({
+      result,
+      score: titleMatchScore(metadata.title, result.metadata.title),
+      authorMatch: authorsOverlap(metadata.authors, result.metadata.authors),
+    }))
+    .filter(
+      ({ result, score, authorMatch }) =>
+        (score >= 0.9 || (score >= 0.82 && authorMatch)) &&
+        !(
+          metadata.year &&
+          result.metadata.year &&
+          result.metadata.year > metadata.year + 1
+        ),
+    )
+    .sort((left, right) => right.score - left.score);
+  return matches[0]?.result;
 }
 
 export function extractOpenAlexPdfCandidates(
@@ -366,17 +440,6 @@ export function extractOpenAlexPdfCandidates(
     {
       url: payload.open_access?.oa_url ?? "",
       source: "OpenAlex",
-    },
-  ]);
-}
-
-export function extractSemanticScholarPdfCandidates(
-  payload: SemanticScholarPaper,
-): PdfCandidate[] {
-  return uniquePdfCandidates([
-    {
-      url: payload.openAccessPdf?.url ?? "",
-      source: "Semantic Scholar",
     },
   ]);
 }
@@ -437,10 +500,10 @@ export function extractCorePdfCandidates(
 
 export const DEFAULT_SCIHUB_MIRRORS = [
   "https://sci-hub.se",
+  "https://sci-hub.red",
   "https://sci-hub.st",
   "https://sci-hub.su",
   "https://sci-hub.ru",
-  "https://sci-hub.red",
   "https://sci-hub.box",
 ];
 
@@ -474,8 +537,9 @@ export function formatDoiForSciHub(doi: string): string {
   const replaced = doi.replace("/", "@");
   return encodeURIComponent(replaced)
     .replace(/%40/g, "@")
-    .replace(/[!'()*]/g, (character) =>
-      `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+    .replace(
+      /[!'()*]/g,
+      (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
     );
 }
 
@@ -559,6 +623,47 @@ function resolveScihubUrl(base: string, maybeRelative: string): string {
   } catch {
     return maybeRelative;
   }
+}
+
+function titleMatchScore(left: string, right: string): number {
+  const normalizedLeft = normalizeMatchText(left);
+  const normalizedRight = normalizeMatchText(right);
+  if (!normalizedLeft || !normalizedRight) return 0;
+  if (normalizedLeft === normalizedRight) return 1;
+
+  const leftTokens = new Set(normalizedLeft.split(" "));
+  const rightTokens = new Set(normalizedRight.split(" "));
+  let shared = 0;
+  for (const token of leftTokens) {
+    if (rightTokens.has(token)) shared += 1;
+  }
+  return (2 * shared) / (leftTokens.size + rightTokens.size);
+}
+
+function authorsOverlap(left: string[], right: string[]): boolean {
+  const leftNames = new Set(left.map(authorFamilyName).filter(Boolean));
+  return right
+    .map(authorFamilyName)
+    .filter(Boolean)
+    .some((name) => leftNames.has(name));
+}
+
+function authorFamilyName(value: string): string {
+  return normalizeMatchText(value).split(" ").filter(Boolean).at(-1) ?? "";
+}
+
+function normalizeMatchText(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function chemrxivVersion(doi: string): number {
+  const match = doi.match(/[.-]v(\d+)$/i);
+  return match?.[1] ? Number(match[1]) : 0;
 }
 
 export function uniquePdfCandidates(

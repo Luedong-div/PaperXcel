@@ -79,22 +79,6 @@ const MIN_LIBRARY_RESULTS_WIDTH = 360;
 const LIBRARY_ASSISTANT_RESIZE_HANDLE_WIDTH = 8;
 const LIBRARY_ASSISTANT_STACK_BREAKPOINT = 720;
 
-const presets = [
-  {
-    label: "研究设计",
-    query: "研究问题、研究对象、理论框架、研究设计、方法、模型与关键假设",
-  },
-  {
-    label: "证据与复现",
-    query:
-      "数据、样本、材料、实验或计算条件、软件、仪器、参数、统计方法与可复现信息",
-  },
-  {
-    label: "结果与局限",
-    query: "主要结果、评价指标、证据强度、不确定性、适用范围与研究局限",
-  },
-];
-
 const reasoningOptions: Array<{
   value: ModelReasoningEffort;
   label: string;
@@ -566,21 +550,6 @@ export function LibrarySearchWorkspace({
                 {searching ? "检索中" : "检索"}
               </button>
             </label>
-            <div className="library-search-presets">
-              {presets.map((preset) => (
-                <button
-                  type="button"
-                  key={preset.label}
-                  disabled={searching || !readyPapers.length}
-                  onClick={() => {
-                    updateQuery(preset.query);
-                    onSearch(preset.query);
-                  }}
-                >
-                  {preset.label}
-                </button>
-              ))}
-            </div>
           </form>
 
           <div className="library-search-results">

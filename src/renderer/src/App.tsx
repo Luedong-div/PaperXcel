@@ -27,7 +27,6 @@ import {
   ChevronRight,
   ChevronUp,
   CircleAlert,
-  Columns3,
   Copy,
   Database,
   Download,
@@ -77,7 +76,6 @@ import type {
   TranslationResult,
 } from "../../shared/contracts";
 import { reorderIds, type PaperDropPlacement } from "../../shared/paperOrder";
-import { ComparisonWorkspace } from "./ComparisonWorkspace";
 import { CitationGraphWorkspace } from "./CitationGraphWorkspace";
 import { DoiDialog } from "./DoiDialog";
 import { GlobalSelectionMenu } from "./GlobalSelectionMenu";
@@ -99,15 +97,15 @@ import { detectTranslationDirection } from "../../shared/translation";
 
 type LibraryFilter = "all" | "starred" | "archived";
 type AssistantView = "chat" | "notes";
-type WorkspaceView =
-  | "reader"
-  | "search"
-  | "knowledge"
-  | "comparison"
-  | "citation";
-type AppSettingsSection = "doi" | "zotero" | "openalex" | "translation";
+type WorkspaceView = "reader" | "search" | "knowledge" | "citation";
+type AppSettingsSection =
+  | "doi"
+  | "parsing"
+  | "zotero"
+  | "openalex"
+  | "translation";
 type ComposerMenuSection = "model" | "reasoning";
-type ResizablePanel = "library" | "assistant";
+type ResizablePanel = "library" | "assistant" | "knowledge" | "citation";
 type ChatReference = ReferencedSnippet;
 type ComposerReference = ChatReference & { id: string; imageDataUrl?: string };
 type PaperActionMenu = { paperId: string; x: number; y: number };
@@ -153,15 +151,19 @@ const MIN_PAPER_RAIL_WIDTH = 240;
 const MAX_PAPER_RAIL_WIDTH = 480;
 const MIN_ASSISTANT_PANE_WIDTH = 300;
 const MAX_ASSISTANT_PANE_WIDTH = 520;
+const MIN_KNOWLEDGE_INDEX_WIDTH = 240;
+const MAX_KNOWLEDGE_INDEX_WIDTH = 480;
+const MIN_CITATION_SIDEBAR_WIDTH = 180;
+const MAX_CITATION_SIDEBAR_WIDTH = 420;
 const MIN_READER_PANE_WIDTH = 480;
 const PAPER_RAIL_VISIBLE_STORAGE_KEY = "paperxcel:library-rail-visible";
 const PAPER_RAIL_WIDTH_STORAGE_KEY = "paperxcel:library-rail-width";
 const CITATION_SIDEBAR_VISIBLE_STORAGE_KEY =
   "paperxcel:citation-sidebar-visible";
-const COMPARISON_SIDEBAR_VISIBLE_STORAGE_KEY =
-  "paperxcel:comparison-sidebar-visible";
+const CITATION_SIDEBAR_WIDTH_STORAGE_KEY = "paperxcel:citation-sidebar-width";
 const ASSISTANT_PANE_VISIBLE_STORAGE_KEY = "paperxcel:assistant-pane-visible";
 const ASSISTANT_PANE_WIDTH_STORAGE_KEY = "paperxcel:assistant-pane-width";
+const KNOWLEDGE_INDEX_WIDTH_STORAGE_KEY = "paperxcel:knowledge-index-width";
 
 function getAttachmentDisplayName(attachment: ChatAttachment): string {
   if (attachment.source === "library" && attachment.fileName === "full.md") {
@@ -202,8 +204,13 @@ export default function App(): React.JSX.Element {
   const [citationSidebarVisible, setCitationSidebarVisible] = useState(() =>
     readStoredBoolean(CITATION_SIDEBAR_VISIBLE_STORAGE_KEY, true),
   );
-  const [comparisonSidebarVisible, setComparisonSidebarVisible] = useState(() =>
-    readStoredBoolean(COMPARISON_SIDEBAR_VISIBLE_STORAGE_KEY, true),
+  const [citationSidebarWidth, setCitationSidebarWidth] = useState(() =>
+    readStoredNumber(
+      CITATION_SIDEBAR_WIDTH_STORAGE_KEY,
+      214,
+      MIN_CITATION_SIDEBAR_WIDTH,
+      MAX_CITATION_SIDEBAR_WIDTH,
+    ),
   );
   const [paperRailWidth, setPaperRailWidth] = useState(() =>
     readStoredNumber(
@@ -222,6 +229,14 @@ export default function App(): React.JSX.Element {
       390,
       MIN_ASSISTANT_PANE_WIDTH,
       MAX_ASSISTANT_PANE_WIDTH,
+    ),
+  );
+  const [knowledgeIndexWidth, setKnowledgeIndexWidth] = useState(() =>
+    readStoredNumber(
+      KNOWLEDGE_INDEX_WIDTH_STORAGE_KEY,
+      320,
+      MIN_KNOWLEDGE_INDEX_WIDTH,
+      MAX_KNOWLEDGE_INDEX_WIDTH,
     ),
   );
   const [resizingPanel, setResizingPanel] = useState<ResizablePanel>();
@@ -293,6 +308,8 @@ export default function App(): React.JSX.Element {
     paperRailWidth,
     assistantPaneVisible,
     assistantPaneWidth,
+    knowledgeIndexWidth,
+    citationSidebarWidth,
   });
   providerRef.current = provider;
   reasoningEffortRef.current = reasoningEffort;
@@ -302,6 +319,8 @@ export default function App(): React.JSX.Element {
     paperRailWidth,
     assistantPaneVisible,
     assistantPaneWidth,
+    knowledgeIndexWidth,
+    citationSidebarWidth,
   };
 
   const resetPdfDragState = useCallback((): void => {
@@ -784,15 +803,12 @@ export default function App(): React.JSX.Element {
   }, [citationSidebarVisible]);
 
   useEffect(() => {
-    writeStoredBoolean(
-      COMPARISON_SIDEBAR_VISIBLE_STORAGE_KEY,
-      comparisonSidebarVisible,
-    );
-  }, [comparisonSidebarVisible]);
-
-  useEffect(() => {
     writeStoredNumber(PAPER_RAIL_WIDTH_STORAGE_KEY, paperRailWidth);
   }, [paperRailWidth]);
+
+  useEffect(() => {
+    writeStoredNumber(CITATION_SIDEBAR_WIDTH_STORAGE_KEY, citationSidebarWidth);
+  }, [citationSidebarWidth]);
 
   useEffect(() => {
     writeStoredBoolean(
@@ -804,6 +820,10 @@ export default function App(): React.JSX.Element {
   useEffect(() => {
     writeStoredNumber(ASSISTANT_PANE_WIDTH_STORAGE_KEY, assistantPaneWidth);
   }, [assistantPaneWidth]);
+
+  useEffect(() => {
+    writeStoredNumber(KNOWLEDGE_INDEX_WIDTH_STORAGE_KEY, knowledgeIndexWidth);
+  }, [knowledgeIndexWidth]);
 
   useEffect(() => {
     return () => {
@@ -974,6 +994,36 @@ export default function App(): React.JSX.Element {
           clampPanelWidth(
             event.clientX - shellRect.left - sidebarWidth,
             MIN_PAPER_RAIL_WIDTH,
+            maxWidth,
+          ),
+        );
+        return;
+      }
+
+      if (resizingPanel === "knowledge") {
+        const maxWidth = Math.min(
+          MAX_KNOWLEDGE_INDEX_WIDTH,
+          shellRect.width - sidebarWidth - MIN_READER_PANE_WIDTH - 8,
+        );
+        setKnowledgeIndexWidth(
+          clampPanelWidth(
+            event.clientX - shellRect.left - sidebarWidth,
+            MIN_KNOWLEDGE_INDEX_WIDTH,
+            maxWidth,
+          ),
+        );
+        return;
+      }
+
+      if (resizingPanel === "citation") {
+        const maxWidth = Math.min(
+          MAX_CITATION_SIDEBAR_WIDTH,
+          shellRect.width - sidebarWidth - MIN_READER_PANE_WIDTH - 8,
+        );
+        setCitationSidebarWidth(
+          clampPanelWidth(
+            event.clientX - shellRect.left - sidebarWidth,
+            MIN_CITATION_SIDEBAR_WIDTH,
             maxWidth,
           ),
         );
@@ -1999,7 +2049,7 @@ export default function App(): React.JSX.Element {
     cancelEditingMessage();
   };
 
-  const openComparisonCitation = (paperId: string, page: number): void => {
+  const openLibraryHit = (paperId: string, page: number): void => {
     setWorkspaceView("reader");
     setExpandedCitation(undefined);
     // 同一篇论文可以直接改 currentPage；跨论文则先记录目标页，
@@ -2076,6 +2126,38 @@ export default function App(): React.JSX.Element {
       );
       return;
     }
+    if (panel === "knowledge") {
+      const maxWidth = shellWidth
+        ? Math.min(
+            MAX_KNOWLEDGE_INDEX_WIDTH,
+            shellWidth - sidebarWidth - MIN_READER_PANE_WIDTH - 8,
+          )
+        : MAX_KNOWLEDGE_INDEX_WIDTH;
+      setKnowledgeIndexWidth((current) =>
+        clampPanelWidth(
+          current + (event.key === "ArrowRight" ? amount : -amount),
+          MIN_KNOWLEDGE_INDEX_WIDTH,
+          maxWidth,
+        ),
+      );
+      return;
+    }
+    if (panel === "citation") {
+      const maxWidth = shellWidth
+        ? Math.min(
+            MAX_CITATION_SIDEBAR_WIDTH,
+            shellWidth - sidebarWidth - MIN_READER_PANE_WIDTH - 8,
+          )
+        : MAX_CITATION_SIDEBAR_WIDTH;
+      setCitationSidebarWidth((current) =>
+        clampPanelWidth(
+          current + (event.key === "ArrowRight" ? amount : -amount),
+          MIN_CITATION_SIDEBAR_WIDTH,
+          maxWidth,
+        ),
+      );
+      return;
+    }
     const maxWidth = shellWidth
       ? Math.min(
           MAX_ASSISTANT_PANE_WIDTH,
@@ -2098,31 +2180,23 @@ export default function App(): React.JSX.Element {
   const appShellStyle = {
     "--paper-rail-width": `${paperRailWidth}px`,
     "--assistant-pane-width": `${assistantPaneWidth}px`,
+    "--knowledge-index-width": `${knowledgeIndexWidth}px`,
+    "--citation-sidebar-width": `${citationSidebarWidth}px`,
   } as CSSProperties;
   const leftSidebarVisible =
-    workspaceView === "citation"
-      ? citationSidebarVisible
-      : workspaceView === "comparison"
-        ? comparisonSidebarVisible
-        : paperRailVisible;
+    workspaceView === "citation" ? citationSidebarVisible : paperRailVisible;
   const leftSidebarLabel = leftSidebarVisible ? "隐藏侧边栏" : "显示侧边栏";
 
   return (
     <div
       ref={appShellRef}
       className={`app-shell workspace-${workspaceView} ${
-        workspaceView !== "citation" &&
-        workspaceView !== "comparison" &&
-        !paperRailVisible
+        workspaceView !== "citation" && !paperRailVisible
           ? "paper-rail-collapsed"
           : ""
       } ${assistantPaneVisible ? "" : "assistant-pane-collapsed"} ${
         workspaceView === "citation" && !citationSidebarVisible
           ? "citation-sidebar-collapsed"
-          : ""
-      } ${
-        workspaceView === "comparison" && !comparisonSidebarVisible
-          ? "comparison-sidebar-collapsed"
           : ""
       } ${resizingPanel ? "is-resizing" : ""}`}
       style={appShellStyle}
@@ -2134,25 +2208,23 @@ export default function App(): React.JSX.Element {
         </div>
       </div>
       <button
-          className="titlebar-panel-toggle"
-          type="button"
-          title={leftSidebarLabel}
-          aria-label={leftSidebarLabel}
-          onClick={() => {
-            if (workspaceView === "citation") {
-              setCitationSidebarVisible((current) => !current);
-            } else if (workspaceView === "comparison") {
-              setComparisonSidebarVisible((current) => !current);
-            } else {
-              setPaperRailVisible((current) => !current);
-            }
-          }}
-        >
-          {leftSidebarVisible ? (
-            <PanelLeftClose size={17} />
-          ) : (
-            <PanelLeftOpen size={17} />
-          )}
+        className="titlebar-panel-toggle"
+        type="button"
+        title={leftSidebarLabel}
+        aria-label={leftSidebarLabel}
+        onClick={() => {
+          if (workspaceView === "citation") {
+            setCitationSidebarVisible((current) => !current);
+          } else {
+            setPaperRailVisible((current) => !current);
+          }
+        }}
+      >
+        {leftSidebarVisible ? (
+          <PanelLeftClose size={17} />
+        ) : (
+          <PanelLeftOpen size={17} />
+        )}
       </button>
       <aside ref={appSidebarRef} className="app-sidebar">
         <nav className="sidebar-nav" aria-label="主导航">
@@ -2217,14 +2289,6 @@ export default function App(): React.JSX.Element {
             <Database size={20} />
           </button>
           <button
-            className={workspaceView === "comparison" ? "active" : ""}
-            type="button"
-            title="研究矩阵"
-            onClick={() => setWorkspaceView("comparison")}
-          >
-            <Columns3 size={20} />
-          </button>
-          <button
             className={workspaceView === "citation" ? "active" : ""}
             type="button"
             title="引文图谱"
@@ -2252,7 +2316,6 @@ export default function App(): React.JSX.Element {
       {workspaceView !== "citation" &&
         workspaceView !== "search" &&
         workspaceView !== "knowledge" &&
-        workspaceView !== "comparison" &&
         paperRailVisible && (
           <>
             <aside
@@ -2702,13 +2765,16 @@ export default function App(): React.JSX.Element {
             <CitationGraphWorkspace
               papers={activePapers}
               folders={folders}
-              onOpenPaper={openGraphPaper}
-              onPaperImported={(paper) =>
-                setPapers((current) => [
-                  paper,
-                  ...current.filter((item) => item.id !== paper.id),
-                ])
+              sidebarWidth={citationSidebarWidth}
+              sidebarMinWidth={MIN_CITATION_SIDEBAR_WIDTH}
+              sidebarMaxWidth={MAX_CITATION_SIDEBAR_WIDTH}
+              onSidebarResizePointerDown={(event) =>
+                startPanelResize("citation", event)
               }
+              onSidebarResizeKeyDown={(event) =>
+                resizePanelWithKeyboard("citation", event)
+              }
+              onOpenPaper={openGraphPaper}
               onOpenSettings={() => {
                 setAppSettingsSection("openalex");
                 setAppSettingsOpen(true);
@@ -2731,21 +2797,21 @@ export default function App(): React.JSX.Element {
             onReasoningChange={setReasoningEffort}
             onQueryChange={setLibrarySearchQuery}
             onSearch={(nextQuery) => void searchLibrary(nextQuery)}
-            onOpenHit={openComparisonCitation}
+            onOpenHit={openLibraryHit}
             onError={setNotice}
           />
         ) : workspaceView === "knowledge" ? (
           <KnowledgeWorkspace
             papers={activePapers}
-            provider={provider}
-            onError={setNotice}
-            onNotice={setNotice}
-          />
-        ) : workspaceView === "comparison" ? (
-          <ComparisonWorkspace
-            papers={activePapers}
-            provider={provider}
-            onOpenCitation={openComparisonCitation}
+            indexWidth={knowledgeIndexWidth}
+            indexMinWidth={MIN_KNOWLEDGE_INDEX_WIDTH}
+            indexMaxWidth={MAX_KNOWLEDGE_INDEX_WIDTH}
+            onIndexResizePointerDown={(event) =>
+              startPanelResize("knowledge", event)
+            }
+            onIndexResizeKeyDown={(event) =>
+              resizePanelWithKeyboard("knowledge", event)
+            }
             onError={setNotice}
           />
         ) : !selectedPaper ? (

@@ -5,11 +5,14 @@ import type {
   ChatAttachment,
   ChatMessage,
   ChatProgress,
-  ComparePapersInput,
-  ComparisonReport,
+  CitationContentMatchPriority,
+  CitationDiscoveryInput,
+  CitationDiscoveryResult,
   CitationGraphRefreshResult,
   CitationGraphClearResult,
+  CitationGraphExportRequest,
   CitationGraphSnapshot,
+  CitationNetworkAnalysis,
   GeneratePaperNoteResult,
   GenerateLibraryReviewInput,
   ImportPdfInput,
@@ -167,6 +170,7 @@ const api: PaperXcelApi = {
       ipcRenderer.invoke("translation:translate", input),
   },
   notes: {
+    list: (): Promise<PaperNote[]> => ipcRenderer.invoke("notes:list"),
     get: (paperId: string): Promise<PaperNote | null> =>
       ipcRenderer.invoke("notes:get", paperId),
     save: (paperId: string, content: string): Promise<PaperNote> =>
@@ -210,16 +214,6 @@ const api: PaperXcelApi = {
         ipcRenderer.removeListener("knowledge-base:progress", handler);
     },
   },
-  comparisons: {
-    list: (): Promise<ComparisonReport[]> =>
-      ipcRenderer.invoke("comparisons:list"),
-    generate: (input: ComparePapersInput): Promise<ComparisonReport> =>
-      ipcRenderer.invoke("comparisons:generate", input),
-    remove: (reportId: string): Promise<void> =>
-      ipcRenderer.invoke("comparisons:remove", reportId),
-    exportMarkdown: (reportId: string): Promise<boolean> =>
-      ipcRenderer.invoke("comparisons:export-markdown", reportId),
-  },
   search: {
     library: (input: LibrarySearchInput): Promise<LibrarySearchHit[]> =>
       ipcRenderer.invoke("search:library", input),
@@ -231,6 +225,27 @@ const api: PaperXcelApi = {
       ipcRenderer.invoke("settings:get-scihub-enabled"),
     setScihubEnabled: (enabled: boolean): Promise<boolean> =>
       ipcRenderer.invoke("settings:set-scihub-enabled", enabled),
+    getPreprintFallbackEnabled: (): Promise<boolean> =>
+      ipcRenderer.invoke("settings:get-preprint-fallback-enabled"),
+    setPreprintFallbackEnabled: (enabled: boolean): Promise<boolean> =>
+      ipcRenderer.invoke("settings:set-preprint-fallback-enabled", enabled),
+    getCitationAiOptimizationEnabled: (): Promise<boolean> =>
+      ipcRenderer.invoke("settings:get-citation-ai-optimization-enabled"),
+    setCitationAiOptimizationEnabled: (enabled: boolean): Promise<boolean> =>
+      ipcRenderer.invoke(
+        "settings:set-citation-ai-optimization-enabled",
+        enabled,
+      ),
+    getCitationContentMatchPriority:
+      (): Promise<CitationContentMatchPriority> =>
+        ipcRenderer.invoke("settings:get-citation-content-match-priority"),
+    setCitationContentMatchPriority: (
+      priority: CitationContentMatchPriority,
+    ): Promise<CitationContentMatchPriority> =>
+      ipcRenderer.invoke(
+        "settings:set-citation-content-match-priority",
+        priority,
+      ),
   },
   openAlex: {
     getConfig: () => ipcRenderer.invoke("openalex:get-config"),
@@ -247,8 +262,16 @@ const api: PaperXcelApi = {
       paperIds?: string[],
     ): Promise<CitationGraphRefreshResult> =>
       ipcRenderer.invoke("citation-graph:refresh", force, paperIds),
+    discover: (
+      input: CitationDiscoveryInput,
+    ): Promise<CitationDiscoveryResult> =>
+      ipcRenderer.invoke("citation-graph:discover", input),
+    analyze: (paperIds?: string[]): Promise<CitationNetworkAnalysis> =>
+      ipcRenderer.invoke("citation-graph:analyze", paperIds),
     clear: (): Promise<CitationGraphClearResult> =>
       ipcRenderer.invoke("citation-graph:clear"),
+    export: (request: CitationGraphExportRequest): Promise<boolean> =>
+      ipcRenderer.invoke("citation-graph:export", request),
   },
   zotero: {
     getConfig: () => ipcRenderer.invoke("zotero:get-config"),

@@ -62,7 +62,7 @@ export function DoiDialog({
           <input
             autoFocus
             spellCheck={false}
-            placeholder="DOI、arXiv ID 或链接"
+            placeholder="请输入 DOI 等相关信息"
             value={input}
             onChange={(event) => setInput(event.target.value)}
           />

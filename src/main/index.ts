@@ -16,9 +16,11 @@ import type {
   AskPaperInput,
   ChatAttachment,
   ChatProgress,
+  CitationContentMatchPriority,
+  CitationDiscoveryInput,
+  CitationGraphExportRequest,
   CitationGraphSnapshot,
   ChatMessage,
-  ComparePapersInput,
   CreateLibraryFolderInput,
   DocumentPageText,
   GenerateLibraryReviewInput,
@@ -42,10 +44,6 @@ import type {
 } from "../shared/contracts";
 import { buildCitationGraphSnapshot } from "../shared/citationGraph";
 import {
-  buildComparisonReportExport,
-  comparisonReportFileName,
-} from "../shared/comparisons";
-import {
   buildLibraryReviewExport,
   buildPaperFullTextMarkdown,
   libraryReviewFileName,
@@ -64,13 +62,15 @@ import {
   extractCrossrefPdfCandidates,
   extractDoiResolverPdfCandidates,
   extractEuropePmcPdfCandidates,
+  extractMatchingChemrxivPdfCandidates,
   extractOpenAlexPdfCandidates,
   extractScihubPdfCandidates,
-  extractSemanticScholarPdfCandidates,
-  extractUnpaywallPdfCandidates,
+  findMatchingArxivResult,
   isLikelyScihubChallenge,
+  isChemrxivDoi,
   looksLikePdfNetworkResponse,
   looksLikeScihubBlock,
+  parseArxivAtomEntries,
   parseArxivAtomFeed,
   parsePaperIdentifier,
   normalizeDoiInput,
@@ -79,12 +79,11 @@ import {
   uniquePdfCandidates,
   type ArxivLookupResult,
   type CoreSearchResponse,
+  type CrossrefPreprintWork,
   type CrossrefMessageWithLinks,
   type EuropePmcResponse,
   type OpenAlexWork,
   type PdfCandidate,
-  type SemanticScholarPaper,
-  type UnpaywallResponse,
 } from "./doiSources";
 import {
   findPaperForMetadata,
@@ -108,6 +107,8 @@ import {
   type ResolvedChatAttachment,
 } from "./chat-attachments";
 import { refreshCitationGraphData } from "./citation-graph-service";
+import { discoverCitationWorks } from "./citation-discovery-service";
+import { analyzeCitationNetwork } from "./citation-analysis-service";
 import { OpenAlexClient } from "./openalex-client";
 import { BaiduTranslationClient } from "./baidu-translation-client";
 import {
@@ -119,7 +120,7 @@ import {
 import {
   answerLibraryQuestion,
   askPaper,
-  comparePapers,
+  extractCitationReferenceSearchHints,
   generateLibraryReview,
   generatePaperNote,
   listProviderModels,
@@ -523,6 +524,30 @@ function registerIpc(): void {
     store.setScihubEnabled(Boolean(enabled));
     return store.getScihubEnabled();
   });
+  ipcMain.handle("settings:get-preprint-fallback-enabled", () =>
+    store.getPreprintFallbackEnabled(),
+  );
+  ipcMain.handle(
+    "settings:set-preprint-fallback-enabled",
+    (_event, enabled: boolean) =>
+      store.setPreprintFallbackEnabled(Boolean(enabled)),
+  );
+  ipcMain.handle("settings:get-citation-ai-optimization-enabled", () =>
+    store.getCitationAiOptimizationEnabled(),
+  );
+  ipcMain.handle(
+    "settings:set-citation-ai-optimization-enabled",
+    (_event, enabled: boolean) =>
+      store.setCitationAiOptimizationEnabled(Boolean(enabled)),
+  );
+  ipcMain.handle("settings:get-citation-content-match-priority", () =>
+    store.getCitationContentMatchPriority(),
+  );
+  ipcMain.handle(
+    "settings:set-citation-content-match-priority",
+    (_event, priority: CitationContentMatchPriority) =>
+      store.setCitationContentMatchPriority(priority),
+  );
   ipcMain.handle("translation:get-config", () => store.getTranslationConfig());
   ipcMain.handle(
     "translation:save-config",
@@ -562,6 +587,112 @@ function registerIpc(): void {
   );
   ipcMain.handle("citation-graph:clear", () => store.clearCitationGraphCache());
   ipcMain.handle(
+    "citation-graph:discover",
+    async (_event, input: CitationDiscoveryInput) => {
+      const papers = selectCitationPapers(store.listPapers(), input?.paperIds);
+      const cache = store.getCitationGraphCache();
+      const { result, works } = await discoverCitationWorks({
+        papers,
+        cache,
+        client: new OpenAlexClient(store.resolveOpenAlexApiKey()),
+        query: typeof input?.query === "string" ? input.query : "",
+        limit:
+          typeof input?.limit === "number" && Number.isFinite(input.limit)
+            ? input.limit
+            : undefined,
+        contentMatchPriority: store.getCitationContentMatchPriority(),
+      });
+      for (const work of works) cache.works[work.openAlexId] = work;
+      if (works.length > 0) {
+        cache.updatedAt = new Date().toISOString();
+        store.saveCitationGraphCache(cache);
+      }
+      return result;
+    },
+  );
+  ipcMain.handle("citation-graph:analyze", (_event, paperIds?: unknown) =>
+    analyzeCitationNetwork(
+      selectCitationPapers(store.listPapers(), paperIds),
+      store.getCitationGraphCache(),
+    ),
+  );
+  ipcMain.handle(
+    "citation-graph:export",
+    async (_event, input: CitationGraphExportRequest) => {
+      if (
+        !input ||
+        (input.format !== "json" && input.format !== "html") ||
+        typeof input.content !== "string"
+      ) {
+        throw new Error("图谱导出参数不正确。");
+      }
+      const config =
+        input.format === "json"
+          ? {
+              title: "导出引文图谱数据",
+              name: "JSON 数据",
+              extension: "json",
+              maximumLength: 80 * 1024 * 1024,
+            }
+          : {
+              title: "导出交互式引文图谱",
+              name: "HTML 网页",
+              extension: "html",
+              maximumLength: 40 * 1024 * 1024,
+            };
+      if (
+        !input.content.length ||
+        input.content.length > config.maximumLength
+      ) {
+        throw new Error("图谱导出内容为空或体积过大。");
+      }
+      const date = new Date().toISOString().slice(0, 10);
+      const selected = await dialog.showSaveDialog(mainWindow!, {
+        title: config.title,
+        defaultPath: join(
+          app.getPath("documents"),
+          `PaperXcel-引文图谱-${date}.${config.extension}`,
+        ),
+        filters: [{ name: config.name, extensions: [config.extension] }],
+      });
+      if (selected.canceled || !selected.filePath) return false;
+      const outputPath = selected.filePath
+        .toLocaleLowerCase()
+        .endsWith(`.${config.extension}`)
+        ? selected.filePath
+        : `${selected.filePath}.${config.extension}`;
+      if (input.format === "json") {
+        let document: unknown;
+        try {
+          document = JSON.parse(input.content);
+        } catch {
+          throw new Error("生成的引文图谱 JSON 文件无效。");
+        }
+        if (
+          !document ||
+          typeof document !== "object" ||
+          (document as { schemaVersion?: unknown }).schemaVersion !== 1 ||
+          !Array.isArray((document as { nodes?: unknown }).nodes) ||
+          !Array.isArray((document as { edges?: unknown }).edges)
+        ) {
+          throw new Error("生成的引文图谱 JSON 数据结构无效。");
+        }
+        await writeFile(outputPath, input.content, "utf8");
+      } else {
+        if (
+          !input.content
+            .trimStart()
+            .toLocaleLowerCase()
+            .startsWith("<!doctype html>")
+        ) {
+          throw new Error("生成的交互式图谱文件无效。");
+        }
+        await writeFile(outputPath, input.content, "utf8");
+      }
+      return true;
+    },
+  );
+  ipcMain.handle(
     "citation-graph:refresh",
     async (_event, force = false, paperIds?: unknown) => {
       const papers = selectCitationPapers(store.listPapers(), paperIds);
@@ -592,6 +723,13 @@ function registerIpc(): void {
             30_000,
           );
         },
+        extractReferenceSearchHints: store.getCitationAiOptimizationEnabled()
+          ? (references) =>
+              extractCitationReferenceSearchHints(
+                store.getActiveProvider(),
+                references,
+              )
+          : undefined,
       });
       store.saveCitationGraphCache(cache);
       return result;
@@ -834,6 +972,7 @@ function registerIpc(): void {
     return true;
   });
 
+  ipcMain.handle("notes:list", () => store.listPaperNotes());
   ipcMain.handle("notes:get", (_event, paperId: string) =>
     store.getPaperNote(paperId),
   );
@@ -1214,68 +1353,6 @@ function registerIpc(): void {
     knowledgeMarkdownRepairAbortControllers.delete(requestId);
     return true;
   });
-
-  ipcMain.handle("comparisons:list", () => store.listComparisonReports());
-  ipcMain.handle(
-    "comparisons:generate",
-    async (_event, input: ComparePapersInput) => {
-      const paperIds = [...new Set(input.paperIds)];
-      if (paperIds.length < 2 || paperIds.length > 5) {
-        throw new Error("请选择 2 至 5 篇文献进行比较。");
-      }
-      const papers = paperIds.map((paperId) => store.getPaper(paperId));
-      if (papers.some((paper) => !paper)) {
-        throw new Error("所选文献中包含已移除的项目。");
-      }
-      if (papers.some((paper) => paper?.archived)) {
-        throw new Error("已归档文献不能用于研究矩阵。");
-      }
-      const readyPapers = papers.filter(
-        (paper): paper is Paper => paper?.status === "ready",
-      );
-      if (readyPapers.length !== papers.length) {
-        throw new Error("只能比较已完成索引的文献。");
-      }
-      const result = await comparePapers(store.getActiveProvider(), worker, {
-        papers: readyPapers.map((paper) => ({
-          id: paper.id,
-          title: paper.title,
-        })),
-        question: input.question,
-        indexDir: join(app.getPath("userData"), "indexes"),
-      });
-      return store.saveComparisonReport({
-        id: crypto.randomUUID(),
-        ...result,
-        createdAt: new Date().toISOString(),
-      });
-    },
-  );
-  ipcMain.handle("comparisons:remove", (_event, reportId: string) =>
-    store.removeComparisonReport(reportId),
-  );
-  ipcMain.handle(
-    "comparisons:export-markdown",
-    async (_event, reportId: string) => {
-      const report = store.getComparisonReport(reportId);
-      if (!report) throw new Error("比较报告不存在。");
-      const selected = await dialog.showSaveDialog(mainWindow!, {
-        title: "导出跨文献研究矩阵",
-        defaultPath: join(
-          app.getPath("documents"),
-          comparisonReportFileName(report),
-        ),
-        filters: [{ name: "Markdown", extensions: ["md"] }],
-      });
-      if (selected.canceled || !selected.filePath) return false;
-      await writeFile(
-        selected.filePath,
-        buildComparisonReportExport(report, store.listPapers()),
-        "utf8",
-      );
-      return true;
-    },
-  );
 
   ipcMain.handle(
     "search:library",
@@ -1823,6 +1900,7 @@ async function addPaperFromIdentifier(
   identifier: PaperIdentifier,
 ): Promise<Paper> {
   if (identifier.kind === "doi") {
+    const explicitChemrxiv = isChemrxivDoi(identifier.doi);
     let doiLookup: PaperLookupResult | undefined;
     let doiError: unknown;
     try {
@@ -1831,9 +1909,24 @@ async function addPaperFromIdentifier(
       doiError = error;
     }
 
-    // Crossref 不是所有 DOI 的唯一元数据来源。即使它失败，也继续用 DOI
-    // 查询 arXiv；arXiv 条目可能已经记录了出版社 DOI 和自己的 PDF。
-    const arxivLookup = await lookupArxivByDoi(identifier.doi);
+    if (!doiLookup && explicitChemrxiv) {
+      return saveImportedPaper(
+        {
+          title: identifier.doi,
+          authors: [],
+          doi: identifier.doi,
+          sourceUrl: `https://chemrxiv.org/doi/full/${identifier.doi}`,
+        },
+        extractChemrxivPdfCandidates(identifier.doi),
+        true,
+      );
+    }
+
+    // Crossref 失败时，仅在用户允许预印本回退后尝试通过 DOI 定位 arXiv。
+    const arxivLookup =
+      !doiLookup && store.getPreprintFallbackEnabled()
+        ? await lookupArxivByDoi(identifier.doi)
+        : undefined;
     if (!doiLookup && !arxivLookup) {
       throw doiError instanceof Error
         ? doiError
@@ -1848,20 +1941,10 @@ async function addPaperFromIdentifier(
       return saveImportedPaper(metadata, arxivLookup!.pdfCandidates, true);
     }
 
-    const doi = doiLookup.metadata.doi;
-    const linkedArxivLookup =
-      doi && doi.toLowerCase() === identifier.doi.toLowerCase()
-        ? arxivLookup
-        : await lookupArxivByDoi(doi ?? identifier.doi);
-    const metadata: PaperMetadata = {
-      ...doiLookup.metadata,
-      arxivId: linkedArxivLookup?.metadata.arxivId,
-      arxivVersion: linkedArxivLookup?.metadata.arxivVersion,
-    };
     return saveImportedPaper(
-      metadata,
-      [...doiLookup.pdfCandidates, ...(linkedArxivLookup?.pdfCandidates ?? [])],
-      Boolean(linkedArxivLookup?.metadata.arxivId),
+      doiLookup.metadata,
+      doiLookup.pdfCandidates,
+      explicitChemrxiv,
     );
   }
 
@@ -1957,6 +2040,7 @@ async function addOpenAccessPdfIfAvailable(
   const resolution = await resolveOpenAccessPdf(
     metadata.doi,
     crossrefCandidates,
+    metadata,
   );
   if (!resolution.downloaded) {
     const manualPdfUrl =
@@ -2257,20 +2341,29 @@ async function lookupArxivByDoi(
 async function resolveOpenAccessPdf(
   doi: string,
   crossrefCandidates: PdfCandidate[],
+  metadata: PaperMetadata,
 ): Promise<PdfResolution> {
   const downloaded = await resolvePdfCandidatesInOrder(
     [
       () => Promise.resolve(crossrefCandidates),
       () => lookupEuropePmcPdfCandidates(doi),
-      () => lookupUnpaywallPdfCandidates(doi),
       () => lookupOpenAlexPdfCandidates(doi),
-      () => lookupSemanticScholarPdfCandidates(doi),
-      () => lookupArxivPdfCandidates(doi),
       () => lookupCorePdfCandidates(doi),
     ],
     downloadPdfCandidate,
   );
   if (downloaded) return { downloaded };
+
+  if (store.getPreprintFallbackEnabled() && !isChemrxivDoi(doi)) {
+    const preprint = await resolvePdfCandidatesInOrder(
+      [
+        () => lookupChemrxivPreprintPdfCandidates(metadata),
+        () => lookupArxivPreprintPdfCandidates(doi, metadata),
+      ],
+      downloadPdfCandidate,
+    );
+    if (preprint) return { downloaded: preprint };
+  }
 
   // Sci-Hub 作为最后兜底：仅在合法来源均无结果时尝试。
   const scihub = await lookupScihubPdfCandidates(doi);
@@ -2290,17 +2383,6 @@ async function resolveOpenAccessPdf(
     manualUrl: scihub.challengeUrl,
     scihubChallengeDetected: Boolean(scihub.challengeUrl),
   };
-}
-
-async function lookupUnpaywallPdfCandidates(
-  doi: string,
-): Promise<PdfCandidate[]> {
-  const email = process.env.PAPERXCEL_UNPAYWALL_EMAIL?.trim();
-  if (!email) return [];
-  const payload = await fetchJson<UnpaywallResponse>(
-    `https://api.unpaywall.org/v2/${encodeURIComponent(doi)}?email=${encodeURIComponent(email)}`,
-  );
-  return payload ? extractUnpaywallPdfCandidates(payload) : [];
 }
 
 async function lookupEuropePmcPdfCandidates(
@@ -2329,24 +2411,55 @@ async function lookupOpenAlexPdfCandidates(
   return payload ? extractOpenAlexPdfCandidates(payload) : [];
 }
 
-async function lookupSemanticScholarPdfCandidates(
-  doi: string,
+async function lookupChemrxivPreprintPdfCandidates(
+  metadata: PaperMetadata,
 ): Promise<PdfCandidate[]> {
-  const headers: Record<string, string> = { Accept: "application/json" };
-  const apiKey = process.env.PAPERXCEL_SEMANTIC_SCHOLAR_API_KEY?.trim();
-  if (apiKey) headers["x-api-key"] = apiKey;
-  const payload = await fetchJson<SemanticScholarPaper>(
-    `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(
-      `DOI:${doi}`,
-    )}?fields=openAccessPdf`,
-    headers,
+  if (!metadata.title || isWeakPaperTitle(metadata.title)) return [];
+  const url = new URL("https://api.crossref.org/works");
+  url.searchParams.set("query.title", metadata.title.slice(0, 500));
+  url.searchParams.set("filter", "prefix:10.26434");
+  url.searchParams.set("rows", "10");
+  const payload = await fetchJson<{
+    message?: { items?: CrossrefPreprintWork[] };
+  }>(url.toString(), {
+    Accept: "application/json",
+    "User-Agent": "PaperXcel/0.1",
+  });
+  return extractMatchingChemrxivPdfCandidates(
+    metadata,
+    payload?.message?.items ?? [],
   );
-  return payload ? extractSemanticScholarPdfCandidates(payload) : [];
 }
 
-async function lookupArxivPdfCandidates(doi: string): Promise<PdfCandidate[]> {
-  const result = await lookupArxivByDoi(doi);
-  return result?.pdfCandidates ?? [];
+async function lookupArxivPreprintPdfCandidates(
+  doi: string,
+  metadata: PaperMetadata,
+): Promise<PdfCandidate[]> {
+  const byDoi = await lookupArxivByDoi(doi);
+  if (byDoi) return byDoi.pdfCandidates;
+  if (!metadata.title || isWeakPaperTitle(metadata.title)) return [];
+
+  const url = new URL("https://export.arxiv.org/api/query");
+  const title = metadata.title.replace(/["\\]/g, " ").replace(/\s+/g, " ");
+  url.searchParams.set("search_query", `ti:"${title.slice(0, 300)}"`);
+  url.searchParams.set("start", "0");
+  url.searchParams.set("max_results", "5");
+  try {
+    const response = await net.fetch(url.toString(), {
+      headers: {
+        Accept: "application/atom+xml, application/xml;q=0.9, text/xml;q=0.8",
+      },
+    });
+    if (!response.ok) return [];
+    return (
+      findMatchingArxivResult(
+        metadata,
+        parseArxivAtomEntries(await response.text()),
+      )?.pdfCandidates ?? []
+    );
+  } catch {
+    return [];
+  }
 }
 
 async function lookupCorePdfCandidates(doi: string): Promise<PdfCandidate[]> {

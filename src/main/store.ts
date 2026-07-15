@@ -15,7 +15,7 @@ import {
 import { paperArtifactDirectory } from "./paper-artifacts";
 import type {
   ChatMessage,
-  ComparisonReport,
+  CitationContentMatchPriority,
   CreateLibraryFolderInput,
   LibraryReview,
   LibraryFolder,
@@ -66,11 +66,16 @@ interface StoreSchema {
   folders: LibraryFolder[];
   notes: Record<string, PaperNote>;
   reviews: LibraryReview[];
-  comparisons: ComparisonReport[];
   providers: StoredProvider[];
   activeProviderId: string;
   // 用户是否已接受免责声明并启用 Sci-Hub 兜底下载。
   scihubEnabled: boolean;
+  // 普通 DOI 的开放获取来源失败后，是否允许尝试匹配预印本。
+  preprintFallbackEnabled: boolean;
+  // 用户是否允许当前模型在引文匹配前清理 PDF 书目文本。
+  citationAiOptimizationEnabled: boolean;
+  // 外部论文发现中，内容关键词匹配对总推荐分的影响级别。
+  citationContentMatchPriority: CitationContentMatchPriority;
   zotero: StoredZoteroConfig;
   openAlex: StoredOpenAlexConfig;
   citationGraph: CitationGraphCache;
@@ -80,7 +85,6 @@ interface StoreSchema {
 const DEFAULT_PROVIDER_ID = "openai";
 const MAX_CHAT_MESSAGES = 200;
 const MAX_NOTE_LENGTH = 200_000;
-const MAX_COMPARISON_REPORTS = 50;
 const MAX_LIBRARY_REVIEWS = 30;
 
 export class AppStore {
@@ -95,7 +99,6 @@ export class AppStore {
         folders: [],
         notes: {},
         reviews: [],
-        comparisons: [],
         providers: [
           {
             id: DEFAULT_PROVIDER_ID,
@@ -107,6 +110,9 @@ export class AppStore {
         ],
         activeProviderId: DEFAULT_PROVIDER_ID,
         scihubEnabled: false,
+        preprintFallbackEnabled: false,
+        citationAiOptimizationEnabled: false,
+        citationContentMatchPriority: "standard",
         zotero: {
           mode: "local",
           libraryType: "user",
@@ -325,12 +331,6 @@ export class AppStore {
         .get("reviews")
         .filter((review) => !review.paperIds.includes(id)),
     );
-    this.store.set(
-      "comparisons",
-      this.store
-        .get("comparisons")
-        .filter((report) => !report.paperIds.includes(id)),
-    );
   }
 
   listChatMessages(paperId: string): ChatMessage[] {
@@ -425,40 +425,6 @@ export class AppStore {
     );
   }
 
-  listComparisonReports(): ComparisonReport[] {
-    return this.store
-      .get("comparisons")
-      .map(cloneComparisonReport)
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  }
-
-  getComparisonReport(id: string): ComparisonReport | undefined {
-    const report = this.store.get("comparisons").find((item) => item.id === id);
-    return report ? cloneComparisonReport(report) : undefined;
-  }
-
-  saveComparisonReport(report: ComparisonReport): ComparisonReport {
-    if (report.paperIds.some((paperId) => !this.getPaper(paperId))) {
-      throw new Error("比较报告包含已移除的文献。");
-    }
-    const reports = this.store
-      .get("comparisons")
-      .filter((item) => item.id !== report.id);
-    const next = [cloneComparisonReport(report), ...reports].slice(
-      0,
-      MAX_COMPARISON_REPORTS,
-    );
-    this.store.set("comparisons", next);
-    return cloneComparisonReport(report);
-  }
-
-  removeComparisonReport(id: string): void {
-    this.store.set(
-      "comparisons",
-      this.store.get("comparisons").filter((report) => report.id !== id),
-    );
-  }
-
   listProviders(): ProviderProfile[] {
     const activeProviderId = this.store.get("activeProviderId");
     return this.store.get("providers").map((provider) => ({
@@ -544,6 +510,38 @@ export class AppStore {
   setScihubEnabled(enabled: boolean): boolean {
     this.store.set("scihubEnabled", enabled);
     return enabled;
+  }
+
+  getPreprintFallbackEnabled(): boolean {
+    return this.store.get("preprintFallbackEnabled");
+  }
+
+  setPreprintFallbackEnabled(enabled: boolean): boolean {
+    this.store.set("preprintFallbackEnabled", enabled);
+    return enabled;
+  }
+
+  getCitationAiOptimizationEnabled(): boolean {
+    return this.store.get("citationAiOptimizationEnabled");
+  }
+
+  setCitationAiOptimizationEnabled(enabled: boolean): boolean {
+    this.store.set("citationAiOptimizationEnabled", enabled);
+    return enabled;
+  }
+
+  getCitationContentMatchPriority(): CitationContentMatchPriority {
+    return normalizeCitationContentMatchPriority(
+      this.store.get("citationContentMatchPriority"),
+    );
+  }
+
+  setCitationContentMatchPriority(
+    priority: CitationContentMatchPriority,
+  ): CitationContentMatchPriority {
+    const normalized = normalizeCitationContentMatchPriority(priority);
+    this.store.set("citationContentMatchPriority", normalized);
+    return normalized;
   }
 
   getTranslationConfig(): TranslationConfig {
@@ -798,12 +796,10 @@ function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function cloneComparisonReport(report: ComparisonReport): ComparisonReport {
-  return {
-    ...report,
-    paperIds: [...report.paperIds],
-    citations: report.citations.map((citation) => ({ ...citation })),
-  };
+function normalizeCitationContentMatchPriority(
+  priority: unknown,
+): CitationContentMatchPriority {
+  return priority === "low" || priority === "high" ? priority : "standard";
 }
 
 function cloneLibraryReview(review: LibraryReview): LibraryReview {
