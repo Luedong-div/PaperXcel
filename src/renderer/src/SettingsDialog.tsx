@@ -257,13 +257,7 @@ export function SettingsDialog({
               />
               <div>
                 <strong>文档引擎</strong>
-                <small>
-                  {worker?.available
-                    ? worker.semanticSearch
-                      ? "混合检索"
-                      : "关键词检索"
-                    : "未连接"}
-                </small>
+                <small>{worker?.available ? "模糊全文检索" : "未连接"}</small>
               </div>
             </div>
           </aside>

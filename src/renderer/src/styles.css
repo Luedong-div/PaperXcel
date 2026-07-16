@@ -5215,6 +5215,40 @@ button:disabled {
   background: #dfe2dc;
 }
 
+.paper-markdown-warning {
+  display: flex;
+  width: min(920px, 100%);
+  align-items: flex-start;
+  gap: 9px;
+  margin: 0 auto 12px;
+  padding: 10px 12px;
+  border: 1px solid #dfc58c;
+  border-radius: 4px;
+  color: #6f5318;
+  background: #fff9e9;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.paper-markdown-warning > svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.paper-markdown-warning strong {
+  display: block;
+  margin-bottom: 2px;
+  color: #59400e;
+}
+
+.paper-markdown-warning p {
+  margin: 0;
+}
+
+.paper-markdown-warning p + p {
+  margin-top: 3px;
+}
+
 .paper-markdown-document {
   width: min(920px, 100%);
   min-height: 100%;

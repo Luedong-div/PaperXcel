@@ -1,31 +1,25 @@
-import { app } from "electron";
 import { EventEmitter } from "node:events";
-import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { WorkerStatus } from "../shared/contracts";
 import { DocumentEngine } from "./document-engine";
 
-export class WorkerClient extends EventEmitter {
+const mainDirectory = dirname(fileURLToPath(import.meta.url));
+
+export class DocumentEngineClient extends EventEmitter {
   private engine?: DocumentEngine;
   private startError?: string;
 
   async start(): Promise<void> {
     if (this.engine) return;
     try {
-      const modelDirectory = app.isPackaged
-        ? join(process.resourcesPath, "models", "bge-small-zh-v1.5")
-        : join(app.getAppPath(), "models", "bge-small-zh-v1.5");
-      const require = createRequire(import.meta.url);
       const standardFontDirectory = join(
-        dirname(require.resolve("pdfjs-dist/package.json")),
+        mainDirectory,
+        "../renderer/pdfjs",
         "standard_fonts",
       );
-      const wasmDirectory = join(
-        dirname(require.resolve("pdfjs-dist/package.json")),
-        "wasm",
-      );
+      const wasmDirectory = join(mainDirectory, "../renderer/pdfjs", "wasm");
       this.engine = new DocumentEngine(
-        modelDirectory,
         standardFontDirectory,
         wasmDirectory,
         (payload) => {
@@ -65,7 +59,7 @@ export class WorkerClient extends EventEmitter {
       return {
         available: false,
         pdfjs: false,
-        semanticSearch: false,
+        searchMode: "fuzzy-text",
         detail: error instanceof Error ? error.message : String(error),
       };
     }

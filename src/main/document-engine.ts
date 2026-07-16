@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { mkdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { Tokenizer } from "@huggingface/tokenizers";
-import * as ort from "onnxruntime-node";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import DOMMatrixShim from "@thednp/dommatrix";
 import type { DocumentPageText } from "../shared/contracts";
 import {
   normalizePdfPageText,
@@ -15,21 +15,8 @@ import { extractNumberedReferenceCitations } from "./reference-citations";
 
 const MAX_CHUNK_CHARS = 1_600;
 const CHUNK_OVERLAP_CHARS = 180;
-const MAX_EMBEDDING_TOKENS = 512;
-const EMBEDDING_DIMENSIONS = 512;
-export const CURRENT_EMBEDDING_PROFILE =
-  "bge-small-zh-v1.5-cls-query-instruction-v1";
-export const LEGACY_EMBEDDING_PROFILE = "bge-small-zh-v1.5-mean-v0";
-const BGE_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章：";
-
-export type EmbeddingProfile =
-  | typeof CURRENT_EMBEDDING_PROFILE
-  | typeof LEGACY_EMBEDDING_PROFILE;
-export type EmbeddingRole = "document" | "query";
-type QueryEmbeddingCache = Map<
-  EmbeddingProfile,
-  Promise<Float32Array | undefined>
->;
+const TEXT_SEARCH_PROFILE = "fts5-fuzzy-v1";
+const mainDirectory = dirname(fileURLToPath(import.meta.url));
 
 interface Chunk {
   chunkId: string;
@@ -54,13 +41,11 @@ interface ExtractResult {
   year_guess?: number;
   doi_guess?: string;
   chunk_count: number;
-  semantic_ready: boolean;
 }
 
 interface MarkdownReindexResult {
   page_count: number;
   chunk_count: number;
-  semantic_ready: boolean;
   updated: boolean;
 }
 
@@ -72,13 +57,22 @@ interface IndexSource {
 
 type PdfTextItem = PdfLayoutTextItem;
 
-export class DocumentEngine {
-  private tokenizer?: Tokenizer;
-  private session?: ort.InferenceSession;
-  private embeddingError?: string;
+async function loadPdfJs() {
+  // PDF.js normally obtains DOMMatrix from a native Canvas package in Node.
+  // Text extraction only needs the matrix API, so keep the portable build
+  // small by installing a pure JavaScript shim before PDF.js is evaluated.
+  if (typeof globalThis.DOMMatrix === "undefined") {
+    globalThis.DOMMatrix = DOMMatrixShim;
+  }
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(
+    join(mainDirectory, "pdf.worker.min.mjs"),
+  ).toString();
+  return pdfjs;
+}
 
+export class DocumentEngine {
   constructor(
-    private readonly modelDirectory: string,
     private readonly standardFontDirectory: string,
     private readonly wasmDirectory: string,
     private readonly sendProgress: (payload: {
@@ -92,16 +86,13 @@ export class DocumentEngine {
     available: boolean;
     node: string;
     pdfjs: boolean;
-    semanticSearch: boolean;
-    detail?: string;
+    searchMode: "fuzzy-text";
   }> {
-    await this.ensureEmbedder();
     return {
       available: true,
       node: process.version,
       pdfjs: true,
-      semanticSearch: Boolean(this.session && this.tokenizer),
-      detail: this.embeddingError,
+      searchMode: "fuzzy-text",
     };
   }
 
@@ -132,7 +123,7 @@ export class DocumentEngine {
     if (!indexDir) throw new Error("Index directory is required.");
     await mkdir(indexDir, { recursive: true });
 
-    const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    const pdfjs = await loadPdfJs();
     const loadingTask = pdfjs.getDocument({
       url: pdfPath,
       standardFontDataUrl: toPdfJsDirectoryUrl(this.standardFontDirectory),
@@ -182,18 +173,7 @@ export class DocumentEngine {
       stage: "Building local index",
       progress: 68,
     });
-    const embeddings = await this.embedChunks(chunks);
-    const semanticReady = embeddings.some(
-      (embedding) => embedding !== undefined,
-    );
-    if (semanticReady) {
-      this.sendProgress({
-        paper_id: paperId,
-        stage: "Creating semantic index",
-        progress: 88,
-      });
-    }
-    this.writeIndex(join(indexDir, `${paperId}.sqlite3`), chunks, embeddings, {
+    this.writeIndex(join(indexDir, `${paperId}.sqlite3`), chunks, {
       kind: "pdf",
       path: pdfPath,
     });
@@ -210,7 +190,6 @@ export class DocumentEngine {
       year_guess: guessYear(firstPageText),
       doi_guess: guessDoi(`${doiText}\n${firstPageText}`),
       chunk_count: chunks.length,
-      semantic_ready: semanticReady,
     };
   }
 
@@ -228,7 +207,7 @@ export class DocumentEngine {
     await mkdir(indexDir, { recursive: true });
 
     // AI 修复后的 full.md 是新的正文来源。先按页面标记还原页码，再沿用
-    // 与 PDF 索引相同的切片和 embedding 流程，最终覆盖该论文原来的 SQLite。
+    // 与 PDF 索引相同的切片和 FTS 流程，最终覆盖该论文原来的 SQLite。
     const markdown = await readFile(markdownPath, "utf8");
     const pages = parseMarkdownPages(markdown);
     const chunks = pages.flatMap((page) =>
@@ -239,28 +218,22 @@ export class DocumentEngine {
     }
 
     const indexPath = join(indexDir, `${paperId}.sqlite3`);
-    // source_digest 用来判断 full.md 是否真的变化，避免每次启动都重新计算向量。
+    // source_digest 用来判断 full.md 是否真的变化，避免每次启动都重建索引。
     const digest = createHash("sha256").update(markdown).digest("hex");
     const current = readIndexSummary(indexPath);
     if (
       !params.force &&
       current?.sourceKind === "markdown" &&
-      current.sourceDigest === digest &&
-      current.embeddingProfile === CURRENT_EMBEDDING_PROFILE
+      current.sourceDigest === digest
     ) {
       return {
         page_count: current.pageCount,
         chunk_count: current.chunkCount,
-        semantic_ready: current.semanticReady,
         updated: false,
       };
     }
 
-    const embeddings = await this.embedChunks(chunks);
-    const semanticReady = embeddings.some(
-      (embedding) => embedding !== undefined,
-    );
-    this.writeIndex(indexPath, chunks, embeddings, {
+    this.writeIndex(indexPath, chunks, {
       kind: "markdown",
       path: markdownPath,
       digest,
@@ -268,7 +241,6 @@ export class DocumentEngine {
     return {
       page_count: pages.length,
       chunk_count: chunks.length,
-      semantic_ready: semanticReady,
       updated: true,
     };
   }
@@ -308,7 +280,6 @@ export class DocumentEngine {
     const query = String(params.query ?? "").trim();
     if (!query) return [];
     const hits: SearchHit[] = [];
-    const queryEmbeddings: QueryEmbeddingCache = new Map();
     // 全库检索没有创建一个“全库总数据库”。这里逐篇打开
     // indexes/<paperId>.sqlite3，检索后再把各论文结果汇总。
     for (const paperId of paperIds) {
@@ -319,7 +290,6 @@ export class DocumentEngine {
         query,
         perPaperLimit * 3,
         undefined,
-        queryEmbeddings,
       );
       hits.push(...paperHits.map((hit) => ({ ...hit, paper_id: paperId })));
     }
@@ -331,21 +301,14 @@ export class DocumentEngine {
     query: string,
     limit: number,
     currentPage?: number,
-    queryEmbeddings: QueryEmbeddingCache = new Map(),
   ): Promise<SearchHit[]> {
     const database = new DatabaseSync(indexPath, { readOnly: true });
     try {
-      // lexical 使用 SQLite FTS5/BM25；semantic 使用 BGE query embedding
-      // 与 chunks.embedding 做余弦相似度。最后用排名融合得到统一分数。
+      // FTS5/BM25 负责精确词和前缀；轻量模糊匹配补充中文子串与少量拼写错误。
+      // 两路结果只在本地文本上运行，不加载模型，也不需要额外运行时。
       const lexical = lexicalSearch(database, query, limit * 3);
-      const embeddingProfile = readIndexEmbeddingProfile(database);
-      const queryEmbedding = embeddingProfile
-        ? await this.queryEmbedding(query, embeddingProfile, queryEmbeddings)
-        : undefined;
-      const semantic = queryEmbedding
-        ? semanticSearch(database, queryEmbedding, limit * 3)
-        : [];
-      return fuseRankings([lexical, semantic], limit, currentPage);
+      const fuzzy = fuzzySearch(database, query, limit * 3);
+      return fuseRankings([lexical, fuzzy], limit, currentPage);
     } finally {
       database.close();
     }
@@ -354,14 +317,13 @@ export class DocumentEngine {
   private writeIndex(
     indexPath: string,
     chunks: Chunk[],
-    embeddings: Array<Float32Array | undefined>,
     source: IndexSource,
   ): void {
     const database = new DatabaseSync(indexPath);
     let transactionStarted = false;
     try {
-      // 一个事务内删除旧表并写入新表：提交成功后，旧切片、旧 FTS
-      // 和旧向量会同时被 full.md 生成的新数据替换。
+      // 一个事务内删除旧表并写入新表：提交成功后，旧切片和旧 FTS
+      // 会同时被 full.md 生成的新数据替换。
       database.exec("BEGIN IMMEDIATE");
       transactionStarted = true;
       database.exec(`
@@ -372,8 +334,7 @@ export class DocumentEngine {
           chunk_id TEXT PRIMARY KEY,
           page INTEGER NOT NULL,
           text TEXT NOT NULL,
-          bbox_json TEXT NOT NULL,
-          embedding BLOB
+          bbox_json TEXT NOT NULL
         );
         CREATE VIRTUAL TABLE chunks_fts USING fts5(
           chunk_id UNINDEXED,
@@ -387,7 +348,7 @@ export class DocumentEngine {
         );
       `);
       const insertChunk = database.prepare(
-        "INSERT INTO chunks (chunk_id, page, text, bbox_json, embedding) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO chunks (chunk_id, page, text, bbox_json) VALUES (?, ?, ?, ?)",
       );
       const insertFts = database.prepare(
         "INSERT INTO chunks_fts (chunk_id, page, text) VALUES (?, ?, ?)",
@@ -395,14 +356,12 @@ export class DocumentEngine {
       const insertMetadata = database.prepare(
         "INSERT INTO index_metadata (key, value) VALUES (?, ?)",
       );
-      for (const [index, chunk] of chunks.entries()) {
-        const embedding = embeddings[index];
+      for (const chunk of chunks) {
         insertChunk.run(
           chunk.chunkId,
           chunk.page,
           chunk.text,
           JSON.stringify(chunk.bbox),
-          embedding ? Buffer.from(embedding.buffer) : null,
         );
         insertFts.run(chunk.chunkId, chunk.page, chunk.text);
       }
@@ -410,16 +369,10 @@ export class DocumentEngine {
         ["source_kind", source.kind],
         ["source_path", source.path],
         ["source_digest", source.digest ?? ""],
-        ["embedding_profile", CURRENT_EMBEDDING_PROFILE],
+        ["search_profile", TEXT_SEARCH_PROFILE],
         ["indexed_at", new Date().toISOString()],
         ["page_count", String(new Set(chunks.map((chunk) => chunk.page)).size)],
         ["chunk_count", String(chunks.length)],
-        [
-          "semantic_ready",
-          embeddings.some((embedding) => embedding !== undefined)
-            ? "true"
-            : "false",
-        ],
       ]);
       for (const [key, value] of metadata) {
         insertMetadata.run(key, value);
@@ -525,7 +478,7 @@ export class DocumentEngine {
 
   private async readPdfPages(pdfPath: string): Promise<DocumentPageText[]> {
     if (!existsSync(pdfPath)) throw new Error("PDF file does not exist.");
-    const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    const pdfjs = await loadPdfJs();
     const loadingTask = pdfjs.getDocument({
       url: pdfPath,
       standardFontDataUrl: toPdfJsDirectoryUrl(this.standardFontDirectory),
@@ -551,174 +504,6 @@ export class DocumentEngine {
     }
     return pages.filter((page) => page.text);
   }
-
-  private async embedChunks(
-    chunks: Chunk[],
-  ): Promise<Array<Float32Array | undefined>> {
-    const embedderReady = await this.ensureEmbedder();
-    if (!embedderReady) return chunks.map(() => undefined);
-    return Promise.all(
-      chunks.map((chunk) =>
-        this.embedText(
-          prepareEmbeddingText(chunk.text, "document"),
-          CURRENT_EMBEDDING_PROFILE,
-        ),
-      ),
-    );
-  }
-
-  private queryEmbedding(
-    query: string,
-    profile: EmbeddingProfile,
-    cache: QueryEmbeddingCache,
-  ): Promise<Float32Array | undefined> {
-    const cached = cache.get(profile);
-    if (cached) return cached;
-    // 全库检索会逐篇读取 SQLite，但同一条 query 不应为每篇论文重复跑 ONNX。
-    // 以 embedding profile 为键缓存 Promise，混合新旧索引时也最多只调用两次。
-    const pending = this.embedText(
-      prepareEmbeddingText(query, "query", profile),
-      profile,
-    );
-    cache.set(profile, pending);
-    return pending;
-  }
-
-  private async embedText(
-    text: string,
-    profile: EmbeddingProfile,
-  ): Promise<Float32Array | undefined> {
-    if (!(await this.ensureEmbedder()) || !this.tokenizer || !this.session)
-      return undefined;
-    try {
-      const encoding = this.tokenizer.encode(text.slice(0, 8_000), {
-        return_token_type_ids: true,
-      });
-      const inputIds = encoding.ids.slice(0, MAX_EMBEDDING_TOKENS);
-      const attentionMask = encoding.attention_mask.slice(
-        0,
-        MAX_EMBEDDING_TOKENS,
-      );
-      const tokenTypeIds = encoding.token_type_ids.slice(
-        0,
-        MAX_EMBEDDING_TOKENS,
-      );
-      const length = inputIds.length;
-      if (!length) return undefined;
-      const feeds = {
-        input_ids: new ort.Tensor(
-          "int64",
-          BigInt64Array.from(inputIds, BigInt),
-          [1, length],
-        ),
-        attention_mask: new ort.Tensor(
-          "int64",
-          BigInt64Array.from(attentionMask, BigInt),
-          [1, length],
-        ),
-        token_type_ids: new ort.Tensor(
-          "int64",
-          BigInt64Array.from(
-            tokenTypeIds.length === length
-              ? tokenTypeIds
-              : new Array<number>(length).fill(0),
-            BigInt,
-          ),
-          [1, length],
-        ),
-      };
-      const output = await this.session.run(feeds);
-      const values = output.last_hidden_state.data as Float32Array;
-      return poolEmbedding(values, attentionMask, length, profile);
-    } catch (error) {
-      this.embeddingError =
-        error instanceof Error ? error.message : String(error);
-      return undefined;
-    }
-  }
-
-  private async ensureEmbedder(): Promise<boolean> {
-    if (this.tokenizer && this.session) return true;
-    if (this.embeddingError) return false;
-    try {
-      const [tokenizerJson, tokenizerConfig] = await Promise.all([
-        readFile(join(this.modelDirectory, "tokenizer.json"), "utf8"),
-        readFile(join(this.modelDirectory, "tokenizer_config.json"), "utf8"),
-      ]);
-      this.tokenizer = new Tokenizer(
-        JSON.parse(tokenizerJson),
-        JSON.parse(tokenizerConfig),
-      );
-      this.session = await ort.InferenceSession.create(
-        join(this.modelDirectory, "model_optimized.onnx"),
-        { executionProviders: ["cpu"] },
-      );
-      return true;
-    } catch (error) {
-      this.embeddingError =
-        error instanceof Error ? error.message : String(error);
-      return false;
-    }
-  }
-}
-
-export function prepareEmbeddingText(
-  text: string,
-  role: EmbeddingRole,
-  profile: EmbeddingProfile = CURRENT_EMBEDDING_PROFILE,
-): string {
-  const normalized = text.trim();
-  if (role !== "query" || profile === LEGACY_EMBEDDING_PROFILE) {
-    return normalized;
-  }
-  // BGE 的检索 instruction 只加在 query 上；文档向量保持原文，
-  // 否则两侧都加提示会改变模型训练时约定的检索空间。
-  return `${BGE_QUERY_INSTRUCTION}${normalized}`;
-}
-
-export function poolEmbedding(
-  values: Float32Array,
-  attentionMask: number[],
-  tokenCount: number,
-  profile: EmbeddingProfile = CURRENT_EMBEDDING_PROFILE,
-): Float32Array {
-  if (tokenCount < 1 || values.length < tokenCount * EMBEDDING_DIMENSIONS) {
-    throw new Error("Embedding model returned an invalid hidden state.");
-  }
-
-  const embedding = new Float32Array(EMBEDDING_DIMENSIONS);
-  if (profile === CURRENT_EMBEDDING_PROFILE) {
-    // BGE 官方用最后一层的 [CLS] token 作为句向量，再进行 L2 normalize。
-    embedding.set(values.subarray(0, EMBEDDING_DIMENSIONS));
-  } else {
-    // 旧版 PaperXcel 使用 attention-mask mean pooling。保留该分支只为读取
-    // 已经落盘的旧向量；新索引统一写入带版本标记的 CLS 向量。
-    let includedTokens = 0;
-    for (let token = 0; token < tokenCount; token += 1) {
-      if (!attentionMask[token]) continue;
-      includedTokens += 1;
-      const offset = token * EMBEDDING_DIMENSIONS;
-      for (
-        let dimension = 0;
-        dimension < EMBEDDING_DIMENSIONS;
-        dimension += 1
-      ) {
-        embedding[dimension] += values[offset + dimension];
-      }
-    }
-    const divisor = Math.max(includedTokens, 1);
-    for (let index = 0; index < embedding.length; index += 1) {
-      embedding[index] /= divisor;
-    }
-  }
-
-  let norm = 0;
-  for (const value of embedding) norm += value ** 2;
-  norm = Math.sqrt(norm) || 1;
-  for (let index = 0; index < embedding.length; index += 1) {
-    embedding[index] /= norm;
-  }
-  return embedding;
 }
 
 export function parseMarkdownPages(markdown: string): DocumentPageText[] {
@@ -768,36 +553,12 @@ function markdownPageNumber(line: string): number | undefined {
   return Number.isInteger(page) && page > 0 ? page : undefined;
 }
 
-function readIndexEmbeddingProfile(
-  database: DatabaseSync,
-): EmbeddingProfile | undefined {
-  try {
-    const row = database
-      .prepare("SELECT value FROM index_metadata WHERE key = ?")
-      .get("embedding_profile") as { value?: string } | undefined;
-    if (!row?.value) return LEGACY_EMBEDDING_PROFILE;
-    if (
-      row.value === CURRENT_EMBEDDING_PROFILE ||
-      row.value === LEGACY_EMBEDDING_PROFILE
-    ) {
-      return row.value;
-    }
-    // 显式标记但当前代码不认识的版本不能猜测 pooling 方式，否则会混算向量。
-    return undefined;
-  } catch {
-    // embedding_profile 引入前的索引没有该元数据，均由旧 mean pooling 生成。
-    return LEGACY_EMBEDDING_PROFILE;
-  }
-}
-
 function readIndexSummary(indexPath: string):
   | {
       sourceKind?: string;
       sourceDigest?: string;
-      embeddingProfile?: string;
       pageCount: number;
       chunkCount: number;
-      semanticReady: boolean;
     }
   | undefined {
   if (!existsSync(indexPath)) return undefined;
@@ -816,10 +577,8 @@ function readIndexSummary(indexPath: string):
     return {
       sourceKind: metadata.get("source_kind"),
       sourceDigest: metadata.get("source_digest"),
-      embeddingProfile: metadata.get("embedding_profile"),
       pageCount: Number(metadata.get("page_count")) || 0,
       chunkCount: Number(metadata.get("chunk_count")) || 0,
-      semanticReady: metadata.get("semantic_ready") === "true",
     };
   } catch {
     return undefined;
@@ -837,7 +596,7 @@ function splitChunks(paperId: string, page: number, text: string): Chunk[] {
   if (!clean) return [];
   const chunks: Chunk[] = [];
   let remaining = clean;
-  // 相邻切片保留重叠文本，避免查询关键词或语义恰好落在切片边界时丢失上下文。
+  // 相邻切片保留重叠文本，避免查询词恰好落在切片边界时丢失上下文。
   while (remaining) {
     const value = remaining.slice(0, MAX_CHUNK_CHARS);
     chunks.push({
@@ -857,12 +616,10 @@ function lexicalSearch(
   query: string,
   limit: number,
 ): SearchHit[] {
-  const tokens = [...new Set(query.match(/[\w\u4e00-\u9fff]+/gu) ?? [])]
-    .filter((token) => token.length >= 2)
-    .slice(0, 18);
+  const tokens = [...new Set(extractSearchTerms(query))].slice(0, 18);
   if (!tokens.length) return [];
   const ftsQuery = tokens
-    .map((token) => `"${token.replace(/"/g, '""')}"`)
+    .map((token) => `"${token.replace(/"/g, '""')}"*`)
     .join(" OR ");
   try {
     // FTS5 的 bm25 越小越相关，因此取负数后统一为“分数越大越相关”。
@@ -879,32 +636,22 @@ function lexicalSearch(
   }
 }
 
-function semanticSearch(
+function fuzzySearch(
   database: DatabaseSync,
-  query: Float32Array,
+  query: string,
   limit: number,
 ): SearchHit[] {
   const rows = database
-    .prepare(
-      "SELECT chunk_id, CAST(page AS INTEGER) AS page, text, embedding FROM chunks WHERE embedding IS NOT NULL",
-    )
-    .all() as unknown as Array<SearchHit & { embedding: Uint8Array }>;
-  // embedding 在 SQLite 中以 Float32Array 的原始 BLOB 保存，读取后恢复为
-  // 512 维向量，与当前查询向量计算 cosine similarity。
+    .prepare("SELECT chunk_id, CAST(page AS INTEGER) AS page, text FROM chunks")
+    .all() as unknown as SearchHit[];
   return rows
     .map((row) => ({
       chunk_id: row.chunk_id,
       page: row.page,
       text: row.text,
-      score: cosine(
-        query,
-        new Float32Array(
-          row.embedding.buffer,
-          row.embedding.byteOffset,
-          row.embedding.byteLength / 4,
-        ),
-      ),
+      score: fuzzyTextScore(row.text, query),
     }))
+    .filter((row) => row.score > 0)
     .sort((left, right) => right.score - left.score)
     .slice(0, limit);
 }
@@ -915,19 +662,21 @@ function fuseRankings(
   currentPage?: number,
 ): SearchHit[] {
   const fused = new Map<string, SearchHit>();
-  // Reciprocal Rank Fusion：不直接比较 BM25 与 cosine 的原始数值，
+  // Reciprocal Rank Fusion：不直接比较 BM25 与模糊匹配的原始数值，
   // 而是按它们各自的排名累加 1 / (60 + rank)，量纲更稳定。
   for (const ranking of rankings) {
     ranking.forEach((hit, index) => {
       const current = fused.get(hit.chunk_id) ?? { ...hit, score: 0 };
       current.score += 1 / (60 + index + 1);
-      if (currentPage) {
-        const distance = Math.abs(hit.page - currentPage);
-        if (distance === 0) current.score += 0.018;
-        else if (distance === 1) current.score += 0.008;
-      }
       fused.set(hit.chunk_id, current);
     });
+  }
+  if (currentPage) {
+    for (const hit of fused.values()) {
+      const distance = Math.abs(hit.page - currentPage);
+      if (distance === 0) hit.score += 0.018;
+      else if (distance === 1) hit.score += 0.008;
+    }
   }
   return [...fused.values()]
     .sort((left, right) => right.score - left.score)
@@ -1002,16 +751,99 @@ function guessJournal(value: string): string | undefined {
     ?.trim();
 }
 
-function cosine(left: Float32Array, right: Float32Array): number {
-  let dot = 0;
-  let leftNorm = 0;
-  let rightNorm = 0;
-  for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
-    dot += left[index] * right[index];
-    leftNorm += left[index] ** 2;
-    rightNorm += right[index] ** 2;
+export function fuzzyTextScore(text: string, query: string): number {
+  const normalizedText = normalizeSearchText(text);
+  const normalizedQuery = normalizeSearchText(query);
+  if (!normalizedText || !normalizedQuery) return 0;
+
+  const compactText = normalizedText.replaceAll(" ", "");
+  const compactQuery = normalizedQuery.replaceAll(" ", "");
+  if (compactText.includes(compactQuery)) {
+    return 1 + Math.min(compactQuery.length / 100, 0.2);
   }
-  return dot / ((Math.sqrt(leftNorm) || 1) * (Math.sqrt(rightNorm) || 1));
+
+  const textTerms = extractSearchTerms(normalizedText);
+  const queryUnits = extractSearchTerms(normalizedQuery).flatMap((term) =>
+    isHanText(term) ? characterNgrams(term, 2) : [term],
+  );
+  if (!queryUnits.length) return 0;
+
+  let similarity = 0;
+  for (const unit of queryUnits) {
+    if (isHanText(unit)) {
+      similarity += compactText.includes(unit) ? 1 : 0;
+      continue;
+    }
+    similarity += bestWordSimilarity(unit, textTerms);
+  }
+
+  const coverage = similarity / queryUnits.length;
+  const minimumCoverage = queryUnits.length <= 2 ? 0.5 : 0.4;
+  return coverage >= minimumCoverage ? coverage : 0;
+}
+
+function normalizeSearchText(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/\p{Mark}+/gu, "")
+    .toLocaleLowerCase()
+    .replace(/[^\p{Letter}\p{Number}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function extractSearchTerms(value: string): string[] {
+  return (
+    normalizeSearchText(value).match(
+      /\p{Script=Han}+|[\p{Letter}\p{Number}]+/gu,
+    ) ?? []
+  );
+}
+
+function isHanText(value: string): boolean {
+  return /^\p{Script=Han}+$/u.test(value);
+}
+
+function characterNgrams(value: string, size: number): string[] {
+  const characters = [...value];
+  if (characters.length <= size) return [value];
+  return characters
+    .slice(0, characters.length - size + 1)
+    .map((_, index) => characters.slice(index, index + size).join(""));
+}
+
+function bestWordSimilarity(query: string, candidates: string[]): number {
+  let best = 0;
+  for (const candidate of candidates) {
+    if (isHanText(candidate)) continue;
+    if (candidate.includes(query) || query.includes(candidate)) return 1;
+    if (query.length < 4 || Math.abs(candidate.length - query.length) > 2) {
+      continue;
+    }
+    const similarity =
+      1 -
+      levenshteinDistance(query, candidate) /
+        Math.max(query.length, candidate.length);
+    best = Math.max(best, similarity);
+  }
+  return best >= 0.68 ? best : 0;
+}
+
+function levenshteinDistance(left: string, right: string): number {
+  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    const current = [leftIndex];
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      current[rightIndex] = Math.min(
+        current[rightIndex - 1] + 1,
+        previous[rightIndex] + 1,
+        previous[rightIndex - 1] +
+          (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1),
+      );
+    }
+    previous = current;
+  }
+  return previous[right.length];
 }
 
 function clampNumber(

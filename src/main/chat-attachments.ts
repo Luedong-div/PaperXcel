@@ -41,8 +41,7 @@ const MIME_TYPES: Record<string, string> = {
   ".txt": "text/plain",
   ".webp": "image/webp",
   ".xls": "application/vnd.ms-excel",
-  ".xlsx":
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   ".xml": "application/xml",
   ".yaml": "application/yaml",
   ".yml": "application/yaml",
@@ -59,6 +58,7 @@ export interface SaveChatAttachmentOptions {
 export interface ResolvedChatAttachment {
   attachment: ChatAttachment;
   filePath: string;
+  textFallbackPath?: string;
 }
 
 export interface SaveChatAttachmentDataInput {
@@ -88,10 +88,7 @@ export async function saveChatAttachment(
   const directory = attachmentDirectory(userDataPath, attachment.id);
   await mkdir(directory, { recursive: true });
   try {
-    await copyFile(
-      absoluteSourcePath,
-      join(directory, attachment.fileName),
-    );
+    await copyFile(absoluteSourcePath, join(directory, attachment.fileName));
   } catch (error) {
     await rm(directory, { recursive: true, force: true });
     throw error;
@@ -234,15 +231,9 @@ function inferAttachmentKind(
     return "text";
   }
   if (
-    [
-      ".doc",
-      ".docx",
-      ".ppt",
-      ".pptx",
-      ".rtf",
-      ".xls",
-      ".xlsx",
-    ].includes(extension)
+    [".doc", ".docx", ".ppt", ".pptx", ".rtf", ".xls", ".xlsx"].includes(
+      extension,
+    )
   ) {
     return "document";
   }

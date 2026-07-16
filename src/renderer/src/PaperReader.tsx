@@ -87,7 +87,7 @@ export function PaperReader({
     const requestId = crypto.randomUUID();
     activeRepairRequestRef.current = requestId;
     setRepairing(true);
-    setRepairDetail("正在准备 AI 全文生成");
+    setRepairDetail("正在准备 PDF 全文修复");
     setError("");
     try {
       const next = onRepairMarkdown
@@ -102,10 +102,11 @@ export function PaperReader({
         return;
       }
       setPreview(next);
+      const warningDetails = (next.warnings ?? []).filter(Boolean);
       onNotice?.(
-        `论文全文已由 ${next.model || provider.model} 修复并缓存${
-          next.warnings?.length ? `，保留 ${next.warnings.length} 条警告` : ""
-        }。`,
+        warningDetails.length
+          ? `论文全文已由 ${next.model || provider.model} 修复并缓存。兼容性提示：${warningDetails.join("；")}`
+          : `论文全文已由 ${next.model || provider.model} 修复并缓存。`,
       );
     } catch (reason) {
       if (activeRepairRequestRef.current !== requestId) return;
@@ -124,7 +125,7 @@ export function PaperReader({
   const stopRepair = async (): Promise<void> => {
     const requestId = activeRepairRequestRef.current;
     if (!requestId) return;
-    setRepairDetail("正在停止 PDF 转换");
+    setRepairDetail("正在停止文件修复");
     try {
       const stopped = onCancelRepair
         ? await onCancelRepair(requestId)
@@ -251,6 +252,17 @@ export function PaperReader({
       </div>
 
       <div className="paper-markdown-stage">
+        {preview?.warnings?.length ? (
+          <div className="paper-markdown-warning" role="status">
+            <CircleAlert size={16} />
+            <div>
+              <strong>兼容性提示</strong>
+              {preview.warnings.map((warning, index) => (
+                <p key={`${index}-${warning}`}>{warning}</p>
+              ))}
+            </div>
+          </div>
+        ) : null}
         {loading && !preview ? (
           <div className="paper-markdown-state">
             <LoaderCircle className="spin" size={24} />

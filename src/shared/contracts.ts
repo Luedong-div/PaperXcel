@@ -530,7 +530,7 @@ export interface WorkerStatus {
   available: boolean;
   node?: string;
   pdfjs: boolean;
-  semanticSearch: boolean;
+  searchMode: "fuzzy-text";
   detail?: string;
 }
 

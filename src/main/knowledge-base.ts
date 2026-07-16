@@ -62,6 +62,7 @@ interface ExportKnowledgeBaseOptions {
 
 interface KnowledgeBasePaperRepairInput {
   paper: Paper;
+  pdfPath: string;
   markdownPath: string;
   pages: DocumentPageText[];
   citationNodes: CitationGraphNode[];
@@ -215,6 +216,7 @@ async function runKnowledgeBaseExport(
             repairResult = await aiRepair.repairPaper(
               {
                 paper,
+                pdfPath,
                 markdownPath,
                 pages,
                 citationNodes,

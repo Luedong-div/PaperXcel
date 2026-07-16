@@ -30,6 +30,12 @@ const reasonLabels: Record<CitationDiscoveryReason, string> = {
   "shared-references": "共享参考文献",
 };
 
+const reasonOrder: CitationDiscoveryReason[] = [
+  "shared-references",
+  "cites-library",
+  "topic-match",
+];
+
 export function CitationDiscoveryPanel({
   result,
   loading,
@@ -128,18 +134,20 @@ export function CitationDiscoveryPanel({
             </div>
             <div className="citation-discovery-content">
               <div className="citation-discovery-reasons">
-                {candidate.reasons.map((reason) => (
-                  <span className={reason} key={reason}>
-                    {reason === "cites-library" ? (
-                      <Quote size={12} />
-                    ) : reason === "shared-references" ? (
-                      <Share2 size={12} />
-                    ) : (
-                      <Compass size={12} />
-                    )}
-                    {reasonLabels[reason]}
-                  </span>
-                ))}
+                {reasonOrder
+                  .filter((reason) => candidate.reasons.includes(reason))
+                  .map((reason) => (
+                    <span className={reason} key={reason}>
+                      {reason === "cites-library" ? (
+                        <Quote size={12} />
+                      ) : reason === "shared-references" ? (
+                        <Share2 size={12} />
+                      ) : (
+                        <Compass size={12} />
+                      )}
+                      {reasonLabels[reason]}
+                    </span>
+                  ))}
               </div>
               <h3>{candidate.work.title}</h3>
               <p className="citation-discovery-authors">

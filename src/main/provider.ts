@@ -59,17 +59,22 @@ interface KnowledgeRepairRequestOptions extends ProviderRequestOptions {
   cachedMarkdown?: string;
 }
 
+interface ProviderCompletionRequestOptions {
+  timeoutMs?: number;
+}
+
 interface ProviderTextCompletion {
   content: string;
   reasoningContent?: string;
+  attachmentInput?: "text-fallback";
 }
 
 const PAPER_ASSISTANT_SYSTEM_PROMPT = `你是 PaperXcel 中的文献助手。
-当前论文 PDF 会作为会话上下文提供。直接阅读文件并完成用户提出的任务，不要套用固定分析模板。
+当前论文会以原始文件，或由 PaperXcel 本地提取、保留页码标记的文本作为会话上下文。直接阅读提供的内容并完成用户提出的任务，不要套用固定分析模板。
 无法从论文或附件确认的内容应明确说明，不要编造。默认使用用户的语言回答，并保留必要的英文术语、公式和单位。`;
 
 const NOTE_SYSTEM_PROMPT = `你是 PaperXcel 的通用学术研究笔记助手。
-请完整阅读随消息提供的论文文件，并生成可继续编辑的 Markdown 阅读笔记。输入通常是完整 PDF；如果服务商无法接收大型 PDF，则会提供由 PaperXcel 本地解析生成、保留页面标记的 full.md。
+请完整阅读随消息提供的论文文件或本地提取文本，并生成可继续编辑的 Markdown 阅读笔记。输入通常是完整 PDF；如果服务商无法接收 PDF，则会提供由 PaperXcel 本地解析生成、保留页面标记的 full.md。
 规则：
 1. 严格使用以下二级标题：研究问题与背景、研究对象与证据来源、方法与研究设计、关键假设与实施细节、主要结果与证据、局限性与适用范围、待核查问题。
 2. 每个可验证事实在句末使用【p.页码】引用，不得编造页码、公式编号、参数或结论。
@@ -88,18 +93,18 @@ const LIBRARY_QA_SYSTEM_PROMPT = `你是 PaperXcel 的全库证据问答助手�
 6. 历史对话只用于理解追问和保持上下文；本轮新增事实与引用必须来自本轮提供的索引片段。
 7. 默认使用简洁中文，保留英文术语、公式、单位和不确定性，不要输出代码围栏。`;
 
-const KNOWLEDGE_MARKDOWN_REPAIR_SYSTEM_PROMPT = `你是 PaperXcel 的学术 Markdown 修复引擎。你会收到当前论文的 full.md 文件。
-请修复该文件，并输出可直接覆盖原文件的完整 Markdown。
+const KNOWLEDGE_MARKDOWN_REPAIR_SYSTEM_PROMPT = `你是 PaperXcel 的学术论文 Markdown 转换与修复引擎。你会收到当前论文的原始 PDF；如果服务商不支持 PDF 文件输入，则会收到 PaperXcel 本地提取的 full.md 文本。
+请完整阅读输入，并输出可直接覆盖当前全文缓存的完整 Markdown。
 规则：
-1. 必须返回完整文件，不得只返回修改片段，不得总结、翻译、删节、评论或补充源文件中不存在的信息。
-2. 保持标题、作者、摘要、章节、段落、脚注、致谢、附录、参考文献以及页面标记的原始顺序。
-3. 保留现有 \`<!-- page: N -->\` 或页面标题，不得编造、删除或重排页码。
+1. 必须返回整篇论文，不得只返回修改片段，不得总结、翻译、删节、评论或补充源文件中不存在的信息。
+2. 保持标题、作者、摘要、章节、段落、脚注、致谢、附录、图表题、参考文献和阅读顺序。
+3. 按 PDF 实际页面插入 \`## 第 N 页\` 页面标题，页码从 PDF 第 1 页开始，不得编造、删除、跳过或重排页面。
 4. 修复标题层级、段落断行、连字符断词、乱码、重复页眉页脚和明显的版面读取顺序问题。
 5. 公式使用 LaTeX：行内公式用 \`$...$\`，独立公式用 \`$$...$$\`。保留公式编号、符号、上下标和单位。
 6. 表格优先使用 Markdown 表格；复杂表格可使用 HTML table，但不得丢失单元格、表注或数值。
 7. 保留图题、表题、引用、DOI、数字和可辨认的图内文字；无法确认的内容按源文件保留，不得猜测。
 8. 不要声称直接修改了本机文件；PaperXcel 会在校验输出后负责写回。
-9. 只输出 Markdown 正文，不要使用包裹全文的代码围栏，不要输出 JSON，也不要添加处理说明。`;
+9. 只输出完整 Markdown 正文，不要使用包裹全文的代码围栏，不要输出 JSON，也不要添加处理说明。`;
 
 const KNOWLEDGE_CITATION_REPAIR_SYSTEM_PROMPT = `你是 PaperXcel 的引文元数据校对器。
 根据当前论文的参考文献页面，只校对输入中已经存在的外部文献节点，不得新增或删除节点，不得新增、删除或修改引用边。
@@ -125,7 +130,7 @@ const LIBRARY_REVIEW_SYSTEM_PROMPT = `你是 PaperXcel 的全库文献综述助�
 const LIBRARY_REVIEW_BATCH_SIZE = 16;
 const KNOWLEDGE_REPAIR_CITATION_BATCH_SIZE = 24;
 const MAX_AI_FILE_INPUT_BYTES = 50 * 1024 * 1024;
-const AI_FILE_COMPLETION_TIMEOUT_MS = 10 * 60_000;
+const AI_FILE_COMPLETION_TIMEOUT_MS = 20 * 60_000;
 const TRANSIENT_PROVIDER_RETRY_COUNT = 1;
 const TRANSIENT_PROVIDER_RETRY_DELAY_MS = 300;
 const CITATION_REFERENCE_HINT_BATCH_SIZE = 24;
@@ -172,6 +177,7 @@ export interface KnowledgePaperRepairResult {
 
 interface KnowledgePaperRepairInput {
   paper: Paper;
+  pdfPath: string;
   markdownPath: string;
   pages: DocumentPageText[];
   citationNodes: CitationGraphNode[];
@@ -296,6 +302,7 @@ export async function generatePaperNote(
     mimeType: "application/pdf",
     kind: "pdf",
     pageCount: input.paper.pageCount,
+    textFallbackPath: input.markdownPath,
   });
   try {
     const result = await completeWithProvider(
@@ -308,7 +315,16 @@ export async function generatePaperNote(
       [],
       [pdfAttachment],
     );
-    return { ...result, model: credentials.model, source: "pdf" };
+    const usedMarkdownFallback =
+      result.attachmentInput === "text-fallback";
+    return {
+      ...result,
+      model: credentials.model,
+      source: usedMarkdownFallback ? "full.md" : "pdf",
+      warning: usedMarkdownFallback
+        ? "当前服务商使用 Chat Completions，已自动改用 full.md 文本生成笔记。"
+        : undefined,
+    };
   } catch (error) {
     if (!input.markdownPath || !isProviderContextTooLargeError(error)) {
       throw error;
@@ -366,34 +382,78 @@ export async function repairKnowledgePaperExport(
     if (!sourceMarkdown) {
       throw new Error("论文全文文件为空，无法交给 AI 修复。");
     }
-    const attachment = await resolveProviderFileAttachment(input.markdownPath, {
+    const pdfAttachment = await resolveProviderFileAttachment(input.pdfPath, {
       paperId: input.paper.id,
-      fileName: "full.md",
-      mimeType: "text/markdown",
-      kind: "text",
+      fileName: input.paper.fileName || `${input.paper.title}.pdf`,
+      mimeType: "application/pdf",
+      kind: "pdf",
       pageCount: input.pages.length,
+      textFallbackPath: input.markdownPath,
     });
     onStage?.(
       "repairing-text",
-      `正在将论文全文文件发送给 ${credentials.model} 修复`,
+      credentials.protocol === "chat-completions"
+        ? `正在将 full.md 全文一次性发送给 ${credentials.model} 转换与修复`
+        : `正在将原始 PDF 一次性发送给 ${credentials.model} 转换与修复`,
     );
     const reportProgress = createKnowledgeRepairProgressReporter(
       credentials.model,
       onStage,
     );
-    const result = await completeWithProvider(
-      credentials,
-      KNOWLEDGE_MARKDOWN_REPAIR_SYSTEM_PROMPT,
-      [],
-      `论文标题：${input.paper.title}
+    let result: Awaited<ReturnType<typeof completeWithProvider>>;
+    try {
+      result = await completeWithProvider(
+        credentials,
+        KNOWLEDGE_MARKDOWN_REPAIR_SYSTEM_PROMPT,
+        [],
+        `论文标题：${input.paper.title}
 
-请修复附件中的 full.md，并返回可直接覆盖原文件的完整 Markdown。`,
-      undefined,
-      signal,
-      [],
-      [attachment],
-      reportProgress,
-    );
+请完整读取随消息提供的原始 PDF 或全文文本，将整篇论文转换并修复为 Markdown。必须返回全部页面和完整正文。`,
+        undefined,
+        signal,
+        [],
+        [pdfAttachment],
+        reportProgress,
+      );
+    } catch (error) {
+      throwIfAborted(signal);
+      if (
+        !isProviderFileInputUnsupportedError(error) &&
+        !isProviderContextTooLargeError(error)
+      ) {
+        throw error;
+      }
+      onStage?.(
+        "repairing-text",
+        "当前接口无法直接处理原始 PDF，改用 full.md 全文进行一次兼容修复",
+      );
+      result = await completeWithProvider(
+        credentials,
+        KNOWLEDGE_MARKDOWN_REPAIR_SYSTEM_PROMPT,
+        [],
+        `论文标题：${input.paper.title}
+
+当前服务商无法接收原始 PDF。以下是 PaperXcel 本地提取的完整 full.md，请修复并返回整篇 Markdown，不得摘要、删节或只返回修改片段。
+
+----- BEGIN FULL.MD -----
+${sourceMarkdown}
+----- END FULL.MD -----`,
+        undefined,
+        signal,
+        [],
+        [],
+        reportProgress,
+        { timeoutMs: AI_FILE_COMPLETION_TIMEOUT_MS },
+      );
+      textWarnings.push(
+        "当前服务商未能处理原始 PDF，已自动改用 full.md 全文完成单次修复。",
+      );
+    }
+    if (result.attachmentInput === "text-fallback") {
+      textWarnings.push(
+        "当前请求通过 Chat Completions 完成，已按兼容模式使用 full.md 全文作为纯文本上下文。",
+      );
+    }
     protocol = result.protocol;
     textProtocol = result.protocol;
     markdown = normalizeModelMarkdown(result.content);
@@ -690,9 +750,11 @@ async function completeWithProvider(
   selectedSnippets: Array<{ imageDataUrl?: string }> = [],
   attachments: ResolvedChatAttachment[] = [],
   onProgress?: (progress: Omit<ChatProgress, "requestId">) => void,
+  requestOptions: ProviderCompletionRequestOptions = {},
 ): Promise<{
   content: string;
   reasoningContent?: string;
+  attachmentInput?: "text-fallback";
   protocol: Exclude<ProviderProtocol, "auto">;
 }> {
   const effectiveProgress =
@@ -700,7 +762,9 @@ async function completeWithProvider(
   const client = new OpenAI({
     apiKey: credentials.apiKey,
     baseURL: credentials.baseUrl,
-    timeout: attachments.length ? AI_FILE_COMPLETION_TIMEOUT_MS : 120_000,
+    timeout:
+      requestOptions.timeoutMs ??
+      (attachments.length ? AI_FILE_COMPLETION_TIMEOUT_MS : 120_000),
     maxRetries: 0,
   });
   try {
@@ -1149,45 +1213,58 @@ async function askWithChatCompletions(
   const userAttachments = attachments.filter(
     (attachment) => !isCurrentPaperContextAttachment(attachment),
   );
-  const paperAttachmentParts = await buildChatAttachmentParts(
+  const paperAttachmentContent = await prepareChatAttachments(
     paperContextAttachments,
   );
-  const userAttachmentParts = await buildChatAttachmentParts(userAttachments);
+  const userAttachmentContent = await prepareChatAttachments(userAttachments);
+  const selectedImageParts = selectedSnippets
+    .map((snippet) => snippet.imageDataUrl)
+    .filter((imageDataUrl): imageDataUrl is string => Boolean(imageDataUrl))
+    .slice(0, 3)
+    .map((imageDataUrl) => ({
+      type: "image_url" as const,
+      image_url: { url: imageDataUrl, detail: "high" as const },
+    }));
+  const userText = [...userAttachmentContent.textBlocks, userPrompt]
+    .filter(Boolean)
+    .join("\n\n");
+  const userParts = [
+    ...selectedImageParts,
+    ...userAttachmentContent.parts,
+  ];
+  const paperText = [
+    "这是当前会话对应的论文内容。后续问题默认以此内容为主要上下文。",
+    ...paperAttachmentContent.textBlocks,
+  ].join("\n\n");
   const messages = [
     { role: "system" as const, content: instructions },
-    ...(paperAttachmentParts.length
+    ...(paperAttachmentContent.textBlocks.length ||
+    paperAttachmentContent.parts.length
       ? [
           {
             role: "user" as const,
-            content: [
-              {
-                type: "text" as const,
-                text: "这是当前会话对应的论文 PDF。后续问题默认以此文件为主要上下文。",
-              },
-              ...paperAttachmentParts,
-            ],
+            content: paperAttachmentContent.parts.length
+              ? [
+                  { type: "text" as const, text: paperText },
+                  ...paperAttachmentContent.parts,
+                ]
+              : paperText,
           },
         ]
       : []),
     ...history,
     {
       role: "user" as const,
-      content: [
-        ...selectedSnippets
-          .map((snippet) => snippet.imageDataUrl)
-          .filter((imageDataUrl): imageDataUrl is string =>
-            Boolean(imageDataUrl),
-          )
-          .slice(0, 3)
-          .map((imageDataUrl) => ({
-            type: "image_url" as const,
-            image_url: { url: imageDataUrl, detail: "high" as const },
-          })),
-        ...userAttachmentParts,
-        { type: "text" as const, text: userPrompt },
-      ],
+      content: userParts.length
+        ? [{ type: "text" as const, text: userText }, ...userParts]
+        : userText,
     },
   ];
+  const attachmentInput = attachments.some(
+    (attachment) => attachment.attachment.kind !== "image",
+  )
+    ? ("text-fallback" as const)
+    : undefined;
   const reasoningEffortValue = normalizeReasoningEffort(reasoningEffort);
   if (!onProgress) {
     const response = await client.chat.completions.create(
@@ -1200,10 +1277,13 @@ async function askWithChatCompletions(
     );
     const content = extractChatCompletionText(response);
     if (!content) throw new Error("模型未返回文本内容。");
-    return normalizeProviderCompletion(
-      content,
-      extractChatCompletionReasoning(response),
-    );
+    return {
+      ...normalizeProviderCompletion(
+        content,
+        extractChatCompletionReasoning(response),
+      ),
+      attachmentInput,
+    };
   }
 
   onProgress({
@@ -1295,7 +1375,10 @@ async function askWithChatCompletions(
   if (!parsed.content.trim()) {
     throw new Error("模型未返回文本内容。");
   }
-  return normalizeProviderCompletion(parsed.content, combinedReasoning);
+  return {
+    ...normalizeProviderCompletion(parsed.content, combinedReasoning),
+    attachmentInput,
+  };
 }
 
 interface ThinkMarkupStreamResult {
@@ -1435,15 +1518,15 @@ type ResponsesAttachmentPart =
       file_data: string;
     };
 
-type ChatAttachmentPart =
-  | {
-      type: "image_url";
-      image_url: { url: string; detail: "high" };
-    }
-  | {
-      type: "file";
-      file: { filename: string; file_data: string };
-    };
+type ChatAttachmentPart = {
+  type: "image_url";
+  image_url: { url: string; detail: "high" };
+};
+
+interface PreparedChatAttachments {
+  parts: ChatAttachmentPart[];
+  textBlocks: string[];
+}
 
 async function buildResponsesAttachmentParts(
   attachments: ResolvedChatAttachment[],
@@ -1467,27 +1550,71 @@ async function buildResponsesAttachmentParts(
   );
 }
 
-async function buildChatAttachmentParts(
+async function prepareChatAttachments(
   attachments: ResolvedChatAttachment[],
-): Promise<ChatAttachmentPart[]> {
-  return Promise.all(
+): Promise<PreparedChatAttachments> {
+  const prepared = await Promise.all(
     attachments.map(async (resolved) => {
-      const dataUrl = await readChatAttachmentDataUrl(resolved);
       if (resolved.attachment.kind === "image") {
         return {
-          type: "image_url" as const,
-          image_url: { url: dataUrl, detail: "high" as const },
+          part: {
+            type: "image_url" as const,
+            image_url: {
+              url: await readChatAttachmentDataUrl(resolved),
+              detail: "high" as const,
+            },
+          },
         };
       }
+
+      const text = await readChatAttachmentText(resolved);
       return {
-        type: "file" as const,
-        file: {
-          filename: resolved.attachment.fileName,
-          file_data: dataUrl,
-        },
+        textBlock: formatChatAttachmentText(resolved, text),
       };
     }),
   );
+  return {
+    parts: prepared.flatMap((item) => (item.part ? [item.part] : [])),
+    textBlocks: prepared.flatMap((item) =>
+      item.textBlock ? [item.textBlock] : [],
+    ),
+  };
+}
+
+async function readChatAttachmentText(
+  resolved: ResolvedChatAttachment,
+): Promise<string> {
+  // OpenAI-compatible gateways often validate Chat Completions against the
+  // older text/image schema. Files stay native on Responses; Chat receives
+  // locally readable text so no provider-specific message wrapper is needed.
+  const textPath =
+    resolved.attachment.kind === "text"
+      ? resolved.filePath
+      : resolved.textFallbackPath;
+  if (!textPath) {
+    throw new Error(
+      `Chat Completions 无法直接读取附件 ${resolved.attachment.fileName}。请使用 Responses API，或先将文件转换为 Markdown / 文本。`,
+    );
+  }
+  const text = (await readFile(textPath, "utf8")).replace(/^\uFEFF/, "").trim();
+  if (!text) {
+    throw new Error(`附件 ${resolved.attachment.fileName} 没有可读取的文本。`);
+  }
+  return text;
+}
+
+function formatChatAttachmentText(
+  resolved: ResolvedChatAttachment,
+  text: string,
+): string {
+  const source =
+    resolved.attachment.kind === "pdf" ? "PaperXcel 本地提取文本" : "文本附件";
+  return [
+    `----- BEGIN ATTACHMENT: ${resolved.attachment.fileName} -----`,
+    `来源：${source}`,
+    text,
+    `----- END ATTACHMENT: ${resolved.attachment.fileName} -----`,
+  ].join("\n");
 }
 
 function requireResponsesText(response: unknown, label = "文本内容"): string {
@@ -1846,20 +1973,44 @@ function createKnowledgeRepairProgressReporter(
         lastReportedAt = now;
         onStage(
           "repairing-text",
-          `正在接收 ${model} 返回的修复结果（${characters.toLocaleString()} 字符）`,
+          `正在接收 ${model} 返回的完整论文（${characters.toLocaleString()} 字符）`,
         );
       }
       return;
     }
     const detail =
       progress.phase === "thinking"
-        ? `已提交论文全文文件，${progress.detail}`
+        ? `原始 PDF 已提交，${progress.detail}`
         : progress.detail;
     if (detail && detail !== lastDetail) {
       lastDetail = detail;
       onStage("repairing-text", detail);
     }
   };
+}
+
+function isProviderFileInputUnsupportedError(error: unknown): boolean {
+  const record = objectRecord(error);
+  const nested = objectRecord(record?.error);
+  const status = Number(record?.status);
+  const text = [
+    error instanceof Error ? error.message : "",
+    record?.message,
+    record?.code,
+    record?.type,
+    nested?.message,
+    nested?.code,
+    nested?.type,
+  ]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+  return (
+    (status === 400 || status === 422 || !Number.isFinite(status)) &&
+    /(?:invalid|unsupported|not supported|supported values|validation|string_type|不支持|无效)/i.test(
+      text,
+    ) &&
+    /(?:\bfile\b|file_data|input_file|GPT3Message|MMGPT3Item|文件)/i.test(text)
+  );
 }
 
 function isProviderContextTooLargeError(error: unknown): boolean {
@@ -2100,9 +2251,6 @@ function validateRepairedPaperMarkdown(
   markdown: string,
   sourceMarkdown: string,
 ): void {
-  if (markdown.length < 200) {
-    throw new Error("AI 返回的 Markdown 过短，未得到可用的完整修复结果。");
-  }
   const sourceLength = sourceMarkdown.length;
   if (
     sourceLength >= 4_000 &&
@@ -2111,6 +2259,9 @@ function validateRepairedPaperMarkdown(
     throw new Error(
       "AI 返回的修复结果明显短于原始论文全文文件，模型可能只返回了摘要或截断内容。",
     );
+  }
+  if (sourceLength >= 200 && markdown.length < 200) {
+    throw new Error("AI 返回的 Markdown 过短，未得到可用的完整修复结果。");
   }
 }
 
@@ -2122,6 +2273,7 @@ async function resolveProviderFileAttachment(
     mimeType: string;
     kind: "pdf" | "text";
     pageCount?: number;
+    textFallbackPath?: string;
   },
 ): Promise<ResolvedChatAttachment> {
   const sourceInfo = await stat(filePath);
@@ -2143,6 +2295,7 @@ async function resolveProviderFileAttachment(
       pageCount: options.pageCount,
     },
     filePath,
+    textFallbackPath: options.textFallbackPath,
   };
 }
 

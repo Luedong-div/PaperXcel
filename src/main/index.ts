@@ -10,8 +10,8 @@ import {
   shell,
 } from "electron";
 import { copyFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
-import { extname, isAbsolute, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, extname, isAbsolute, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type {
   AskPaperInput,
   ChatAttachment,
@@ -142,7 +142,13 @@ import {
   writePaperNoteArtifact,
   writePaperTextArtifacts,
 } from "./paper-artifacts";
-import { WorkerClient } from "./worker-client";
+import { DocumentEngineClient } from "./document-engine-client";
+
+const mainDirectory = dirname(fileURLToPath(import.meta.url));
+
+// The portable build removes Vulkan/WebGPU binaries. Chromium's CPU renderer
+// still supports the PDF canvas and the rest of the desktop interface.
+app.disableHardwareAcceleration();
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -171,7 +177,7 @@ app.commandLine.appendSwitch(
 
 let mainWindow: BrowserWindow | null = null;
 let store: AppStore;
-const worker = new WorkerClient();
+const documentEngine = new DocumentEngineClient();
 const chatAbortControllers = new Map<string, AbortController>();
 const knowledgeExportAbortControllers = new Map<string, AbortController>();
 const knowledgeMarkdownRepairAbortControllers = new Map<
@@ -187,7 +193,7 @@ const MAX_AUTO_PDF_BYTES = 120 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_COUNT = 6;
 const MAX_CHAT_ATTACHMENT_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 80 * 1024 * 1024;
-const MARKDOWN_REPAIR_TIMEOUT_MS = 10 * 60_000;
+const MARKDOWN_REPAIR_TIMEOUT_MS = 20 * 60_000;
 const SCIHUB_SESSION_PARTITION = "persist:paperxcel-scihub";
 let scihubVerificationWindow: BrowserWindow | null = null;
 
@@ -229,7 +235,7 @@ interface ScihubLookupResult {
   challengeUrl?: string;
 }
 
-worker.on(
+documentEngine.on(
   "progress",
   (payload: { paper_id?: string; stage?: string; progress?: number }) => {
     if (!store || !payload.paper_id) return;
@@ -254,7 +260,7 @@ function createWindow(): void {
     minWidth: 1024,
     minHeight: 680,
     show: false,
-    icon: join(__dirname, "../renderer/paperxcel.png"),
+    icon: join(mainDirectory, "../renderer/paperxcel.png"),
     backgroundColor: "#f4f5f1",
     titleBarStyle: "hidden",
     titleBarOverlay: {
@@ -263,7 +269,7 @@ function createWindow(): void {
       height: 32,
     },
     webPreferences: {
-      preload: join(__dirname, "../preload/index.cjs"),
+      preload: join(mainDirectory, "../preload/index.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -282,7 +288,7 @@ function createWindow(): void {
   if (process.env.ELECTRON_RENDERER_URL) {
     void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
   } else {
-    void mainWindow.loadFile(join(__dirname, "../renderer/index.html"));
+    void mainWindow.loadFile(join(mainDirectory, "../renderer/index.html"));
   }
 }
 
@@ -313,7 +319,7 @@ app.whenReady().then(async () => {
   registerIpc();
   createWindow();
   resumeRecoverablePaperProcessing();
-  void worker.start();
+  void documentEngine.start();
   void synchronizeStoredPaperMarkdownIndexes();
   if (process.env.PAPERXCEL_E2E_FIXTURE_PDF) {
     void importPdf(process.env.PAPERXCEL_E2E_FIXTURE_PDF);
@@ -335,7 +341,7 @@ app.on("before-quit", () => {
   ]) {
     controller.abort();
   }
-  worker.stop();
+  documentEngine.stop();
 });
 
 app.on("activate", () => {
@@ -703,7 +709,7 @@ function registerIpc(): void {
         force: Boolean(force),
         extractLocalReferenceDois: async (paper) => {
           if (paper.status !== "ready") return [];
-          return worker.request<string[]>(
+          return documentEngine.request<string[]>(
             "reference_dois",
             {
               paper_id: paper.id,
@@ -714,7 +720,7 @@ function registerIpc(): void {
         },
         extractLocalReferenceCitations: async (paper) => {
           if (paper.status !== "ready") return [];
-          return worker.request<string[]>(
+          return documentEngine.request<string[]>(
             "reference_citations",
             {
               paper_id: paper.id,
@@ -919,15 +925,21 @@ function registerIpc(): void {
           markdownPath,
         );
         const paper = store.getPaper(input.paperId);
+        const warningDetails = (preview.warnings ?? []).filter(Boolean);
         return {
           message: {
             id: crypto.randomUUID(),
             role: "assistant",
-            content: `文件修复已完成，结果已写入当前论文缓存。${
-              preview.warnings?.length
-                ? ` 保留 ${preview.warnings.length} 条警告。`
-                : ""
-            }`,
+            content: [
+              "文件修复已完成，结果已写入当前论文缓存。",
+              warningDetails.length
+                ? `兼容性提示：\n${warningDetails
+                    .map((warning) => `- ${warning}`)
+                    .join("\n")}`
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n\n"),
             processingDurationMs: Date.now() - startedAt,
             createdAt: new Date().toISOString(),
           },
@@ -1135,7 +1147,7 @@ function registerIpc(): void {
           warnings: cached.warnings,
         };
       }
-      const pages = await worker.request<DocumentPageText[]>(
+      const pages = await documentEngine.request<DocumentPageText[]>(
         "document_text",
         {
           paper_id: paperId,
@@ -1175,7 +1187,7 @@ function registerIpc(): void {
       } catch (error) {
         if (controller.signal.aborted || isAbortError(error)) {
           if (timedOut) {
-            throw new Error("AI 文件修复超过 10 分钟，已自动停止。", {
+            throw new Error("AI 文件修复超过 20 分钟，已自动停止。", {
               cause: error,
             });
           }
@@ -1257,7 +1269,7 @@ function registerIpc(): void {
           citationGraph,
           resolvePaperPath: (paperId) => store.resolvePaperPath(paperId),
           readDocumentPages: (paperId) =>
-            worker.request<DocumentPageText[]>(
+            documentEngine.request<DocumentPageText[]>(
               "document_text",
               {
                 paper_id: paperId,
@@ -1363,7 +1375,7 @@ function registerIpc(): void {
         throw new Error("全库搜索问题不能超过 500 个字符。");
       }
       // Renderer 只提交查询文本；主进程负责选择论文、定位 SQLite，
-      // 再把 worker 返回的内部字段转换为前端使用的 LibrarySearchHit。
+      // 再把文档引擎返回的内部字段转换为前端使用的 LibrarySearchHit。
       const hits = await searchLibraryIndex(query, input.limit ?? 30);
       return hits.map((hit) => ({
         paperId: hit.paper_id,
@@ -1467,7 +1479,8 @@ function registerIpc(): void {
     },
   );
 
-  ipcMain.handle("worker:status", () => worker.status());
+  // 保留既有 IPC 名称，避免破坏 preload 与已发布版本的前端契约。
+  ipcMain.handle("worker:status", () => documentEngine.status());
 }
 
 interface LibraryIndexHit {
@@ -1481,7 +1494,6 @@ interface LibraryIndexHit {
 interface MarkdownReindexResult {
   page_count: number;
   chunk_count: number;
-  semantic_ready: boolean;
   updated: boolean;
 }
 
@@ -1496,7 +1508,7 @@ async function searchLibraryIndex(
     .filter((paper) => paper.status === "ready")
     .map((paper) => paper.id);
   if (!paperIds.length) return [];
-  return worker.request<LibraryIndexHit[]>(
+  return documentEngine.request<LibraryIndexHit[]>(
     "search_library",
     {
       paper_ids: paperIds,
@@ -1648,6 +1660,9 @@ async function includeCurrentPaperPdf(
   if (totalBytes > MAX_CHAT_ATTACHMENT_TOTAL_BYTES) {
     throw new Error("当前论文 PDF 与本轮附件总大小不能超过 80 MB。");
   }
+  const textFallbackPath = await ensurePaperMarkdownArtifact(paperId).catch(
+    () => undefined,
+  );
 
   return [
     {
@@ -1662,6 +1677,7 @@ async function includeCurrentPaperPdf(
         pageCount: paper.pageCount,
       },
       filePath,
+      textFallbackPath,
     },
     ...attachments,
   ];
@@ -2127,7 +2143,7 @@ async function processPaper(paper: Paper): Promise<void> {
         updatedAt: new Date().toISOString(),
       }),
     );
-    const result = await worker.request<{
+    const result = await documentEngine.request<{
       page_count: number;
       title_guess?: string;
       authors_guess?: string[];
@@ -2135,7 +2151,6 @@ async function processPaper(paper: Paper): Promise<void> {
       year_guess?: number;
       doi_guess?: string;
       chunk_count: number;
-      semantic_ready: boolean;
     }>(
       "extract",
       {
@@ -2928,7 +2943,7 @@ async function ensurePaperMarkdownArtifact(paperId: string): Promise<string> {
     // Generate the local Markdown below when the artifact does not exist yet.
   }
 
-  const pages = await worker.request<DocumentPageText[]>(
+  const pages = await documentEngine.request<DocumentPageText[]>(
     "document_text",
     {
       paper_id: paperId,
@@ -2975,7 +2990,7 @@ async function synchronizeStoredPaperMarkdownIndexes(): Promise<void> {
       if (!cached) continue;
       await writePaperTextArtifacts(directory, paper, { repair: cached });
       // reindex_markdown 会比较 full.md 的 SHA-256；内容未变化时直接跳过，
-      // 旧 SQLite 或正文有变化时才覆盖 chunks、FTS 和 embedding。
+      // 旧 SQLite 或正文有变化时才覆盖 chunks 与 FTS。
       const result = await reindexPaperMarkdown(paper.id);
       if (result.updated) {
         console.info(
@@ -3057,7 +3072,7 @@ async function runPaperMarkdownRepair(
     markdownPathOverride || (await ensurePaperMarkdownArtifact(paperId));
   sendProgress("extracting", "正在准备论文全文文件与本地页面信息");
   const pages = await waitForAbort(
-    worker.request<DocumentPageText[]>(
+    documentEngine.request<DocumentPageText[]>(
       "document_text",
       {
         paper_id: paperId,
@@ -3074,6 +3089,7 @@ async function runPaperMarkdownRepair(
     store.getActiveProvider(),
     {
       paper,
+      pdfPath: canonicalPdfPath,
       markdownPath,
       pages,
       citationNodes: [],
@@ -3102,7 +3118,7 @@ async function runPaperMarkdownRepair(
     rawPages: pages,
     repair: cached,
   });
-  sendProgress("writing", "正在重建全文检索与向量索引");
+  sendProgress("writing", "正在重建全文检索索引");
   await waitForAbort(reindexPaperMarkdown(paperId), signal);
   sendProgress("complete", "文件修复与缓存写入完成");
   return {
@@ -3123,7 +3139,7 @@ function reindexPaperMarkdown(paperId: string): Promise<MarkdownReindexResult> {
   // 合并为同一个 Promise，避免对同一个 SQLite 重复写入。
   const existing = paperMarkdownIndexSyncs.get(paperId);
   if (existing) return existing;
-  const task = worker.request<MarkdownReindexResult>(
+  const task = documentEngine.request<MarkdownReindexResult>(
     "reindex_markdown",
     {
       paper_id: paperId,

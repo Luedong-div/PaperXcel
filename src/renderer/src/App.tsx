@@ -676,7 +676,7 @@ export default function App(): React.JSX.Element {
       }
 
       const prompt =
-        "请读取附件中的论文全文文件，按原文结构修复标题、段落、公式、表格与引用格式，并返回完整修复结果。PaperXcel 会在校验后写回当前论文缓存。";
+        "请读取当前论文原始 PDF，将整篇论文转换并修复为完整 Markdown，保留页面、标题、段落、公式、表格与引用。PaperXcel 会校验后写回当前论文缓存。";
       let attachment: ChatAttachment | undefined;
       let userMessage: ChatMessage | undefined;
       let attachmentPersisted = false;
@@ -687,7 +687,7 @@ export default function App(): React.JSX.Element {
       setAssistantPaneVisible(true);
       setStoppingAsk(false);
       setAsking(true);
-      beginAskPresentation("正在准备文件修复");
+      beginAskPresentation("正在准备 PDF 全文修复");
 
       try {
         const baseMessages = await window.paperxcel.chat.list(paperId);
@@ -716,7 +716,7 @@ export default function App(): React.JSX.Element {
           ...current,
           [paperId]: nextMessages,
         }));
-        updateAskProgress("正在将论文全文文件交给文献助手修复");
+        updateAskProgress("正在一次性提交原始 PDF 进行全文修复");
 
         const result = await window.paperxcel.chat.ask({
           requestId,
