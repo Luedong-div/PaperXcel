@@ -15,15 +15,11 @@ PaperXcel 是一个面向科研阅读与文献管理的本地优先桌面工作�
 
 ## 下载与安装
 
-目前正式版提供 **Windows 10/11 x64 ZIP 便携版**，无需安装。
-
 1. 打开 [Releases](https://github.com/Luedong-div/PaperXcel/releases/latest)。
 2. 下载 `PaperXcel-1.0.0-win-x64.zip`。
 3. 将压缩包完整解压到可写目录。
 4. 运行解压目录中的 `PaperXcel.exe`。
 5. 如需使用 AI 功能，在“应用设置”中配置服务地址、API Key 和模型。
-
-不要直接在压缩包内运行程序，否则模型、PDF.js 资源和本地数据库可能无法正常读取。首个版本暂未提供代码签名，Windows SmartScreen 可能显示未知发布者提示。请只从本仓库的 Release 页面下载。
 
 ## 从源码运行
 
@@ -54,8 +50,6 @@ npm run test:citation-graph
 npm run dist:win
 ```
 
-`npm run dist:win` 会构建 ZIP 便携版，执行打包后的应用冒烟测试，并将压缩包写入 `release/`。
-
 ## 本地语义检索模型
 
 Windows Release 已包含运行所需的 BGE 模型。源码运行或自行打包时，请准备以下目录：
@@ -70,13 +64,12 @@ models/
     └── tokenizer_config.json
 ```
 
-模型不可用时，应用仍可运行，但语义检索会降级为关键词检索。`models/` 不提交到 Git 仓库，避免把大型模型文件写入源码历史。
+模型不可用时，应用仍可运行，但语义检索会降级为关键词检索。
 
 ## 数据与隐私
 
 - 论文、Markdown、笔记、索引和应用配置默认保存在本机。
 - 只有在用户主动配置并调用 AI、OpenAlex、Crossref、Zotero 等外部服务时，相关请求才会发送到对应服务。
-- 下载和使用论文全文时，请确认自己拥有合法访问权限，并遵守所在地区法律及内容提供方条款。
 
 ## 许可证
 
