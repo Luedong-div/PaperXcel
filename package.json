@@ -1,10 +1,19 @@
 {
   "name": "paperxcel",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Local-first AI workspace for reading, organizing, and comparing research papers.",
   "main": "./out/main/index.js",
   "author": "PaperXcel",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/Luedong-div/PaperXcel",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Luedong-div/PaperXcel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Luedong-div/PaperXcel/issues"
+  },
   "type": "module",
   "scripts": {
     "dev": "node scripts/run-dev.mjs",
@@ -81,33 +90,38 @@
         ]
       }
     ],
+    "extraFiles": [
+      {
+        "from": "LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "README.md",
+        "to": "README.md"
+      }
+    ],
     "files": [
       "out/**/*",
       "package.json",
+      "LICENSE",
       "!node_modules/onnxruntime-node/bin/napi-v6/darwin/**/*",
       "!node_modules/onnxruntime-node/bin/napi-v6/linux/**/*",
       "!node_modules/onnxruntime-node/bin/napi-v6/win32/arm64/**/*",
       "!node_modules/onnxruntime-node/bin/napi-v6/win32/x64/DirectML.dll",
       "!node_modules/onnxruntime-node/bin/napi-v6/win32/x64/dxcompiler.dll",
-      "!node_modules/onnxruntime-node/bin/napi-v6/win32/x64/dxil.dll",
-      "!node_modules/@napi-rs/canvas*/**/*"
+      "!node_modules/onnxruntime-node/bin/napi-v6/win32/x64/dxil.dll"
     ],
     "win": {
       "icon": "public/paperxcel.ico",
+      "artifactName": "${productName}-${version}-win-${arch}.${ext}",
       "target": [
         {
-          "target": "nsis",
+          "target": "zip",
           "arch": [
             "x64"
           ]
         }
       ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
     }
   }
 }

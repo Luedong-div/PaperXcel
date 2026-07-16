@@ -71,7 +71,7 @@ try {
         )
     }
 
-    Invoke-Checked npx.cmd electron-builder --win nsis `
+    Invoke-Checked npx.cmd electron-builder --win zip `
         "--config.directories.output=$tempOutput"
 
     $packagedApp = Join-Path $tempOutput "win-unpacked"
@@ -95,23 +95,32 @@ try {
     }
 
     New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
+    Get-ChildItem -LiteralPath $releaseRoot -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -eq "SHA256SUMS.txt" -or
+            $_.Name -like "PaperXcel-*-win-x64.zip.sha256"
+        } |
+        Remove-Item -Force
     Get-ChildItem -LiteralPath $tempOutput -File | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination (
             Join-Path $releaseRoot $_.Name
         ) -Force
     }
-    $releaseUnpacked = Join-Path $releaseRoot "win-unpacked"
-    Remove-CheckedDirectory -Path $releaseUnpacked -AllowedRoot $releaseRoot
-    Copy-Item -LiteralPath $packagedApp -Destination $releaseRoot -Recurse -Force
 
-    $installer = Get-ChildItem -LiteralPath $releaseRoot -File `
-        -Filter "PaperXcel Setup *.exe" |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-    if (-not $installer) {
-        throw "The NSIS installer was not published to the release directory."
+    $packageVersion = (
+        Get-Content -LiteralPath (Join-Path $projectRoot "package.json") `
+            -Raw |
+        ConvertFrom-Json
+    ).version
+    $portableArchivePath = Join-Path $releaseRoot (
+        "PaperXcel-$packageVersion-win-x64.zip"
+    )
+    if (-not (Test-Path -LiteralPath $portableArchivePath)) {
+        throw "The Windows portable ZIP was not published to the release directory."
     }
-    Write-Output "Windows release ready: $($installer.FullName)"
+    $portableArchive = Get-Item -LiteralPath $portableArchivePath
+
+    Write-Output "Windows portable release ready: $($portableArchive.FullName)"
 }
 finally {
     Pop-Location
