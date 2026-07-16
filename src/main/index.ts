@@ -143,6 +143,7 @@ import {
   writePaperTextArtifacts,
 } from "./paper-artifacts";
 import { DocumentEngineClient } from "./document-engine-client";
+import { configureApplicationDataPaths } from "./portable-data";
 
 const mainDirectory = dirname(fileURLToPath(import.meta.url));
 
@@ -163,17 +164,7 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
-if (process.env.PAPERXCEL_E2E_USER_DATA) {
-  app.setPath("userData", process.env.PAPERXCEL_E2E_USER_DATA);
-}
-
-const sessionDataPath = join(app.getPath("userData"), "session-data");
-app.setPath("sessionData", sessionDataPath);
-app.commandLine.appendSwitch("disk-cache-dir", join(sessionDataPath, "Cache"));
-app.commandLine.appendSwitch(
-  "gpu-disk-cache-dir",
-  join(sessionDataPath, "GPUCache"),
-);
+configureApplicationDataPaths();
 
 let mainWindow: BrowserWindow | null = null;
 let store: AppStore;

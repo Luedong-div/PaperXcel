@@ -52,7 +52,7 @@ npm run dist:win
 
 ## 数据与隐私
 
-- 论文、Markdown、笔记、索引和应用配置默认保存在本机。
+- 论文、Markdown、笔记、索引、缓存和应用配置默认保存在程序同级的 `PaperXcel-Data`。
 - 只有在用户主动配置并调用 AI、OpenAlex、Crossref、Zotero 等外部服务时，相关请求才会发送到对应服务。
 
 ## 许可证
