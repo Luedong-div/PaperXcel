@@ -373,11 +373,15 @@ export interface OpenAlexTestResult {
 }
 
 export type CitationGraphNodeKind = "library" | "external";
+export type CitationGraphDirection = "root" | "references" | "citing" | "both";
+export type CitationGraphRelation = "reference" | "citing";
 export type CitationMetadataSource =
   | "library"
   | "pdf"
   | "crossref"
-  | "openalex";
+  | "openalex"
+  | "europe-pmc"
+  | "arxiv";
 export type CitationMatchStatus =
   | "verified"
   | "probable"
@@ -396,6 +400,7 @@ export interface CitationGraphNode {
   journal?: string;
   year?: number;
   abstract?: string;
+  keywords?: string[];
   volume?: string;
   issue?: string;
   pages?: string;
@@ -403,6 +408,9 @@ export interface CitationGraphNode {
   citedByCount?: number;
   referencedByLibrary: boolean;
   citesLibrary: boolean;
+  depth?: 0 | 1 | 2;
+  direction?: CitationGraphDirection;
+  parentIds?: string[];
   sourceUrl?: string;
   metadataSources?: CitationMetadataSource[];
   matchStatus?: CitationMatchStatus;
@@ -415,6 +423,8 @@ export interface CitationGraphEdge {
   id: string;
   source: string;
   target: string;
+  relation?: CitationGraphRelation;
+  depth?: 1 | 2;
 }
 
 export interface CitationGraphSnapshot {
@@ -422,6 +432,34 @@ export interface CitationGraphSnapshot {
   edges: CitationGraphEdge[];
   updatedAt?: string;
   errors: string[];
+  graphMode?: "standard" | "focused-two-hop";
+  focusedPaperId?: string;
+  expansion?: CitationGraphExpansionStats;
+}
+
+export interface CitationGraphExpansionStats {
+  referenceFirstOrderCount: number;
+  referenceSecondOrderCount: number;
+  citingFirstOrderCount: number;
+  citingSecondOrderCount: number;
+  truncatedReferenceCount: number;
+  truncatedCitingCount: number;
+}
+
+export interface CitationGraphExpansionResult {
+  snapshot: CitationGraphSnapshot;
+  paperId: string;
+  cached: boolean;
+}
+
+export interface CitationGraphExternalNodeLimits {
+  references: number;
+  citing: number;
+}
+
+export interface CitationGraphAnalysisOptions {
+  mode?: "standard" | "focused-two-hop";
+  externalLimits?: CitationGraphExternalNodeLimits;
 }
 
 export interface CitationGraphRefreshResult {
@@ -437,11 +475,13 @@ export type CitationDiscoveryReason =
   | "shared-references";
 
 export type CitationContentMatchPriority = "low" | "standard" | "high";
+export type CitationDiscoveryMode = "contextual" | "pure-search";
 
 export interface CitationDiscoveryInput {
   paperIds?: string[];
   query?: string;
   limit?: number;
+  mode?: CitationDiscoveryMode;
 }
 
 export interface CitationDiscoveryCandidate {
@@ -461,6 +501,7 @@ export interface CitationDiscoveryResult {
   terms: string[];
   searchedAt: string;
   warnings: string[];
+  mode?: CitationDiscoveryMode;
 }
 
 export interface CitationNetworkCommunity {
@@ -500,6 +541,8 @@ export interface CitationNetworkBridge {
 
 export interface CitationNetworkAnalysis {
   generatedAt: string;
+  graphMode?: "standard" | "focused-two-hop";
+  focusedPaperId?: string;
   metrics: {
     nodeCount: number;
     edgeCount: number;
@@ -688,10 +731,18 @@ export interface PaperXcelApi {
       force?: boolean,
       paperIds?: string[],
     ) => Promise<CitationGraphRefreshResult>;
+    expand: (
+      paperId: string,
+      force?: boolean,
+    ) => Promise<CitationGraphExpansionResult>;
     discover: (
       input: CitationDiscoveryInput,
     ) => Promise<CitationDiscoveryResult>;
-    analyze: (paperIds?: string[]) => Promise<CitationNetworkAnalysis>;
+    analyze: (
+      paperIds?: string[],
+      options?: CitationGraphAnalysisOptions,
+    ) => Promise<CitationNetworkAnalysis>;
+    openGoogleScholar: (query: string) => Promise<boolean>;
     clear: () => Promise<CitationGraphClearResult>;
     export: (request: CitationGraphExportRequest) => Promise<boolean>;
   };

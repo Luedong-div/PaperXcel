@@ -5,8 +5,12 @@ export interface TranslationDirection {
   target: TranslationLanguage;
 }
 
+export function containsChineseText(text: string): boolean {
+  return /[\u3400-\u9fff]/u.test(text);
+}
+
 export function detectTranslationDirection(text: string): TranslationDirection {
-  return /[\u3400-\u9fff]/u.test(text)
+  return containsChineseText(text)
     ? { source: "zh", target: "en" }
     : { source: "en", target: "zh" };
 }

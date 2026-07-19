@@ -1,5 +1,6 @@
 import type {
   CitationGraphEdge,
+  CitationGraphExpansionStats,
   CitationGraphNode,
 } from "../../shared/contracts";
 import { getSmoothStepPath, Position } from "@xyflow/react";
@@ -40,6 +41,9 @@ export interface CitationGraphExportDocument {
     nodeCount: number;
     edgeCount: number;
   };
+  graphMode?: "standard" | "focused-two-hop";
+  focusedPaperId?: string;
+  expansion?: CitationGraphExpansionStats;
   nodes: CitationGraphExportNode[];
   edges: CitationGraphEdge[];
   errors: string[];
@@ -60,6 +64,9 @@ interface CitationGraphExportDocumentOptions {
   title: string;
   subtitle: string;
   sourceUpdatedAt?: string;
+  graphMode?: "standard" | "focused-two-hop";
+  focusedPaperId?: string;
+  expansion?: CitationGraphExpansionStats;
   filters: CitationGraphExportFilters;
   nodes: CitationGraphExportInputNode[];
   edges: CitationGraphEdge[];
@@ -87,6 +94,9 @@ export function buildCitationGraphExportDocument({
   nodes,
   edges,
   errors,
+  graphMode,
+  focusedPaperId,
+  expansion,
 }: CitationGraphExportDocumentOptions): CitationGraphExportDocument {
   return {
     schemaVersion: 1,
@@ -94,6 +104,9 @@ export function buildCitationGraphExportDocument({
     title,
     subtitle,
     sourceUpdatedAt,
+    graphMode,
+    focusedPaperId,
+    expansion,
     filters: {
       ...filters,
       selectedPaperIds: [...filters.selectedPaperIds],
@@ -108,6 +121,7 @@ export function buildCitationGraphExportDocument({
         ? [...citation.metadataSources]
         : undefined,
       issn: citation.issn ? [...citation.issn] : undefined,
+      parentIds: citation.parentIds ? [...citation.parentIds] : undefined,
       layout: { x, y, width, height },
       dimmed,
     })),
@@ -377,6 +391,9 @@ export function buildCitationGraphInteractiveHtml(
         appendFact("元数据来源", node.metadataSources);
         appendFact("匹配置信度", node.matchConfidence);
         appendFact("文本质量", node.textQuality);
+        appendFact("图谱层级", node.depth === 0 ? "目标论文" : node.depth);
+        appendFact("图谱方向", node.direction);
+        appendFact("关系父节点", node.parentIds);
         appendFact("引用方向", [node.referencedByLibrary ? "被本地论文引用" : "", node.citesLibrary ? "引用本地论文" : ""].filter(Boolean).join("；"));
         text("detail-citation", node.rawCitation, "未保留原始引文");
         document.getElementById("citation-section").hidden = !node.rawCitation;

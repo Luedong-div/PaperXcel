@@ -21,6 +21,7 @@ const OPENALEX_SELECT = [
   "cited_by_count",
   "referenced_works",
   "abstract_inverted_index",
+  "keywords",
   "primary_location",
 ].join(",");
 
@@ -34,6 +35,7 @@ interface OpenAlexWorkPayload {
   cited_by_count?: number;
   referenced_works?: string[];
   abstract_inverted_index?: Record<string, number[]> | null;
+  keywords?: Array<{ display_name?: string } | string> | null;
   authorships?: Array<{
     author?: { display_name?: string };
   }>;
@@ -45,6 +47,11 @@ interface OpenAlexWorkPayload {
 
 interface OpenAlexListPayload {
   results?: OpenAlexWorkPayload[];
+}
+
+export interface OpenAlexSearchOptions {
+  page?: number;
+  sort?: "relevance" | "publication-date";
 }
 
 /**
@@ -94,12 +101,22 @@ export class OpenAlexClient {
   async findWorksBySearch(
     query: string,
     limit = 5,
+    options: OpenAlexSearchOptions = {},
   ): Promise<CitationWorkRecord[]> {
     const normalized = query.replace(/\s+/g, " ").trim();
     if (!normalized) return [];
     const url = new URL(`${OPENALEX_BASE_URL}/works`);
     url.searchParams.set("search", normalized.slice(0, 800));
     url.searchParams.set("per_page", String(Math.max(1, Math.min(limit, 100))));
+    if (options.page && Number.isFinite(options.page)) {
+      url.searchParams.set(
+        "page",
+        String(Math.max(1, Math.floor(options.page))),
+      );
+    }
+    if (options.sort === "publication-date") {
+      url.searchParams.set("sort", "publication_date:desc");
+    }
     url.searchParams.set("select", OPENALEX_SELECT);
     const payload = await this.request<OpenAlexListPayload>(url);
     return (payload.results ?? [])
@@ -226,6 +243,14 @@ export function parseOpenAlexWork(
   const title = (payload.display_name || payload.title || "").trim();
   if (!openAlexId || !title) return undefined;
   const doi = normalizeCitationDoi(payload.doi ?? undefined);
+  const keywords = unique(
+    (payload.keywords ?? [])
+      .map((keyword) =>
+        typeof keyword === "string" ? keyword : keyword.display_name,
+      )
+      .map((keyword) => keyword?.trim())
+      .filter((keyword): keyword is string => Boolean(keyword)),
+  );
   return {
     openAlexId,
     doi,
@@ -242,6 +267,7 @@ export function parseOpenAlexWork(
         ? payload.publication_year
         : undefined,
     abstract: reconstructOpenAlexAbstract(payload.abstract_inverted_index),
+    ...(keywords.length > 0 ? { keywords } : {}),
     citedByCount: Math.max(0, Number(payload.cited_by_count) || 0),
     referencedOpenAlexIds: unique(
       (payload.referenced_works ?? [])

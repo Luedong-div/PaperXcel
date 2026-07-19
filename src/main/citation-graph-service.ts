@@ -2,14 +2,26 @@ import { createHash } from "node:crypto";
 import {
   CITATION_GRAPH_CITING_LIMIT,
   CITATION_GRAPH_CORE_VERSION,
+  CITATION_GRAPH_EXPANSION_VERSION,
+  CITATION_GRAPH_FOCUSED_FIRST_ORDER_LIMIT,
+  CITATION_GRAPH_FOCUSED_SECOND_ORDER_CANDIDATE_LIMIT,
+  CITATION_GRAPH_FOCUSED_SECOND_ORDER_LIMIT,
+  CITATION_GRAPH_FOCUSED_CITING_PER_PARENT_LIMIT,
+  buildFocusedCitationGraphSnapshot,
   buildCitationGraphSnapshot,
+  isCitationExpansionFresh,
   isCitationRecordFresh,
   normalizeCitationDoi,
   normalizeOpenAlexId,
+  type CitationGraphExpansionRecord,
   type CitationGraphCache,
   type CitationWorkRecord,
 } from "../shared/citationGraph";
-import type { CitationGraphRefreshResult, Paper } from "../shared/contracts";
+import type {
+  CitationGraphExpansionResult,
+  CitationGraphRefreshResult,
+  Paper,
+} from "../shared/contracts";
 import { CrossrefClient, type CrossrefWorkRecord } from "./crossref-client";
 import { OpenAlexClient } from "./openalex-client";
 import {
@@ -113,6 +125,222 @@ export async function refreshCitationGraphData({
       updatedPapers,
       skippedPapers,
       failedPapers,
+    },
+  };
+}
+
+export interface CitationGraphExpansionOptions {
+  paper: Paper;
+  cache: CitationGraphCache;
+  client: OpenAlexClient;
+  force?: boolean;
+  now?: Date;
+}
+
+/**
+ * 扩展单篇论文的同向二重图谱：
+ *
+ *   二阶参考 -> 一阶参考 -> 目标论文 -> 一阶引用 -> 二阶引用
+ *
+ * 参考文献侧直接复用 OpenAlex Work 的 referenced_works；
+ * 引用侧按“一阶引用论文”继续请求 cites:{firstOrderId}。
+ * 两侧分别容错，某一侧失败不会吞掉另一侧已经拿到的数据。
+ */
+export async function expandCitationGraphData({
+  paper,
+  cache,
+  client,
+  force = false,
+  now = new Date(),
+}: CitationGraphExpansionOptions): Promise<{
+  cache: CitationGraphCache;
+  result: CitationGraphExpansionResult;
+}> {
+  const nextCache = cloneCache(cache);
+  const core = nextCache.cores[paper.id];
+  if (!core) {
+    throw new Error("请先刷新这篇论文的一阶引文图谱，再生成同向二重图谱。");
+  }
+
+  const previous = nextCache.expansions?.[paper.id];
+  if (
+    !force &&
+    isCitationExpansionFresh(previous, now.getTime()) &&
+    previous &&
+    expansionWorksAvailable(previous, nextCache)
+  ) {
+    return {
+      cache: nextCache,
+      result: {
+        snapshot: buildFocusedCitationGraphSnapshot(
+          paper,
+          nextCache,
+          previous,
+        ),
+        paperId: paper.id,
+        cached: true,
+      },
+    };
+  }
+
+  const errors: string[] = [];
+  const rootOpenAlexId = normalizeOpenAlexId(core.openAlexId);
+
+  // 先补齐一阶 Work，避免旧缓存只有 ID 没有元数据时二重图谱出现空节点。
+  const referenceCandidates = uniqueNormalizedIds(
+    core.referencedOpenAlexIds,
+  );
+  const citingCandidates = uniqueNormalizedIds(core.citingOpenAlexIds);
+  await ensureWorks(referenceCandidates, nextCache, client, errors, "参考文献");
+  await ensureWorks(citingCandidates, nextCache, client, errors, "引用论文");
+
+  const referenceFirstOrderIds = selectFocusedFirstOrderIds(
+    referenceCandidates,
+    nextCache,
+  );
+  const citingFirstOrderIds = selectFocusedFirstOrderIds(
+    citingCandidates,
+    nextCache,
+  );
+  const truncatedReferenceFirstOrderCount = Math.max(
+    0,
+    referenceCandidates.length - referenceFirstOrderIds.length,
+  );
+  const truncatedCitingFirstOrderCount = Math.max(
+    0,
+    citingCandidates.length - citingFirstOrderIds.length,
+  );
+
+  const referenceSecondOrderParentIds = new Map<string, Set<string>>();
+  const referenceSecondOrderCandidates = uniqueNormalizedIds(
+    referenceFirstOrderIds.flatMap(
+      (id) => nextCache.works[id]?.referencedOpenAlexIds ?? [],
+    ),
+  ).filter(
+    (id) =>
+      id !== rootOpenAlexId &&
+      !referenceFirstOrderIds.includes(id) &&
+      !referenceCandidates.includes(id),
+  );
+  for (const parentId of referenceFirstOrderIds) {
+    for (const childId of nextCache.works[parentId]?.referencedOpenAlexIds ??
+      []) {
+      const normalized = normalizeOpenAlexId(childId);
+      if (
+        !normalized ||
+        normalized === rootOpenAlexId ||
+        referenceFirstOrderIds.includes(normalized)
+      ) {
+        continue;
+      }
+      const parents = referenceSecondOrderParentIds.get(normalized) ?? new Set();
+      parents.add(parentId);
+      referenceSecondOrderParentIds.set(normalized, parents);
+    }
+  }
+
+  const limitedReferenceCandidates = rankWorkIds(
+    referenceSecondOrderCandidates,
+    nextCache,
+  ).slice(0, CITATION_GRAPH_FOCUSED_SECOND_ORDER_CANDIDATE_LIMIT);
+  await ensureWorks(
+    limitedReferenceCandidates,
+    nextCache,
+    client,
+    errors,
+    "二阶参考文献",
+  );
+  const referenceSecondOrderIds = rankWorkIds(
+    limitedReferenceCandidates.filter((id) => Boolean(nextCache.works[id])),
+    nextCache,
+  ).slice(0, CITATION_GRAPH_FOCUSED_SECOND_ORDER_LIMIT);
+
+  const citingSecondOrderParentIds = new Map<string, Set<string>>();
+  await mapWithConcurrency(citingFirstOrderIds, 3, async (parentId) => {
+    try {
+      const citingWorks = await client.getCitingWorks(
+        parentId,
+        CITATION_GRAPH_FOCUSED_CITING_PER_PARENT_LIMIT,
+      );
+      storeWorks(nextCache, citingWorks);
+      for (const child of citingWorks) {
+        const childId = normalizeOpenAlexId(child.openAlexId);
+        if (
+          !childId ||
+          childId === rootOpenAlexId ||
+          citingFirstOrderIds.includes(childId)
+        ) {
+          continue;
+        }
+        const parents = citingSecondOrderParentIds.get(childId) ?? new Set();
+        parents.add(parentId);
+        citingSecondOrderParentIds.set(childId, parents);
+      }
+    } catch (error) {
+      errors.push(
+        `引用论文 ${parentId} 的二阶扩展失败：${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  });
+
+  const citingSecondOrderCandidates = rankWorkIds(
+    [...citingSecondOrderParentIds.keys()],
+    nextCache,
+  );
+  const citingSecondOrderIds = citingSecondOrderCandidates.slice(
+    0,
+    CITATION_GRAPH_FOCUSED_SECOND_ORDER_LIMIT,
+  );
+
+  const expansion: CitationGraphExpansionRecord = {
+    version: CITATION_GRAPH_EXPANSION_VERSION,
+    paperId: paper.id,
+    rootOpenAlexId,
+    referenceFirstOrderIds,
+    referenceSecondOrderIds,
+    referenceSecondOrderParentIds: toParentIdRecord(
+      referenceSecondOrderIds,
+      referenceSecondOrderParentIds,
+    ),
+    citingFirstOrderIds,
+    citingSecondOrderIds,
+    citingSecondOrderParentIds: toParentIdRecord(
+      citingSecondOrderIds,
+      citingSecondOrderParentIds,
+    ),
+    truncatedReferenceCount:
+      truncatedReferenceFirstOrderCount +
+      Math.max(
+        0,
+        referenceSecondOrderCandidates.length -
+          referenceSecondOrderIds.length,
+      ),
+    truncatedCitingCount:
+      truncatedCitingFirstOrderCount +
+      Math.max(
+        0,
+        citingSecondOrderCandidates.length - citingSecondOrderIds.length,
+      ),
+    errors: [...errors],
+    fetchedAt: now.toISOString(),
+  };
+  nextCache.expansions ??= {};
+  nextCache.expansions[paper.id] = expansion;
+  nextCache.updatedAt = now.toISOString();
+
+  return {
+    cache: nextCache,
+    result: {
+      snapshot: buildFocusedCitationGraphSnapshot(
+        paper,
+        nextCache,
+        expansion,
+        errors,
+      ),
+      paperId: paper.id,
+      cached: false,
     },
   };
 }
@@ -374,8 +602,108 @@ function cloneCache(cache: CitationGraphCache): CitationGraphCache {
         },
       ]),
     ),
+    expansions: Object.fromEntries(
+      Object.entries(cache.expansions ?? {}).map(([paperId, expansion]) => [
+        paperId,
+        {
+          ...expansion,
+          referenceFirstOrderIds: [...expansion.referenceFirstOrderIds],
+          referenceSecondOrderIds: [...expansion.referenceSecondOrderIds],
+          referenceSecondOrderParentIds: cloneParentIdRecord(
+            expansion.referenceSecondOrderParentIds,
+          ),
+          citingFirstOrderIds: [...expansion.citingFirstOrderIds],
+          citingSecondOrderIds: [...expansion.citingSecondOrderIds],
+          citingSecondOrderParentIds: cloneParentIdRecord(
+            expansion.citingSecondOrderParentIds,
+          ),
+          errors: expansion.errors ? [...expansion.errors] : undefined,
+        },
+      ]),
+    ),
     updatedAt: cache.updatedAt,
   };
+}
+
+function expansionWorksAvailable(
+  expansion: CitationGraphExpansionRecord,
+  cache: CitationGraphCache,
+): boolean {
+  const ids = [
+    ...expansion.referenceFirstOrderIds,
+    ...expansion.referenceSecondOrderIds,
+    ...expansion.citingFirstOrderIds,
+    ...expansion.citingSecondOrderIds,
+  ];
+  return ids.every((id) => Boolean(cache.works[id]));
+}
+
+async function ensureWorks(
+  ids: string[],
+  cache: CitationGraphCache,
+  client: OpenAlexClient,
+  errors: string[],
+  label: string,
+): Promise<void> {
+  const missing = ids.filter((id) => !cache.works[id]);
+  if (!missing.length) return;
+  try {
+    storeWorks(cache, await client.getWorksByOpenAlexIds(missing));
+  } catch (error) {
+    errors.push(
+      `${label}元数据获取失败：${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
+function selectFocusedFirstOrderIds(
+  ids: string[],
+  cache: CitationGraphCache,
+): string[] {
+  return rankWorkIds(ids, cache).slice(
+    0,
+    CITATION_GRAPH_FOCUSED_FIRST_ORDER_LIMIT,
+  );
+}
+
+function rankWorkIds(ids: string[], cache: CitationGraphCache): string[] {
+  return [...new Set(ids)].sort((firstId, secondId) => {
+    const first = cache.works[firstId];
+    const second = cache.works[secondId];
+    return (
+      (second?.citedByCount ?? -1) - (first?.citedByCount ?? -1) ||
+      (second?.year ?? 0) - (first?.year ?? 0) ||
+      (first?.title ?? firstId).localeCompare(second?.title ?? secondId) ||
+      firstId.localeCompare(secondId)
+    );
+  });
+}
+
+function uniqueNormalizedIds(ids: string[]): string[] {
+  return [
+    ...new Set(
+      ids.map(normalizeOpenAlexId).filter((id): id is string => Boolean(id)),
+    ),
+  ];
+}
+
+function toParentIdRecord(
+  ids: string[],
+  parents: Map<string, Set<string>>,
+): Record<string, string[]> {
+  return Object.fromEntries(
+    ids.map((id) => [id, [...(parents.get(id) ?? new Set<string>())]]),
+  );
+}
+
+function cloneParentIdRecord(
+  record: Record<string, string[]>,
+): Record<string, string[]> {
+  return Object.fromEntries(
+    Object.entries(record).map(([id, parentIds]) => [id, [...parentIds]]),
+  );
 }
 
 async function mapWithConcurrency<T>(

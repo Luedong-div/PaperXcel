@@ -823,7 +823,12 @@ function mergeSources(
 ): CitationMetadataSource[] {
   const sources = new Set([...(current ?? []), ...next]);
   return (
-    ["library", "pdf", "crossref", "openalex"] as CitationMetadataSource[]
+    [
+      "library",
+      "pdf",
+      "crossref",
+      "openalex",
+    ] as CitationMetadataSource[]
   ).filter((source) => sources.has(source));
 }
 

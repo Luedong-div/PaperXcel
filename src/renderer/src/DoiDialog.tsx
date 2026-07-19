@@ -45,7 +45,6 @@ export function DoiDialog({
       >
         <header className="dialog-header">
           <div>
-            <span className="eyebrow">Crossref / arXiv</span>
             <h2>添加论文</h2>
           </div>
           <button

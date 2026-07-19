@@ -646,6 +646,29 @@ export class AppStore {
           },
         ]),
       ),
+      expansions: Object.fromEntries(
+        Object.entries(cache.expansions ?? {}).map(([paperId, expansion]) => [
+          paperId,
+          {
+            ...expansion,
+            referenceFirstOrderIds: [...expansion.referenceFirstOrderIds],
+            referenceSecondOrderIds: [...expansion.referenceSecondOrderIds],
+            referenceSecondOrderParentIds: Object.fromEntries(
+              Object.entries(expansion.referenceSecondOrderParentIds).map(
+                ([id, parentIds]) => [id, [...parentIds]],
+              ),
+            ),
+            citingFirstOrderIds: [...expansion.citingFirstOrderIds],
+            citingSecondOrderIds: [...expansion.citingSecondOrderIds],
+            citingSecondOrderParentIds: Object.fromEntries(
+              Object.entries(expansion.citingSecondOrderParentIds).map(
+                ([id, parentIds]) => [id, [...parentIds]],
+              ),
+            ),
+            errors: expansion.errors ? [...expansion.errors] : undefined,
+          },
+        ]),
+      ),
       updatedAt: cache.updatedAt,
     };
   }

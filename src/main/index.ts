@@ -18,7 +18,9 @@ import type {
   ChatProgress,
   CitationContentMatchPriority,
   CitationDiscoveryInput,
+  CitationGraphAnalysisOptions,
   CitationGraphExportRequest,
+  CitationGraphExpansionResult,
   CitationGraphSnapshot,
   ChatMessage,
   CreateLibraryFolderInput,
@@ -42,7 +44,11 @@ import type {
   ZoteroConfigInput,
   ZoteroPullResult,
 } from "../shared/contracts";
-import { buildCitationGraphSnapshot } from "../shared/citationGraph";
+import {
+  CITATION_GRAPH_EXTERNAL_NODE_MAX,
+  CITATION_GRAPH_FOCUSED_EXTERNAL_NODE_MAX,
+  buildCitationGraphSnapshot,
+} from "../shared/citationGraph";
 import {
   buildLibraryReviewExport,
   buildPaperFullTextMarkdown,
@@ -57,6 +63,7 @@ import {
 import {
   buildScihubPageUrls,
   DEFAULT_SCIHUB_MIRRORS,
+  DOI_AUTO_FETCH_CUTOFF_YEAR,
   extractChemrxivPdfCandidates,
   extractCorePdfCandidates,
   extractCrossrefPdfCandidates,
@@ -106,10 +113,17 @@ import {
   saveChatAttachmentData,
   type ResolvedChatAttachment,
 } from "./chat-attachments";
-import { refreshCitationGraphData } from "./citation-graph-service";
+import {
+  expandCitationGraphData,
+  refreshCitationGraphData,
+} from "./citation-graph-service";
 import { discoverCitationWorks } from "./citation-discovery-service";
 import { analyzeCitationNetwork } from "./citation-analysis-service";
 import { OpenAlexClient } from "./openalex-client";
+import { CrossrefClient } from "./crossref-client";
+import { EuropePmcClient } from "./europe-pmc-client";
+import { ArxivClient } from "./arxiv-client";
+import { buildGoogleScholarSearchUrl } from "../shared/externalSearch";
 import { BaiduTranslationClient } from "./baidu-translation-client";
 import {
   downloadZoteroAttachment,
@@ -186,6 +200,11 @@ const MAX_CHAT_ATTACHMENT_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 80 * 1024 * 1024;
 const MARKDOWN_REPAIR_TIMEOUT_MS = 20 * 60_000;
 const SCIHUB_SESSION_PARTITION = "persist:paperxcel-scihub";
+const SCIHUB_DIRECT_PAGE_TIMEOUT_MS = 30_000;
+const SCIHUB_PDF_TIMEOUT_MS = 20 * 60_000;
+const DEFAULT_BROWSER_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 let scihubVerificationWindow: BrowserWindow | null = null;
 
 function selectCitationPapers(papers: Paper[], paperIds: unknown): Paper[] {
@@ -197,6 +216,37 @@ function selectCitationPapers(papers: Paper[], paperIds: unknown): Paper[] {
     ),
   );
   return activePapers.filter((paper) => selectedIds.has(paper.id));
+}
+
+function normalizeCitationGraphAnalysisOptions(
+  input: unknown,
+): CitationGraphAnalysisOptions {
+  if (!input || typeof input !== "object") return {};
+  const value = input as {
+    mode?: unknown;
+    externalLimits?: { references?: unknown; citing?: unknown };
+  };
+  const mode =
+    value.mode === "focused-two-hop" || value.mode === "standard"
+      ? value.mode
+      : undefined;
+  const references = Number(value.externalLimits?.references);
+  const citing = Number(value.externalLimits?.citing);
+  const externalNodeMax =
+    mode === "focused-two-hop"
+      ? CITATION_GRAPH_FOCUSED_EXTERNAL_NODE_MAX
+      : CITATION_GRAPH_EXTERNAL_NODE_MAX;
+  const externalLimits =
+    Number.isFinite(references) && Number.isFinite(citing)
+      ? {
+          references: Math.max(
+            0,
+            Math.min(externalNodeMax, Math.round(references)),
+          ),
+          citing: Math.max(0, Math.min(externalNodeMax, Math.round(citing))),
+        }
+      : undefined;
+  return { mode, externalLimits };
 }
 
 if (!app.requestSingleInstanceLock()) {
@@ -224,6 +274,7 @@ interface PdfResolution {
 interface ScihubLookupResult {
   candidates: PdfCandidate[];
   challengeUrl?: string;
+  manualUrl?: string;
 }
 
 documentEngine.on(
@@ -588,30 +639,65 @@ function registerIpc(): void {
     async (_event, input: CitationDiscoveryInput) => {
       const papers = selectCitationPapers(store.listPapers(), input?.paperIds);
       const cache = store.getCitationGraphCache();
+      const discoveryMode =
+        input?.mode === "pure-search" ? "pure-search" : "contextual";
+      const translationCredentials = store.resolveTranslationCredentials();
+      const canTranslateDiscoveryQuery = Boolean(
+        translationCredentials.appId && translationCredentials.secretKey,
+      );
       const { result, works } = await discoverCitationWorks({
         papers,
-        cache,
-        client: new OpenAlexClient(store.resolveOpenAlexApiKey()),
+          cache,
+          client: new OpenAlexClient(store.resolveOpenAlexApiKey()),
+          crossref: new CrossrefClient(),
+          europePmc: new EuropePmcClient(),
+        arxiv: new ArxivClient(),
         query: typeof input?.query === "string" ? input.query : "",
+        mode: discoveryMode,
         limit:
           typeof input?.limit === "number" && Number.isFinite(input.limit)
             ? input.limit
             : undefined,
         contentMatchPriority: store.getCitationContentMatchPriority(),
+        translateQuery: canTranslateDiscoveryQuery
+          ? async (text) =>
+              (
+                await new BaiduTranslationClient(
+                  translationCredentials.appId,
+                  translationCredentials.secretKey,
+                ).translate(text)
+              ).translatedText
+          : undefined,
       });
-      for (const work of works) cache.works[work.openAlexId] = work;
-      if (works.length > 0) {
+      // 纯搜索结果是灵感/证据临时结果，不写入图谱缓存，避免污染后续上下文发现。
+      if (discoveryMode !== "pure-search") {
+        for (const work of works) cache.works[work.openAlexId] = work;
+      }
+      if (discoveryMode !== "pure-search" && works.length > 0) {
         cache.updatedAt = new Date().toISOString();
         store.saveCitationGraphCache(cache);
       }
       return result;
     },
   );
-  ipcMain.handle("citation-graph:analyze", (_event, paperIds?: unknown) =>
-    analyzeCitationNetwork(
-      selectCitationPapers(store.listPapers(), paperIds),
-      store.getCitationGraphCache(),
-    ),
+  ipcMain.handle(
+    "citation-graph:analyze",
+    (_event, paperIds?: unknown, options?: unknown) =>
+      analyzeCitationNetwork(
+        selectCitationPapers(store.listPapers(), paperIds),
+        store.getCitationGraphCache(),
+        new Date(),
+        normalizeCitationGraphAnalysisOptions(options),
+      ),
+  );
+  ipcMain.handle(
+    "citation-graph:open-google-scholar",
+    async (_event, input: unknown) => {
+      const query = typeof input === "string" ? input.trim() : "";
+      if (!query) throw new Error("Google Scholar 搜索需要主题关键词。");
+      await shell.openExternal(buildGoogleScholarSearchUrl(query));
+      return true;
+    },
   );
   ipcMain.handle(
     "citation-graph:export",
@@ -730,6 +816,26 @@ function registerIpc(): void {
       });
       store.saveCitationGraphCache(cache);
       return result;
+    },
+  );
+  ipcMain.handle(
+    "citation-graph:expand",
+    async (_event, paperId: unknown, force = false) => {
+      if (typeof paperId !== "string" || !paperId.trim()) {
+        throw new Error("同向二重图谱缺少目标论文。");
+      }
+      const paper = store
+        .listPapers()
+        .find((candidate) => candidate.id === paperId.trim());
+      if (!paper) throw new Error("找不到要展开的目标论文。");
+      const { cache, result } = await expandCitationGraphData({
+        paper,
+        cache: store.getCitationGraphCache(),
+        client: new OpenAlexClient(store.resolveOpenAlexApiKey()),
+        force: Boolean(force),
+      });
+      store.saveCitationGraphCache(cache);
+      return result as CitationGraphExpansionResult;
     },
   );
 
@@ -2349,6 +2455,7 @@ async function resolveOpenAccessPdf(
   crossrefCandidates: PdfCandidate[],
   metadata: PaperMetadata,
 ): Promise<PdfResolution> {
+  console.log("[pdf] 开放获取阶段：Crossref、Europe PMC、OpenAlex、CORE");
   const downloaded = await resolvePdfCandidatesInOrder(
     [
       () => Promise.resolve(crossrefCandidates),
@@ -2361,6 +2468,7 @@ async function resolveOpenAccessPdf(
   if (downloaded) return { downloaded };
 
   if (store.getPreprintFallbackEnabled() && !isChemrxivDoi(doi)) {
+    console.log("[pdf] 预印本阶段：ChemRxiv、arXiv");
     const preprint = await resolvePdfCandidatesInOrder(
       [
         () => lookupChemrxivPreprintPdfCandidates(metadata),
@@ -2369,6 +2477,11 @@ async function resolveOpenAccessPdf(
       downloadPdfCandidate,
     );
     if (preprint) return { downloaded: preprint };
+  }
+
+  // 新论文默认不自动进入 Sci-Hub 链路，避免把常规来源失败误判成兜底许可。
+  if (metadata.year && metadata.year > DOI_AUTO_FETCH_CUTOFF_YEAR) {
+    return {};
   }
 
   // Sci-Hub 作为最后兜底：仅在合法来源均无结果时尝试。
@@ -2383,6 +2496,17 @@ async function resolveOpenAccessPdf(
       return { downloaded };
     }
     console.log(`[scihub] 候选下载失败（非 PDF 或被拒）：${candidate.url}`);
+  }
+
+  // 自动解析失败后统一回到原来的浏览器人工验证流程。
+  if (!scihub.challengeUrl && scihub.manualUrl) {
+    const manualCandidates = await openScihubVerificationWindow(
+      scihub.manualUrl,
+    );
+    for (const candidate of manualCandidates) {
+      const downloaded = await downloadPdfCandidate(candidate);
+      if (downloaded) return { downloaded };
+    }
   }
 
   return {
@@ -2501,8 +2625,10 @@ async function lookupScihubPdfCandidates(
     (_webContents, _permission, callback) => callback(false),
   );
   let challengeUrl: string | undefined;
+  let manualFallbackUrl: string | undefined;
   for (const mirror of mirrors) {
     for (const pageUrl of buildScihubPageUrls(mirror, doi)) {
+      manualFallbackUrl ??= pageUrl;
       const page = await fetchScihubPage(pageUrl);
       if (!page) continue;
       if (isLikelyScihubChallenge(page.status, page.html)) {
@@ -2514,7 +2640,13 @@ async function lookupScihubPdfCandidates(
         extractScihubPdfCandidates(page.html, page.url),
         page.url,
       );
-      if (candidates.length > 0) return { candidates };
+      if (candidates.length > 0) {
+        return {
+          candidates,
+          // PDF 自动下载失败时，仍从当前 Sci-Hub 页面进入人工验证窗口。
+          manualUrl: page.url,
+        };
+      }
     }
   }
   console.log(`[scihub] 单次兜底未命中 DOI ${doi}`);
@@ -2528,27 +2660,56 @@ async function lookupScihubPdfCandidates(
     };
   }
 
+  // 原始请求失败后直接进入浏览器人工验证，让用户完成 VPN / CAPTCHA / Cookie 流程。
+  if (manualFallbackUrl) {
+    console.warn(
+      `[scihub] 原始页面请求未得到可解析结果，等待用户人工验证：${manualFallbackUrl}`,
+    );
+    return {
+      candidates: [],
+      manualUrl: manualFallbackUrl,
+    };
+  }
+
   return { candidates: [] };
 }
 
-async function fetchScihubPage(
-  url: string,
-): Promise<{ status: number; html: string; url: string } | undefined> {
+async function fetchScihubPage(url: string): Promise<
+  | {
+      status: number;
+      html: string;
+      url: string;
+    }
+  | undefined
+> {
+  // Sci-Hub 保持原有链路：Electron session / Node fetch 直连，
+  // 失败后交给 openScihubVerificationWindow 做人工验证。
   const visited = new Set<string>();
   let currentUrl = url;
   try {
     for (let redirectCount = 0; redirectCount < 5; redirectCount += 1) {
       if (visited.has(currentUrl)) return undefined;
       visited.add(currentUrl);
-      const response = await session
-        .fromPartition(SCIHUB_SESSION_PARTITION)
-        .fetch(currentUrl, {
-          redirect: "manual",
-          headers: {
-            "User-Agent": "Mozilla/5.0",
-            Accept: "text/html,*/*;q=0.8",
-          },
-        });
+      let response: Response | undefined;
+      let sessionError: unknown;
+      try {
+        response = await fetchScihubPageDirectWithTimeout(currentUrl);
+      } catch (error) {
+        sessionError = error;
+      }
+      if (!response) {
+        try {
+          response = await fetchScihubPageNodeWithTimeout(currentUrl);
+        } catch (nodeError) {
+          throw new Error(
+            `Electron session: ${formatNetworkError(
+              sessionError,
+            )}; Node fetch: ${formatNetworkError(nodeError)}`,
+            { cause: nodeError },
+          );
+        }
+      }
+      if (!response) return undefined;
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get("location");
         const redirectUrl = resolveHttpUrl(location, currentUrl);
@@ -2562,10 +2723,55 @@ async function fetchScihubPage(
         url: currentUrl,
       };
     }
-  } catch {
+  } catch (error) {
+    console.warn(
+      `[scihub] 原始页面请求失败：${formatNetworkError(error)}（${url}）`,
+    );
     // A malformed Location header must not become the verification window URL.
   }
   return undefined;
+}
+
+async function fetchScihubPageDirectWithTimeout(
+  url: string,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    SCIHUB_DIRECT_PAGE_TIMEOUT_MS,
+  );
+  try {
+    return await session.fromPartition(SCIHUB_SESSION_PARTITION).fetch(url, {
+      redirect: "manual",
+      headers: {
+        "User-Agent": DEFAULT_BROWSER_USER_AGENT,
+        Accept: "text/html,*/*;q=0.8",
+      },
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchScihubPageNodeWithTimeout(url: string): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    SCIHUB_DIRECT_PAGE_TIMEOUT_MS,
+  );
+  try {
+    return await globalThis.fetch(url, {
+      redirect: "manual",
+      headers: {
+        "User-Agent": DEFAULT_BROWSER_USER_AGENT,
+        Accept: "text/html,*/*;q=0.8",
+      },
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function tagScihubCandidates(
@@ -2835,24 +3041,38 @@ async function downloadPdfCandidate(
   candidate: PdfCandidate,
 ): Promise<DownloadedPdf | undefined> {
   try {
+    console.log(`[pdf] 尝试 ${candidate.source}（直接请求）：${candidate.url}`);
     const headers: Record<string, string> = {
-      // 部分来源（尤其 Sci-Hub 存储服务器）会拒绝没有浏览器 UA 的请求。
-      "User-Agent": "Mozilla/5.0",
+      // Some Sci-Hub storage servers reject non-browser user agents.
+      "User-Agent": DEFAULT_BROWSER_USER_AGENT,
       Accept: "application/pdf,*/*;q=0.8",
     };
     if (candidate.referer) headers.Referer = candidate.referer;
-    const response = candidate.sessionPartition
-      ? await session
-          .fromPartition(candidate.sessionPartition)
-          .fetch(candidate.url, { headers })
-      : await globalThis.fetch(candidate.url, { headers });
-    if (!response.ok) return undefined;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SCIHUB_PDF_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = candidate.sessionPartition
+        ? await session
+            .fromPartition(candidate.sessionPartition)
+            .fetch(candidate.url, {
+              headers,
+              signal: controller.signal,
+            })
+        : await globalThis.fetch(candidate.url, {
+            headers,
+            signal: controller.signal,
+          });
+    } finally {
+      clearTimeout(timeout);
+    }
     const contentLength = Number(response.headers.get("content-length") ?? 0);
     if (contentLength > MAX_AUTO_PDF_BYTES) return undefined;
 
     const data = Buffer.from(await response.arrayBuffer());
     if (
       data.byteLength > MAX_AUTO_PDF_BYTES ||
+      !response.ok ||
       !isPdfResponse(response, data) ||
       !hasPdfEndMarker(data)
     ) {
@@ -2863,9 +3083,19 @@ async function downloadPdfCandidate(
       data,
       fileName: inferPdfFileName(candidate.url),
     };
-  } catch {
+  } catch (error) {
+    console.warn(
+      `[scihub] 候选下载请求失败：${formatNetworkError(error)}（${candidate.url}）`,
+    );
     return undefined;
   }
+}
+
+function formatNetworkError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message.replace(/\s+/g, " ").trim().slice(0, 360);
+  }
+  return String(error).replace(/\s+/g, " ").trim().slice(0, 360);
 }
 
 function isPdfResponse(response: Response, data: Buffer): boolean {

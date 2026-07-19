@@ -24,9 +24,14 @@ export interface RankCitationDiscoveryInput {
   seedOpenAlexIds?: Record<string, string | undefined>;
   seedReferences?: Record<string, string[]>;
   limit?: number;
+  maxCandidates?: number;
   contentMatchPriority?: CitationContentMatchPriority;
   now?: Date;
 }
+
+export const CITATION_DISCOVERY_MAX_CANDIDATES = 400;
+export const CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES = 800;
+export const CITATION_DISCOVERY_PAGE_SIZE = 50;
 
 const CONTENT_MATCH_MAX_SCORE: Record<CitationContentMatchPriority, number> = {
   low: 25,
@@ -109,15 +114,32 @@ export function buildCitationDiscoveryQueries(
   query = "",
 ): string[] {
   const normalizedQuery = normalizeSpace(query);
+  const keywordQueries = parseCitationDiscoveryKeywords(normalizedQuery);
   const terms = buildCitationDiscoveryTerms(papers, normalizedQuery, 10);
   const queries = [
     normalizedQuery,
+    ...keywordQueries,
     terms.slice(0, 8).join(" "),
     ...papers.slice(0, normalizedQuery ? 1 : 2).map((paper) => paper.title),
   ]
     .map((value) => normalizeSpace(value).slice(0, 360))
     .filter(Boolean);
-  return [...new Set(queries)].slice(0, 3);
+  return [...new Set(queries)].slice(0, 8);
+}
+
+/**
+ * 发现搜索支持 `空格` 和英文逗号作为多个主题关键词的分隔符。
+ * 保留完整查询的同时，再为每个关键词建立独立 OpenAlex 搜索，避免
+ * 一个长查询被搜索引擎当成单一短语后漏掉相关证据。
+ */
+export function parseCitationDiscoveryKeywords(query = ""): string[] {
+  return unique(
+    query
+      .replace(/，/g, ",")
+      .split(/[,\s]+/u)
+      .map((keyword) => keyword.trim())
+      .filter((keyword) => keyword.length >= 2),
+  );
 }
 
 export function rankCitationDiscoveryCandidates({
@@ -126,7 +148,8 @@ export function rankCitationDiscoveryCandidates({
   query = "",
   seedOpenAlexIds = {},
   seedReferences = {},
-  limit = 80,
+  limit = CITATION_DISCOVERY_MAX_CANDIDATES,
+  maxCandidates = CITATION_DISCOVERY_MAX_CANDIDATES,
   contentMatchPriority = "standard",
   now = new Date(),
 }: RankCitationDiscoveryInput): CitationDiscoveryCandidate[] {
@@ -171,7 +194,7 @@ export function rankCitationDiscoveryCandidates({
     ) {
       continue;
     }
-    const identity = openAlexId ?? doi ?? normalizeTitle(candidate.work.title);
+    const identity = findCandidateIdentity(candidate.work, merged);
     if (!identity) continue;
     const previous = merged.get(identity);
     if (!previous) {
@@ -182,6 +205,7 @@ export function rankCitationDiscoveryCandidates({
       });
       continue;
     }
+    previous.work = mergeCitationWorkMetadata(previous.work, candidate.work);
     previous.reasons = unique([
       ...(previous.reasons ?? []),
       ...(candidate.reasons ?? []),
@@ -263,7 +287,13 @@ export function rankCitationDiscoveryCandidates({
         (second.work.year ?? 0) - (first.work.year ?? 0) ||
         first.work.title.localeCompare(second.work.title),
     )
-    .slice(0, Math.max(1, Math.min(limit, 100)));
+    .slice(
+      0,
+      Math.max(
+        1,
+        Math.min(Math.ceil(limit), Math.max(1, Math.ceil(maxCandidates))),
+      ),
+    );
 }
 
 export function tokenizeResearchText(value: string): string[] {
@@ -283,6 +313,111 @@ export function tokenizeResearchText(value: string): string[] {
   );
 }
 
+function mergeCitationWorkMetadata(
+  current: CitationWorkRecord,
+  incoming: CitationWorkRecord,
+): CitationWorkRecord {
+  const currentOpenAlexId = normalizeOpenAlexId(current.openAlexId);
+  const incomingOpenAlexId = normalizeOpenAlexId(incoming.openAlexId);
+  return {
+    ...current,
+    openAlexId:
+      currentOpenAlexId ??
+      incomingOpenAlexId ??
+      current.openAlexId ??
+      incoming.openAlexId,
+    doi: current.doi ?? incoming.doi,
+    authors:
+      current.authors.length > 0 ? current.authors : [...incoming.authors],
+    journal: current.journal ?? incoming.journal,
+    year: current.year ?? incoming.year,
+    abstract: current.abstract ?? incoming.abstract,
+    keywords:
+      current.keywords && current.keywords.length > 0
+        ? unique([...current.keywords, ...(incoming.keywords ?? [])])
+        : incoming.keywords
+          ? [...incoming.keywords]
+          : undefined,
+    volume: current.volume ?? incoming.volume,
+    issue: current.issue ?? incoming.issue,
+    pages: current.pages ?? incoming.pages,
+    issn: current.issn ?? incoming.issn,
+    citedByCount: current.citedByCount ?? incoming.citedByCount,
+    referencedOpenAlexIds: unique([
+      ...current.referencedOpenAlexIds,
+      ...incoming.referencedOpenAlexIds,
+    ]),
+    sourceUrl: current.sourceUrl ?? incoming.sourceUrl,
+    metadataSources: unique([
+      ...(current.metadataSources ?? []),
+      ...(incoming.metadataSources ?? []),
+    ]),
+    matchStatus: current.matchStatus ?? incoming.matchStatus,
+    matchConfidence: current.matchConfidence ?? incoming.matchConfidence,
+    rawCitation: current.rawCitation ?? incoming.rawCitation,
+    textQuality: current.textQuality ?? incoming.textQuality,
+  };
+}
+
+function findCandidateIdentity(
+  work: CitationWorkRecord,
+  merged: Map<string, CitationDiscoveryWorkInput>,
+): string | undefined {
+  const doi = normalizeCitationDoi(work.doi);
+  const title = normalizeTitle(work.title);
+  const authors = normalizedAuthorFamilies(work.authors);
+  const openAlexId = normalizeOpenAlexId(work.openAlexId);
+
+  for (const [identity, previous] of merged) {
+    const previousDoi = normalizeCitationDoi(previous.work.doi);
+    if (doi && previousDoi && doi === previousDoi) return identity;
+
+    const previousTitle = normalizeTitle(previous.work.title);
+    if (title && previousTitle && title === previousTitle) return identity;
+
+    if (
+      title &&
+      previousTitle &&
+      titleSimilarity(title, previousTitle) >= 0.9 &&
+      authorsOverlap(authors, normalizedAuthorFamilies(previous.work.authors))
+    ) {
+      return identity;
+    }
+  }
+
+  if (doi) return `doi:${doi}`;
+  if (title) return `title:${title}`;
+  if (openAlexId) return `openalex:${openAlexId}`;
+  return undefined;
+}
+
+function normalizedAuthorFamilies(authors: string[]): Set<string> {
+  return new Set(
+    authors
+      .map((author) => normalizeTitle(author).split(" ").filter(Boolean).at(-1))
+      .filter((author): author is string => Boolean(author)),
+  );
+}
+
+function authorsOverlap(first: Set<string>, second: Set<string>): boolean {
+  for (const author of first) {
+    if (second.has(author)) return true;
+  }
+  return false;
+}
+
+function titleSimilarity(first: string, second: string): number {
+  if (first === second) return 1;
+  const firstTokens = new Set(first.split(" ").filter(Boolean));
+  const secondTokens = new Set(second.split(" ").filter(Boolean));
+  if (!firstTokens.size || !secondTokens.size) return 0;
+  let shared = 0;
+  for (const token of firstTokens) {
+    if (secondTokens.has(token)) shared += 1;
+  }
+  return (2 * shared) / (firstTokens.size + secondTokens.size);
+}
+
 function scoreRelevance(
   work: CitationWorkRecord,
   terms: string[],
@@ -291,7 +426,13 @@ function scoreRelevance(
   if (!terms.length) return 0;
   const title = normalizeSpace(work.title).toLocaleLowerCase();
   const body = normalizeSpace(
-    [work.title, work.abstract, work.journal, ...work.authors]
+    [
+      work.title,
+      work.abstract,
+      work.journal,
+      ...(work.keywords ?? []),
+      ...work.authors,
+    ]
       .filter(Boolean)
       .join(" "),
   ).toLocaleLowerCase();
@@ -329,6 +470,7 @@ function toDiscoveryNode(
     journal: work.journal,
     year: work.year,
     abstract: work.abstract,
+    keywords: work.keywords ? [...work.keywords] : undefined,
     volume: work.volume,
     issue: work.issue,
     pages: work.pages,
@@ -339,7 +481,7 @@ function toDiscoveryNode(
     sourceUrl: work.sourceUrl,
     metadataSources: work.metadataSources
       ? [...work.metadataSources]
-      : ["openalex"],
+      : [openAlexId ? "openalex" : "crossref"],
     matchStatus: work.matchStatus ?? "verified",
     matchConfidence: work.matchConfidence ?? 100,
   };

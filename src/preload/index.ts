@@ -8,8 +8,10 @@ import type {
   CitationContentMatchPriority,
   CitationDiscoveryInput,
   CitationDiscoveryResult,
+  CitationGraphAnalysisOptions,
   CitationGraphRefreshResult,
   CitationGraphClearResult,
+  CitationGraphExpansionResult,
   CitationGraphExportRequest,
   CitationGraphSnapshot,
   CitationNetworkAnalysis,
@@ -262,12 +264,22 @@ const api: PaperXcelApi = {
       paperIds?: string[],
     ): Promise<CitationGraphRefreshResult> =>
       ipcRenderer.invoke("citation-graph:refresh", force, paperIds),
+    expand: (
+      paperId: string,
+      force = false,
+    ): Promise<CitationGraphExpansionResult> =>
+      ipcRenderer.invoke("citation-graph:expand", paperId, force),
     discover: (
       input: CitationDiscoveryInput,
     ): Promise<CitationDiscoveryResult> =>
       ipcRenderer.invoke("citation-graph:discover", input),
-    analyze: (paperIds?: string[]): Promise<CitationNetworkAnalysis> =>
-      ipcRenderer.invoke("citation-graph:analyze", paperIds),
+    analyze: (
+      paperIds?: string[],
+      options?: CitationGraphAnalysisOptions,
+    ): Promise<CitationNetworkAnalysis> =>
+      ipcRenderer.invoke("citation-graph:analyze", paperIds, options),
+    openGoogleScholar: (query: string): Promise<boolean> =>
+      ipcRenderer.invoke("citation-graph:open-google-scholar", query),
     clear: (): Promise<CitationGraphClearResult> =>
       ipcRenderer.invoke("citation-graph:clear"),
     export: (request: CitationGraphExportRequest): Promise<boolean> =>

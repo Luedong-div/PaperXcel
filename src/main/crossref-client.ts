@@ -107,7 +107,7 @@ export class CrossrefClient {
   ): Promise<CrossrefWorkRecord[]> {
     const url = new URL(`${CROSSREF_BASE_URL}/works`);
     url.searchParams.set("query.bibliographic", citation.slice(0, 800));
-    url.searchParams.set("rows", String(Math.max(1, Math.min(limit, 10))));
+    url.searchParams.set("rows", String(Math.max(1, Math.min(limit, 100))));
     const payload = await this.request<CrossrefSearchResponse>(url.toString());
     return (payload?.message?.items ?? [])
       .map(parseCrossrefWork)

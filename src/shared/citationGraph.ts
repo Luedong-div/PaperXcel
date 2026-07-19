@@ -1,4 +1,6 @@
 import type {
+  CitationGraphDirection,
+  CitationGraphExpansionStats,
   CitationGraphEdge,
   CitationGraphNode,
   CitationGraphSnapshot,
@@ -10,7 +12,21 @@ import type {
 
 export const CITATION_GRAPH_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 export const CITATION_GRAPH_CITING_LIMIT = 20;
+export const CITATION_GRAPH_FOCUSED_EXTERNAL_NODE_MAX = 300;
+export const CITATION_GRAPH_FOCUSED_FIRST_ORDER_LIMIT = 20;
+// 同向二重的外部节点由“一阶 + 二阶”组成：保留 20 篇一阶节点后，
+// 二阶节点必须至少还能补足到 300 篇，否则前端滑块即使调到 300 也只能显示 100 篇。
+export const CITATION_GRAPH_FOCUSED_SECOND_ORDER_LIMIT =
+  CITATION_GRAPH_FOCUSED_EXTERNAL_NODE_MAX -
+  CITATION_GRAPH_FOCUSED_FIRST_ORDER_LIMIT;
+// 每个一阶引用节点多取一些二阶引用，避免不同父节点之间重复后不足 300 篇。
+export const CITATION_GRAPH_FOCUSED_CITING_PER_PARENT_LIMIT = 20;
+export const CITATION_GRAPH_FOCUSED_SECOND_ORDER_CANDIDATE_LIMIT =
+  CITATION_GRAPH_FOCUSED_SECOND_ORDER_LIMIT * 2;
+export const CITATION_GRAPH_EXTERNAL_NODE_MAX = 100;
 export const CITATION_GRAPH_CORE_VERSION = 7;
+// 扩展数量策略变更后，强制旧的 20/80 快照重新生成，避免继续复用旧缓存。
+export const CITATION_GRAPH_EXPANSION_VERSION = 2;
 
 export interface CitationWorkRecord {
   openAlexId: string;
@@ -20,6 +36,7 @@ export interface CitationWorkRecord {
   journal?: string;
   year?: number;
   abstract?: string;
+  keywords?: string[];
   volume?: string;
   issue?: string;
   pages?: string;
@@ -43,14 +60,31 @@ export interface CitationCoreRecord {
   fetchedAt: string;
 }
 
+export interface CitationGraphExpansionRecord {
+  version?: number;
+  paperId: string;
+  rootOpenAlexId?: string;
+  referenceFirstOrderIds: string[];
+  referenceSecondOrderIds: string[];
+  referenceSecondOrderParentIds: Record<string, string[]>;
+  citingFirstOrderIds: string[];
+  citingSecondOrderIds: string[];
+  citingSecondOrderParentIds: Record<string, string[]>;
+  truncatedReferenceCount: number;
+  truncatedCitingCount: number;
+  errors?: string[];
+  fetchedAt: string;
+}
+
 export interface CitationGraphCache {
   works: Record<string, CitationWorkRecord>;
   cores: Record<string, CitationCoreRecord>;
+  expansions?: Record<string, CitationGraphExpansionRecord>;
   updatedAt?: string;
 }
 
 export function emptyCitationGraphCache(): CitationGraphCache {
-  return { works: {}, cores: {} };
+  return { works: {}, cores: {}, expansions: {} };
 }
 
 export function normalizeCitationDoi(value?: string): string | undefined {
@@ -73,6 +107,20 @@ export function isCitationRecordFresh(
   now = Date.now(),
 ): boolean {
   if (!record || record.version !== CITATION_GRAPH_CORE_VERSION) return false;
+  const fetchedAt = Date.parse(record.fetchedAt);
+  return (
+    Number.isFinite(fetchedAt) &&
+    now - fetchedAt < CITATION_GRAPH_CACHE_MAX_AGE_MS
+  );
+}
+
+export function isCitationExpansionFresh(
+  record: CitationGraphExpansionRecord | undefined,
+  now = Date.now(),
+): boolean {
+  if (!record || record.version !== CITATION_GRAPH_EXPANSION_VERSION) {
+    return false;
+  }
   const fetchedAt = Date.parse(record.fetchedAt);
   return (
     Number.isFinite(fetchedAt) &&
@@ -207,6 +255,7 @@ export function buildCitationGraphSnapshot(
       journal: work.journal,
       year: work.year,
       abstract: work.abstract,
+      keywords: work.keywords ? [...work.keywords] : undefined,
       volume: work.volume,
       issue: work.issue,
       pages: work.pages,
@@ -244,6 +293,272 @@ export function buildCitationGraphSnapshot(
     updatedAt: cache.updatedAt,
     errors: [...errors],
   };
+}
+
+/**
+ * 为单篇本地论文构建“二阶参考/二阶引用”专用快照。
+ *
+ * 这里故意不复用多篇论文的直接关系过滤：二重图谱需要保留
+ * 二阶节点之间的链路，最终呈现为：
+ *
+ * 二阶参考 -> 一阶参考 -> 目标论文 -> 一阶引用 -> 二阶引用
+ */
+export function buildFocusedCitationGraphSnapshot(
+  paper: Paper,
+  cache: CitationGraphCache,
+  expansion: CitationGraphExpansionRecord,
+  errors: string[] = [],
+): CitationGraphSnapshot {
+  const core = cache.cores[paper.id];
+  const rootWorkId = normalizeOpenAlexId(
+    expansion.rootOpenAlexId ?? core?.openAlexId,
+  );
+  const rootWork = rootWorkId ? cache.works[rootWorkId] : undefined;
+  const nodes = new Map<string, CitationGraphNode>();
+  const edges = new Map<string, CitationGraphEdge>();
+  const localByDoi = new Map<string, Paper>();
+  const localByOpenAlexId = new Map<string, Paper>();
+
+  // 允许二阶图中的条目显示为“资料库论文”，但只把当前论文作为 root。
+  const libraryPapers = [paper];
+  for (const localPaper of libraryPapers) {
+    const doi = normalizeCitationDoi(localPaper.doi);
+    if (doi) localByDoi.set(doi, localPaper);
+  }
+  if (rootWorkId) localByOpenAlexId.set(rootWorkId, paper);
+
+  const addNode = (
+    workId: string,
+    direction: Exclude<CitationGraphDirection, "root">,
+    depth: 1 | 2,
+    parentIds: string[],
+  ): string | undefined => {
+    const work = cache.works[workId];
+    if (!work) return undefined;
+    const matchedPaper =
+      localByOpenAlexId.get(workId) ??
+      (work.doi ? localByDoi.get(normalizeCitationDoi(work.doi) ?? "") : undefined);
+    const nodeId = matchedPaper
+      ? libraryNodeId(matchedPaper.id)
+      : externalNodeId(workId);
+    const existing = nodes.get(nodeId);
+    const nextDirection =
+      direction === "both" ||
+      existing?.direction === "both" ||
+      (existing?.direction &&
+        existing.direction !== "root" &&
+        existing.direction !== direction)
+        ? "both"
+        : direction;
+    const nextParentIds = [
+      ...new Set([...(existing?.parentIds ?? []), ...parentIds]),
+    ];
+    nodes.set(nodeId, {
+      id: nodeId,
+      kind: matchedPaper ? "library" : "external",
+      paperId: matchedPaper?.id,
+      openAlexId: normalizeOpenAlexId(work.openAlexId),
+      doi: normalizeCitationDoi(work.doi),
+      title: matchedPaper?.title ?? work.title,
+      authors: [...(matchedPaper?.authors ?? work.authors)],
+      journal: matchedPaper?.journal ?? work.journal,
+      year: matchedPaper?.year ?? work.year,
+      abstract: matchedPaper?.abstract?.trim() || work.abstract,
+      keywords: work.keywords ? [...work.keywords] : undefined,
+      volume: work.volume,
+      issue: work.issue,
+      pages: work.pages,
+      issn: work.issn ? [...work.issn] : undefined,
+      citedByCount: work.citedByCount,
+      referencedByLibrary:
+        (existing?.referencedByLibrary ?? false) ||
+        direction === "references",
+      citesLibrary:
+        (existing?.citesLibrary ?? false) || direction === "citing",
+      depth: Math.min(existing?.depth ?? depth, depth) as 1 | 2,
+      direction: nextDirection,
+      parentIds: nextParentIds,
+      sourceUrl: matchedPaper?.sourceUrl ?? work.sourceUrl,
+      metadataSources: work.metadataSources
+        ? [...work.metadataSources]
+        : undefined,
+      matchStatus: work.matchStatus,
+      matchConfidence: work.matchConfidence,
+      rawCitation: work.rawCitation,
+      textQuality: work.textQuality,
+    });
+    return nodeId;
+  };
+
+  const rootId = libraryNodeId(paper.id);
+  nodes.set(rootId, {
+    id: rootId,
+    kind: "library",
+    paperId: paper.id,
+    openAlexId: rootWorkId,
+    doi: normalizeCitationDoi(paper.doi),
+    title: paper.title,
+    authors: [...paper.authors],
+    journal: paper.journal,
+    year: paper.year,
+    abstract: paper.abstract?.trim() || rootWork?.abstract,
+    citedByCount: rootWork?.citedByCount,
+    referencedByLibrary: false,
+    citesLibrary: false,
+    depth: 0,
+    direction: "root",
+    parentIds: [],
+    sourceUrl: paper.sourceUrl,
+    metadataSources: ["library", ...(rootWork?.metadataSources ?? [])],
+    matchStatus: "verified",
+    matchConfidence: 100,
+  });
+
+  const addEdge = (
+    source: string | undefined,
+    target: string | undefined,
+    relation: "reference" | "citing",
+    depth: 1 | 2,
+  ): void => {
+    if (!source || !target || source === target) return;
+    const id = `${source}->${target}:${relation}`;
+    edges.set(id, {
+      id,
+      source,
+      target,
+      relation,
+      depth,
+    });
+  };
+
+  for (const workId of expansion.referenceFirstOrderIds) {
+    const firstId = addNode(workId, "references", 1, [rootId]);
+    addEdge(firstId, rootId, "reference", 1);
+  }
+  for (const workId of expansion.referenceSecondOrderIds) {
+    const parentIds = expansion.referenceSecondOrderParentIds[workId] ?? [];
+    const parentNodeIds = parentIds
+      .map((parentId) => {
+        const parentWork = cache.works[parentId];
+        return parentWork
+          ? externalNodeId(parentId)
+          : undefined;
+      })
+      .filter((id): id is string => Boolean(id));
+    const secondId = addNode(workId, "references", 2, parentNodeIds);
+    for (const parentId of parentIds) {
+      const parentNodeId = addNode(parentId, "references", 1, [rootId]);
+      addEdge(secondId, parentNodeId, "reference", 2);
+    }
+  }
+  for (const workId of expansion.citingFirstOrderIds) {
+    const firstId = addNode(workId, "citing", 1, [rootId]);
+    addEdge(rootId, firstId, "citing", 1);
+  }
+  for (const workId of expansion.citingSecondOrderIds) {
+    const parentIds = expansion.citingSecondOrderParentIds[workId] ?? [];
+    const parentNodeIds = parentIds
+      .map((parentId) => {
+        const parentWork = cache.works[parentId];
+        return parentWork
+          ? externalNodeId(parentId)
+          : undefined;
+      })
+      .filter((id): id is string => Boolean(id));
+    const secondId = addNode(workId, "citing", 2, parentNodeIds);
+    for (const parentId of parentIds) {
+      const parentNodeId = addNode(parentId, "citing", 1, [rootId]);
+      addEdge(parentNodeId, secondId, "citing", 2);
+    }
+  }
+
+  const expansionStats: CitationGraphExpansionStats = {
+    referenceFirstOrderCount: expansion.referenceFirstOrderIds.length,
+    referenceSecondOrderCount: expansion.referenceSecondOrderIds.length,
+    citingFirstOrderCount: expansion.citingFirstOrderIds.length,
+    citingSecondOrderCount: expansion.citingSecondOrderIds.length,
+    truncatedReferenceCount: expansion.truncatedReferenceCount,
+    truncatedCitingCount: expansion.truncatedCitingCount,
+  };
+  return {
+    nodes: [...nodes.values()],
+    edges: [...edges.values()],
+    updatedAt: cache.updatedAt,
+    errors: [...(errors.length ? errors : expansion.errors ?? [])],
+    graphMode: "focused-two-hop",
+    focusedPaperId: paper.id,
+    expansion: expansionStats,
+  };
+}
+
+/**
+ * 按被引次数截取外部节点。这里是“显示上限”，不改缓存和原始关系，
+ * 因此用户拖动滑块只会改变画布/分析范围，不会触发重新抓取。
+ */
+export function limitCitationGraphExternalNodes(
+  snapshot: CitationGraphSnapshot,
+  limits: { references: number; citing: number },
+  max = CITATION_GRAPH_EXTERNAL_NODE_MAX,
+): CitationGraphSnapshot {
+  const referenceLimit = clampExternalNodeLimit(limits.references, max);
+  const citingLimit = clampExternalNodeLimit(limits.citing, max);
+  const referenceIds = rankExternalNodes(
+    snapshot.nodes.filter((node) => isReferenceExternalNode(node)),
+  )
+    .slice(0, referenceLimit)
+    .map((node) => node.id);
+  const citingIds = rankExternalNodes(
+    snapshot.nodes.filter((node) => isCitingExternalNode(node)),
+  )
+    .slice(0, citingLimit)
+    .map((node) => node.id);
+  const visibleIds = new Set([
+    ...snapshot.nodes
+      .filter((node) => node.kind === "library")
+      .map((node) => node.id),
+    ...referenceIds,
+    ...citingIds,
+  ]);
+  return {
+    ...snapshot,
+    nodes: snapshot.nodes.filter((node) => visibleIds.has(node.id)),
+    edges: snapshot.edges.filter(
+      (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
+    ),
+  };
+}
+
+function isReferenceExternalNode(node: CitationGraphNode): boolean {
+  return (
+    node.kind === "external" &&
+    (node.direction === "references" ||
+      node.direction === "both" ||
+      node.referencedByLibrary)
+  );
+}
+
+function isCitingExternalNode(node: CitationGraphNode): boolean {
+  return (
+    node.kind === "external" &&
+    (node.direction === "citing" || node.direction === "both" || node.citesLibrary)
+  );
+}
+
+function rankExternalNodes(nodes: CitationGraphNode[]): CitationGraphNode[] {
+  return [...nodes].sort(
+    (first, second) =>
+      (second.citedByCount ?? -1) - (first.citedByCount ?? -1) ||
+      (second.year ?? 0) - (first.year ?? 0) ||
+      first.title.localeCompare(second.title) ||
+      first.id.localeCompare(second.id),
+  );
+}
+
+function clampExternalNodeLimit(value: number, max: number): number {
+  return Math.max(
+    0,
+    Math.min(Math.max(0, Math.round(max)), Math.round(value)),
+  );
 }
 
 function libraryNodeId(paperId: string): string {
