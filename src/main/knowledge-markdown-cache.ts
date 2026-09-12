@@ -1,6 +1,7 @@
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ProviderProtocol } from "../shared/contracts";
+import { writeCancellableUtf8 } from "./cancellable-file";
 
 export interface KnowledgeMarkdownRepairCache {
   version: 2;
@@ -15,6 +16,12 @@ export interface KnowledgeMarkdownRepairCache {
   protocol?: Exclude<ProviderProtocol, "auto">;
   repairedAt: string;
   warnings: string[];
+  repairReport?: {
+    batchCount: number;
+    repairedBatchCount: number;
+    preservedBatchCount: number;
+    detectedIssues: string[];
+  };
 }
 
 interface WriteKnowledgeMarkdownRepairCacheInput {
@@ -24,6 +31,7 @@ interface WriteKnowledgeMarkdownRepairCacheInput {
   protocol?: Exclude<ProviderProtocol, "auto">;
   repairedAt?: string;
   warnings: string[];
+  repairReport?: KnowledgeMarkdownRepairCache["repairReport"];
 }
 
 export async function readKnowledgeMarkdownRepairCache(
@@ -31,16 +39,23 @@ export async function readKnowledgeMarkdownRepairCache(
   paperId: string,
   pdfPath: string,
   legacyCacheRoot?: string,
+  signal?: AbortSignal,
 ): Promise<KnowledgeMarkdownRepairCache | null> {
+  signal?.throwIfAborted();
   const cachePath = knowledgeMarkdownRepairCachePath(paperDirectory);
   const legacyCachePath = legacyCacheRoot
     ? legacyKnowledgeMarkdownRepairCachePath(legacyCacheRoot, paperId)
     : undefined;
   const sourceInfo = await stat(pdfPath);
+  signal?.throwIfAborted();
   for (const candidatePath of [cachePath, legacyCachePath]) {
     if (!candidatePath) continue;
     try {
-      const serialized = await readFile(candidatePath, "utf8");
+      const serialized = await readFile(candidatePath, {
+        encoding: "utf8",
+        signal,
+      });
+      signal?.throwIfAborted();
       const cache = parseKnowledgeMarkdownRepairCache(serialized);
       if (
         !cache ||
@@ -53,15 +68,18 @@ export async function readKnowledgeMarkdownRepairCache(
       }
       if (candidatePath !== cachePath) {
         await mkdir(paperDirectory, { recursive: true });
-        await writeFile(
+        signal?.throwIfAborted();
+        await writeCancellableUtf8(
           cachePath,
           `${JSON.stringify(cache, null, 2)}\n`,
-          "utf8",
+          signal,
         );
+        signal?.throwIfAborted();
         await rm(candidatePath, { force: true });
       }
       return cache;
     } catch (error) {
+      signal?.throwIfAborted();
       if (!isMissingFileError(error)) {
         await rm(candidatePath, { force: true });
       }
@@ -75,8 +93,11 @@ export async function writeKnowledgeMarkdownRepairCache(
   paperId: string,
   pdfPath: string,
   input: WriteKnowledgeMarkdownRepairCacheInput,
+  signal?: AbortSignal,
 ): Promise<KnowledgeMarkdownRepairCache> {
+  signal?.throwIfAborted();
   const sourceInfo = await stat(pdfPath);
+  signal?.throwIfAborted();
   const cache: KnowledgeMarkdownRepairCache = {
     version: 2,
     paperId,
@@ -90,16 +111,24 @@ export async function writeKnowledgeMarkdownRepairCache(
     protocol: input.protocol,
     repairedAt: input.repairedAt ?? new Date().toISOString(),
     warnings: [...input.warnings],
+    repairReport: input.repairReport
+      ? {
+          ...input.repairReport,
+          detectedIssues: [...input.repairReport.detectedIssues],
+        }
+      : undefined,
   };
   if (!cache.markdown) {
     throw new Error("无法缓存空的 AI Markdown。");
   }
   await mkdir(paperDirectory, { recursive: true });
-  await writeFile(
+  signal?.throwIfAborted();
+  await writeCancellableUtf8(
     knowledgeMarkdownRepairCachePath(paperDirectory),
     `${JSON.stringify(cache, null, 2)}\n`,
-    "utf8",
+    signal,
   );
+  signal?.throwIfAborted();
   return cache;
 }
 
@@ -163,6 +192,7 @@ function parseKnowledgeMarkdownRepairCache(
       value.protocol === "responses" || value.protocol === "chat-completions"
         ? value.protocol
         : undefined;
+    const repairReport = parseRepairReport(value.repairReport);
     return {
       version: 2,
       paperId: value.paperId,
@@ -173,10 +203,35 @@ function parseKnowledgeMarkdownRepairCache(
       protocol,
       repairedAt: value.repairedAt,
       warnings: value.warnings as string[],
+      repairReport,
     };
   } catch {
     return null;
   }
+}
+
+function parseRepairReport(
+  value: unknown,
+): KnowledgeMarkdownRepairCache["repairReport"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const report = value as Record<string, unknown>;
+  if (
+    !Number.isInteger(report.batchCount) ||
+    !Number.isInteger(report.repairedBatchCount) ||
+    !Number.isInteger(report.preservedBatchCount) ||
+    !Array.isArray(report.detectedIssues) ||
+    !report.detectedIssues.every((issue) => typeof issue === "string")
+  ) {
+    return undefined;
+  }
+  return {
+    batchCount: report.batchCount as number,
+    repairedBatchCount: report.repairedBatchCount as number,
+    preservedBatchCount: report.preservedBatchCount as number,
+    detectedIssues: report.detectedIssues as string[],
+  };
 }
 
 function normalizeMarkdown(value: string): string {

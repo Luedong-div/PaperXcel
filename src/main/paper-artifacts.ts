@@ -1,13 +1,10 @@
 import { access, copyFile, mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import type {
-  DocumentPageText,
-  Paper,
-  PaperNote,
-} from "../shared/contracts";
+import type { DocumentPageText, Paper, PaperNote } from "../shared/contracts";
 import { buildPaperFullTextMarkdown } from "../shared/knowledge";
 import { buildPaperNoteExport } from "../shared/notes";
 import type { KnowledgeMarkdownRepairCache } from "./knowledge-markdown-cache";
+import { writeCancellableUtf8 } from "./cancellable-file";
 
 export function paperArtifactDirectory(
   userDataPath: string,
@@ -72,54 +69,66 @@ export async function writePaperTextArtifacts(
   options: {
     rawPages?: DocumentPageText[];
     repair?: KnowledgeMarkdownRepairCache | null;
+    signal?: AbortSignal;
   },
 ): Promise<void> {
+  const signal = options.signal;
+  signal?.throwIfAborted();
   const rawPages = options.rawPages?.map((page) => ({ ...page }));
   const repairedMarkdown = options.repair?.markdown.trim();
   if (!repairedMarkdown && !rawPages?.length) return;
 
   await mkdir(directory, { recursive: true });
+  signal?.throwIfAborted();
   const generatedAt = new Date().toISOString();
   const writes: Array<Promise<void>> = [];
 
   if (options.repair && repairedMarkdown) {
     writes.push(
-      writeFile(
+      writeCancellableUtf8(
         join(directory, "full.md"),
         ensureTrailingNewline(repairedMarkdown),
-        "utf8",
+        signal,
       ),
-      writeJson(join(directory, "content.json"), {
-        format: "paperxcel-document-markdown",
-        version: 2,
-        paper_id: paper.id,
-        generated_at: generatedAt,
-        parser: "AI repair of PaperXcel full.md",
-        page_count: options.repair.pageCount,
-        ai_repaired: true,
-        model: options.repair.model,
-        protocol: options.repair.protocol,
-        repaired_at: options.repair.repairedAt,
-        markdown: ensureTrailingNewline(repairedMarkdown),
-      }),
+      writeJson(
+        join(directory, "content.json"),
+        {
+          format: "paperxcel-document-markdown",
+          version: 2,
+          paper_id: paper.id,
+          generated_at: generatedAt,
+          parser: "AI repair of PaperXcel full.md",
+          page_count: options.repair.pageCount,
+          ai_repaired: true,
+          model: options.repair.model,
+          protocol: options.repair.protocol,
+          repaired_at: options.repair.repairedAt,
+          markdown: ensureTrailingNewline(repairedMarkdown),
+        },
+        signal,
+      ),
     );
   } else if (rawPages?.length) {
     writes.push(
-      writeFile(
+      writeCancellableUtf8(
         join(directory, "full.md"),
         buildPaperFullTextMarkdown(paper, rawPages),
-        "utf8",
+        signal,
       ),
-      writeJson(join(directory, "content.json"), {
-        format: "paperxcel-document-pages",
-        version: 1,
-        paper_id: paper.id,
-        generated_at: generatedAt,
-        parser: "PaperXcel PDF.js layout reconstruction",
-        page_count: rawPages.length,
-        ai_repaired: false,
-        pages: rawPages,
-      }),
+      writeJson(
+        join(directory, "content.json"),
+        {
+          format: "paperxcel-document-pages",
+          version: 1,
+          paper_id: paper.id,
+          generated_at: generatedAt,
+          parser: "PaperXcel PDF.js layout reconstruction",
+          page_count: rawPages.length,
+          ai_repaired: false,
+          pages: rawPages,
+        },
+        signal,
+      ),
       rm(join(directory, "full.raw.md"), { force: true }),
       rm(join(directory, "content.raw.json"), { force: true }),
     );
@@ -127,24 +136,29 @@ export async function writePaperTextArtifacts(
 
   if (options.repair && repairedMarkdown && rawPages?.length) {
     writes.push(
-      writeFile(
+      writeCancellableUtf8(
         join(directory, "full.raw.md"),
         buildPaperFullTextMarkdown(paper, rawPages),
-        "utf8",
+        signal,
       ),
-      writeJson(join(directory, "content.raw.json"), {
-        format: "paperxcel-document-pages",
-        version: 1,
-        paper_id: paper.id,
-        generated_at: generatedAt,
-        parser: "PaperXcel PDF.js layout reconstruction",
-        page_count: rawPages.length,
-        pages: rawPages,
-      }),
+      writeJson(
+        join(directory, "content.raw.json"),
+        {
+          format: "paperxcel-document-pages",
+          version: 1,
+          paper_id: paper.id,
+          generated_at: generatedAt,
+          parser: "PaperXcel PDF.js layout reconstruction",
+          page_count: rawPages.length,
+          pages: rawPages,
+        },
+        signal,
+      ),
     );
   }
 
   await Promise.all(writes);
+  signal?.throwIfAborted();
 }
 
 export async function removePaperTextArtifacts(
@@ -167,9 +181,19 @@ export async function removeLegacyPaperSummaryArtifact(
   await rm(join(directory, "summary.json"), { force: true });
 }
 
-async function writeJson(path: string, value: unknown): Promise<void> {
+async function writeJson(
+  path: string,
+  value: unknown,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  signal?.throwIfAborted();
+  await writeCancellableUtf8(
+    path,
+    `${JSON.stringify(value, null, 2)}\n`,
+    signal,
+  );
 }
 
 function ensureTrailingNewline(value: string): string {

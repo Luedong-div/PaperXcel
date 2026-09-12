@@ -73,7 +73,6 @@ interface StoreSchema {
   // 普通 DOI 的开放获取来源失败后，是否允许尝试匹配预印本。
   preprintFallbackEnabled: boolean;
   // 用户是否允许当前模型在引文匹配前清理 PDF 书目文本。
-  citationAiOptimizationEnabled: boolean;
   // 外部论文发现中，内容关键词匹配对总推荐分的影响级别。
   citationContentMatchPriority: CitationContentMatchPriority;
   zotero: StoredZoteroConfig;
@@ -111,7 +110,6 @@ export class AppStore {
         activeProviderId: DEFAULT_PROVIDER_ID,
         scihubEnabled: false,
         preprintFallbackEnabled: false,
-        citationAiOptimizationEnabled: false,
         citationContentMatchPriority: "standard",
         zotero: {
           mode: "local",
@@ -521,15 +519,6 @@ export class AppStore {
     return enabled;
   }
 
-  getCitationAiOptimizationEnabled(): boolean {
-    return this.store.get("citationAiOptimizationEnabled");
-  }
-
-  setCitationAiOptimizationEnabled(enabled: boolean): boolean {
-    this.store.set("citationAiOptimizationEnabled", enabled);
-    return enabled;
-  }
-
   getCitationContentMatchPriority(): CitationContentMatchPriority {
     return normalizeCitationContentMatchPriority(
       this.store.get("citationContentMatchPriority"),
@@ -812,6 +801,13 @@ function cloneChatMessage(message: ChatMessage): ChatMessage {
       ...snippet,
     })),
     citations: message.citations?.map((citation) => ({ ...citation })),
+    citationVerification: message.citationVerification
+      ? { ...message.citationVerification }
+      : undefined,
+    agentTrace: message.agentTrace?.map((event) => ({
+      ...event,
+      metadata: event.metadata ? { ...event.metadata } : undefined,
+    })),
   };
 }
 

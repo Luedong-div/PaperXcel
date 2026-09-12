@@ -1,5 +1,6 @@
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
+import rehypeRaw from "rehype-raw";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -30,6 +31,7 @@ import {
   useState,
 } from "react";
 import type {
+  AgentEvent,
   LibraryAskHistoryMessage,
   LibraryAskResult,
   LibrarySearchHit,
@@ -60,6 +62,10 @@ interface LibraryChatTurn {
   id: string;
   question: string;
   selectedCount: number;
+  requestId?: string;
+  streamingContent?: string;
+  reasoningContent?: string;
+  agentEvents?: AgentEvent[];
   answer?: LibraryAskResult;
   error?: string;
 }
@@ -72,6 +78,17 @@ const LIBRARY_SELECTED_HITS_STORAGE_KEY =
 const LIBRARY_ASSISTANT_WIDTH_STORAGE_KEY =
   "paperxcel.library-search.assistant-width";
 const MAX_LIBRARY_CONTEXT_HITS = 30;
+
+function agentEventQueries(event: AgentEvent): string[] {
+  const queries = event.metadata?.queries;
+  return Array.isArray(queries)
+    ? queries
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .slice(0, 4)
+    : [];
+}
 const DEFAULT_LIBRARY_ASSISTANT_WIDTH = 500;
 const MIN_LIBRARY_ASSISTANT_WIDTH = 320;
 const MAX_LIBRARY_ASSISTANT_WIDTH = 720;
@@ -198,6 +215,8 @@ export function LibrarySearchWorkspace({
   const [question, setQuestion] = useState("");
   const [turns, setTurns] = useState<LibraryChatTurn[]>(readStoredChatTurns);
   const [answering, setAnswering] = useState(false);
+  const [activeRequestId, setActiveRequestId] = useState<string>();
+  const activeRequestIdRef = useRef<string | undefined>(undefined);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [modelMenuSection, setModelMenuSection] =
     useState<LibraryModelMenuSection>();
@@ -329,6 +348,59 @@ export function LibrarySearchWorkspace({
   }, [assistantOpen, answering, turns]);
 
   useEffect(() => {
+    const disposeProgress = window.paperxcel.search.onProgress((progress) => {
+      if (
+        !progress.requestId ||
+        progress.requestId !== activeRequestIdRef.current
+      ) {
+        return;
+      }
+      setTurns((current) =>
+        current.map((turn) =>
+          turn.requestId === progress.requestId
+            ? {
+                ...turn,
+                streamingContent:
+                  progress.answerContent ?? turn.streamingContent,
+              }
+            : turn,
+        ),
+      );
+    });
+    const disposeAgent = window.paperxcel.search.onAgentEvent((event) => {
+      if (event.requestId !== activeRequestIdRef.current) return;
+      setTurns((current) =>
+        current.map((turn) =>
+          turn.requestId === event.requestId
+            ? {
+                ...turn,
+                agentEvents: [
+                  ...(turn.agentEvents ?? []).filter(
+                    (item) => item.sequence !== event.sequence,
+                  ),
+                  event,
+                ]
+                  .sort((a, b) => a.sequence - b.sequence)
+                  .slice(-20),
+              }
+            : turn,
+        ),
+      );
+      if (
+        event.type === "run.completed" ||
+        event.type === "run.cancelled" ||
+        event.type === "run.failed"
+      ) {
+        setAnswering(false);
+      }
+    });
+    return () => {
+      disposeProgress();
+      disposeAgent();
+    };
+  }, []);
+
+  useEffect(() => {
     if (!modelMenuOpen) return;
     const closeModelMenu = (event: PointerEvent): void => {
       if (!modelMenuRef.current?.contains(event.target as Node)) {
@@ -432,15 +504,19 @@ export function LibrarySearchWorkspace({
       id: turnId,
       question: cleanQuestion,
       selectedCount: selectedHits.length,
+      requestId: turnId,
     };
 
     setQuestion("");
     setModelMenuOpen(false);
     setModelMenuSection(undefined);
     setAnswering(true);
+    setActiveRequestId(turnId);
+    activeRequestIdRef.current = turnId;
     setTurns((current) => [...current, pendingTurn]);
     try {
       const answer = await window.paperxcel.search.askLibrary({
+        requestId: turnId,
         query: cleanQuestion,
         reasoningEffort,
         selectedHits: selectedHits.length ? selectedHits : undefined,
@@ -448,7 +524,9 @@ export function LibrarySearchWorkspace({
       });
       setTurns((current) =>
         current.map((turn) =>
-          turn.id === turnId ? { ...turn, answer } : turn,
+          turn.id === turnId
+            ? { ...turn, answer, streamingContent: undefined }
+            : turn,
         ),
       );
     } catch (error) {
@@ -461,6 +539,10 @@ export function LibrarySearchWorkspace({
       onError(message);
     } finally {
       setAnswering(false);
+      if (activeRequestIdRef.current === turnId) {
+        activeRequestIdRef.current = undefined;
+        setActiveRequestId(undefined);
+      }
     }
   };
 
@@ -709,6 +791,24 @@ export function LibrarySearchWorkspace({
                   </div>
                 </div>
                 <div className="ai-header-actions">
+                  {answering && activeRequestId && (
+                    <button
+                      className="icon-button"
+                      type="button"
+                      title="停止生成"
+                      aria-label="停止生成"
+                      onClick={() => {
+                        const requestId = activeRequestIdRef.current;
+                        if (requestId) {
+                          void window.paperxcel.search.cancelAskLibrary(
+                            requestId,
+                          );
+                        }
+                      }}
+                    >
+                      <span style={{ fontSize: 12 }}>停止</span>
+                    </button>
+                  )}
                   <button
                     className="icon-button"
                     type="button"
@@ -756,6 +856,42 @@ export function LibrarySearchWorkspace({
                               (turn.error ? "请求失败" : "正在综合证据")}
                           </small>
                         </div>
+                        {turn.agentEvents && turn.agentEvents.length > 0 && (
+                          <div className="library-agent-timeline">
+                            {turn.agentEvents
+                              .filter((event) => event.type !== "content.delta")
+                              .slice(-6)
+                              .map((event) => {
+                                const queries = agentEventQueries(event);
+                                return (
+                                  <div
+                                    key={`${turn.id}-agent-${event.sequence}`}
+                                    className={`library-agent-event is-${event.status ?? "running"}`}
+                                  >
+                                    {event.status === "running" ? (
+                                      <LoaderCircle
+                                        className="spin"
+                                        size={12}
+                                      />
+                                    ) : (
+                                      <Check size={12} />
+                                    )}
+                                    <span>{event.title}</span>
+                                    {event.detail && (
+                                      <small>{event.detail}</small>
+                                    )}
+                                    {queries.length > 0 && (
+                                      <div className="library-agent-queries">
+                                        {queries.map((query) => (
+                                          <code key={query}>{query}</code>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                          </div>
+                        )}
                         {turn.answer ? (
                           <>
                             <div className="message-content knowledge-markdown">
@@ -765,11 +901,23 @@ export function LibrarySearchWorkspace({
                                   remarkMath,
                                   remarkBreaks,
                                 ]}
-                                rehypePlugins={[rehypeKatex]}
+                                rehypePlugins={[rehypeKatex, rehypeRaw]}
                               >
                                 {normalizeMarkdownMath(turn.answer.content)}
                               </ReactMarkdown>
                             </div>
+                            {turn.answer.citationVerification?.status ===
+                            "unverified" ? (
+                              <div
+                                className="citation-verification-warning"
+                                role="status"
+                              >
+                                <CircleAlert size={14} />
+                                <span>
+                                  {turn.answer.citationVerification.detail}
+                                </span>
+                              </div>
+                            ) : null}
                             {turn.answer.citations.length > 0 && (
                               <div className="library-search-answer-citations">
                                 {turn.answer.citations.map(
@@ -809,6 +957,19 @@ export function LibrarySearchWorkspace({
                             <p className="library-search-chat-error">
                               {turn.error}
                             </p>
+                          </div>
+                        ) : turn.streamingContent ? (
+                          <div className="message-content knowledge-markdown">
+                            <ReactMarkdown
+                              remarkPlugins={[
+                                remarkGfm,
+                                remarkMath,
+                                remarkBreaks,
+                              ]}
+                              rehypePlugins={[rehypeKatex, rehypeRaw]}
+                            >
+                              {normalizeMarkdownMath(turn.streamingContent)}
+                            </ReactMarkdown>
                           </div>
                         ) : (
                           <div className="message-content pending-message">

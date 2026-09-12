@@ -1,18 +1,17 @@
+import {
+  normalizeMarkdownScriptTags,
+  renderMarkdownScriptSyntax,
+} from "../../shared/markdownScripts";
+
 const DISPLAY_MATH_BLOCK =
   /(^|\n)([ \t]*)\\{1,2}\[[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*\\{1,2}\][ \t]*(?=\r?\n|$)/g;
-const DISPLAY_MATH_INLINE =
-  /[ \t]*\\{1,2}\[([^\n]*?)\\{1,2}\][ \t]*/g;
+const DISPLAY_MATH_INLINE = /[ \t]*\\{1,2}\[([^\n]*?)\\{1,2}\][ \t]*/g;
 const INLINE_MATH = /\\{1,2}\(([^\n]*?)\\{1,2}\)/g;
 
 export function normalizeMarkdownMath(content: string): string {
-  const displayBlocks = content.replace(
+  const displayBlocks = normalizeMarkdownScriptTags(content).replace(
     DISPLAY_MATH_BLOCK,
-    (
-      _match,
-      linePrefix: string,
-      indentation: string,
-      expression: string,
-    ) => {
+    (_match, linePrefix: string, indentation: string, expression: string) => {
       const math = normalizeDisplayMath(expression)
         .split("\n")
         .map((line) => `${indentation}${line}`)
@@ -25,11 +24,11 @@ export function normalizeMarkdownMath(content: string): string {
     (_match, expression: string) =>
       `\n\n$$\n${normalizeLatexEscapes(expression)}\n$$\n\n`,
   );
-  return inlineDisplays.replace(
+  const normalized = inlineDisplays.replace(
     INLINE_MATH,
-    (_match, expression: string) =>
-      `$${normalizeLatexEscapes(expression)}$`,
+    (_match, expression: string) => `$${normalizeLatexEscapes(expression)}$`,
   );
+  return renderMarkdownScriptSyntax(normalized);
 }
 
 function normalizeLatexEscapes(expression: string): string {
@@ -45,9 +44,7 @@ function normalizeDisplayMath(expression: string): string {
   const indentation = lines
     .filter((line) => line.trim())
     .map((line) => line.match(/^[ \t]*/)?.[0].length ?? 0);
-  const commonIndentation = indentation.length
-    ? Math.min(...indentation)
-    : 0;
+  const commonIndentation = indentation.length ? Math.min(...indentation) : 0;
   return normalizeLatexEscapes(
     lines.map((line) => line.slice(commonIndentation)).join("\n"),
   );

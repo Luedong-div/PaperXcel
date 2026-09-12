@@ -1,17 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
+import rehypeRaw from "rehype-raw";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import {
+  Check,
   CircleAlert,
   LoaderCircle,
   RefreshCw,
   Sparkles,
   Square,
+  Undo2,
 } from "lucide-react";
 import type {
+  AgentEvent,
   KnowledgeBaseMarkdownPreview,
   KnowledgeBaseMarkdownRepairResult,
   Paper,
@@ -58,8 +62,13 @@ export function PaperReader({
   const [preview, setPreview] = useState<KnowledgeBaseMarkdownPreview>();
   const [loading, setLoading] = useState(false);
   const [repairing, setRepairing] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   const [repairDetail, setRepairDetail] = useState("");
+  const [repairAgentEvents, setRepairAgentEvents] = useState<AgentEvent[]>([]);
   const [error, setError] = useState("");
+  const [markdownVersion, setMarkdownVersion] = useState<"ai" | "original">(
+    "ai",
+  );
   const requestSequenceRef = useRef(0);
   const activeRepairRequestRef = useRef<string | undefined>(undefined);
 
@@ -71,8 +80,12 @@ export function PaperReader({
     try {
       const next = await window.paperxcel.knowledgeBase.previewMarkdown(
         paper.id,
+        markdownVersion,
       );
-      if (requestSequence === requestSequenceRef.current) setPreview(next);
+      if (requestSequence === requestSequenceRef.current) {
+        setPreview(next);
+        setMarkdownVersion(next.aiRepaired ? "ai" : "original");
+      }
     } catch (reason) {
       if (requestSequence === requestSequenceRef.current) {
         setError(errorMessage(reason));
@@ -80,14 +93,17 @@ export function PaperReader({
     } finally {
       if (requestSequence === requestSequenceRef.current) setLoading(false);
     }
-  }, [paper.id]);
+  }, [markdownVersion, paper.id]);
 
   const repairMarkdown = async (): Promise<void> => {
     if (repairing || !provider?.hasApiKey) return;
     const requestId = crypto.randomUUID();
     activeRepairRequestRef.current = requestId;
     setRepairing(true);
+    setPreview(undefined);
+    setLoading(true);
     setRepairDetail("正在准备 PDF 全文修复");
+    setRepairAgentEvents([]);
     setError("");
     try {
       const next = onRepairMarkdown
@@ -102,12 +118,8 @@ export function PaperReader({
         return;
       }
       setPreview(next);
-      const warningDetails = (next.warnings ?? []).filter(Boolean);
-      onNotice?.(
-        warningDetails.length
-          ? `论文全文已由 ${next.model || provider.model} 修复并缓存。兼容性提示：${warningDetails.join("；")}`
-          : `论文全文已由 ${next.model || provider.model} 修复并缓存。`,
-      );
+      setMarkdownVersion("ai");
+      onNotice?.(`论文全文已由 ${next.model || provider.model} 修复并缓存。`);
     } catch (reason) {
       if (activeRepairRequestRef.current !== requestId) return;
       const message = errorMessage(reason);
@@ -117,7 +129,9 @@ export function PaperReader({
       if (activeRepairRequestRef.current === requestId) {
         activeRepairRequestRef.current = undefined;
         setRepairing(false);
+        setLoading(false);
         setRepairDetail("");
+        setRepairAgentEvents([]);
       }
     }
   };
@@ -147,6 +161,32 @@ export function PaperReader({
     }
   };
 
+  const switchMarkdownVersion = async (): Promise<void> => {
+    if (repairing || restoring || !preview) return;
+    setRestoring(true);
+    setError("");
+    try {
+      const targetVersion = preview.aiRepaired ? "original" : "ai";
+      const next = await window.paperxcel.knowledgeBase.previewMarkdown(
+        paper.id,
+        targetVersion,
+      );
+      setPreview(next);
+      setMarkdownVersion(targetVersion);
+      onNotice?.(
+        targetVersion === "original"
+          ? "已切换到 PDF.js 原始 Markdown，AI 修复缓存仍然保留。"
+          : "已切换到 AI 修复 Markdown。",
+      );
+    } catch (reason) {
+      const message = errorMessage(reason);
+      setError(message);
+      onNotice?.(message);
+    } finally {
+      setRestoring(false);
+    }
+  };
+
   useEffect(
     () =>
       window.paperxcel.knowledgeBase.onProgress((progress) => {
@@ -160,11 +200,46 @@ export function PaperReader({
     [],
   );
 
+  useEffect(
+    () =>
+      window.paperxcel.knowledgeBase.onAgentEvent((event) => {
+        if (event.requestId !== activeRepairRequestRef.current) return;
+        setRepairAgentEvents((current) => [...current, event].slice(-12));
+      }),
+    [],
+  );
+
+  useEffect(() => {
+    const subscribe = window.paperxcel.knowledgeBase.onMarkdownPreview;
+    if (!subscribe) return;
+    return subscribe((event) => {
+      if (event.requestId !== activeRepairRequestRef.current) return;
+      setPreview((current) => ({
+        ...(current ?? {
+          paperId: paper.id,
+          pageCount: paper.pageCount ?? 0,
+          generatedAt: event.generatedAt,
+          aiRepaired: true,
+        }),
+        markdown: event.content,
+        generatedAt: event.generatedAt,
+        aiRepaired: true,
+        model: provider?.model,
+      }));
+      setRepairDetail(
+        event.done
+          ? "Markdown 已生成，正在写入正式缓存"
+          : `正在接收 Markdown · ${event.characters.toLocaleString()} 字符`,
+      );
+    });
+  }, [paper.id, paper.pageCount, provider?.model]);
+
   useEffect(() => {
     setPreview(undefined);
     setError("");
     setRepairing(false);
     setRepairDetail("");
+    setRepairAgentEvents([]);
     return () => {
       const requestId = activeRepairRequestRef.current;
       activeRepairRequestRef.current = undefined;
@@ -235,6 +310,26 @@ export function PaperReader({
             )}
             <span>{repairing ? "停止修复" : "文件修复"}</span>
           </button>
+          {preview?.hasAiRepairedVersion ? (
+            <button
+              className="secondary-button markdown-restore-button"
+              type="button"
+              title={
+                preview.aiRepaired
+                  ? "切换到 PDF.js 原始 Markdown"
+                  : "切换到 AI 修复 Markdown"
+              }
+              disabled={loading || repairing || restoring}
+              onClick={() => void switchMarkdownVersion()}
+            >
+              {restoring ? (
+                <LoaderCircle className="spin" size={14} />
+              ) : (
+                <Undo2 size={14} />
+              )}
+              <span>{restoring ? "切换中" : "切换版本"}</span>
+            </button>
+          ) : null}
           <button
             className="icon-button"
             type="button"
@@ -252,15 +347,30 @@ export function PaperReader({
       </div>
 
       <div className="paper-markdown-stage">
-        {preview?.warnings?.length ? (
-          <div className="paper-markdown-warning" role="status">
-            <CircleAlert size={16} />
-            <div>
-              <strong>兼容性提示</strong>
-              {preview.warnings.map((warning, index) => (
-                <p key={`${index}-${warning}`}>{warning}</p>
-              ))}
-            </div>
+        {repairAgentEvents.length ? (
+          <div
+            className="paper-markdown-agent-timeline"
+            aria-label="Markdown 修复 Agent 执行过程"
+          >
+            <strong>修复 Agent</strong>
+            {repairAgentEvents.map((event) => (
+              <div
+                className={`note-agent-event ${event.status ?? "running"}`}
+                key={`${event.sequence}-${event.type}`}
+              >
+                {event.status === "running" ? (
+                  <LoaderCircle className="spin" size={13} />
+                ) : event.status === "failed" ? (
+                  <CircleAlert size={13} />
+                ) : (
+                  <Check size={13} />
+                )}
+                <span>
+                  <strong>{event.title}</strong>
+                  {event.detail ? <small>{event.detail}</small> : null}
+                </span>
+              </div>
+            ))}
           </div>
         ) : null}
         {loading && !preview ? (
@@ -284,9 +394,15 @@ export function PaperReader({
           </div>
         ) : preview ? (
           <article className="paper-markdown-document knowledge-markdown">
+            {repairing && preview.aiRepaired ? (
+              <div className="paper-markdown-streaming" role="status">
+                <LoaderCircle className="spin" size={14} />
+                <span>实时预览（尚未写入正式缓存）</span>
+              </div>
+            ) : null}
             <ReactMarkdown
               remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
-              rehypePlugins={[rehypeKatex]}
+              rehypePlugins={[rehypeKatex, rehypeRaw]}
             >
               {normalizeMarkdownMath(preview.markdown)}
             </ReactMarkdown>

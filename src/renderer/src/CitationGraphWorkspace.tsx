@@ -75,6 +75,7 @@ import {
 } from "../../shared/citationGraph";
 import {
   CITATION_DISCOVERY_MAX_CANDIDATES,
+  CITATION_DISCOVERY_PURE_SEARCH_DEFAULT_CANDIDATES,
   CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES,
 } from "../../shared/citationDiscovery";
 import { CitationAnalysisPanel } from "./CitationAnalysisPanel";
@@ -181,6 +182,9 @@ function CitationGraphWorkspaceContent({
     useState<CitationDiscoveryMode>("contextual");
   const [discoveryResult, setDiscoveryResult] =
     useState<CitationDiscoveryResult>();
+  const [pureSearchLimit, setPureSearchLimit] = useState(
+    CITATION_DISCOVERY_PURE_SEARCH_DEFAULT_CANDIDATES,
+  );
   const [analysis, setAnalysis] = useState<CitationNetworkAnalysis>();
   const [analysisFocusIds, setAnalysisFocusIds] = useState<Set<string>>(
     () => new Set(),
@@ -376,6 +380,7 @@ function CitationGraphWorkspaceContent({
 
   const discover = async (
     mode: CitationDiscoveryMode = discoveryMode,
+    requestedPureSearchLimit = CITATION_DISCOVERY_PURE_SEARCH_DEFAULT_CANDIDATES,
   ): Promise<void> => {
     if (discovering) return;
     if (mode === "pure-search" && !discoveryQuery.trim()) {
@@ -392,7 +397,10 @@ function CitationGraphWorkspaceContent({
         query: discoveryQuery,
         limit:
           mode === "pure-search"
-            ? CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES
+            ? Math.min(
+                CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES,
+                requestedPureSearchLimit,
+              )
             : CITATION_DISCOVERY_MAX_CANDIDATES,
         mode,
       });
@@ -401,6 +409,14 @@ function CitationGraphWorkspaceContent({
         selectionScopeRef.current === requestedScope
       ) {
         setDiscoveryResult(result);
+        if (mode === "pure-search") {
+          setPureSearchLimit(
+            Math.min(
+              CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES,
+              requestedPureSearchLimit,
+            ),
+          );
+        }
       }
     } catch (error) {
       if (
@@ -414,17 +430,77 @@ function CitationGraphWorkspaceContent({
     }
   };
 
-  const openGoogleScholar = (): void => {
+  const loadMorePureSearch = (amount: 50 | 100): void => {
+    const nextLimit = Math.min(
+      CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES,
+      pureSearchLimit + amount,
+    );
+    if (nextLimit <= pureSearchLimit) return;
+    void discover("pure-search", nextLimit);
+  };
+
+  const openGoogleScholar = async (): Promise<void> => {
     const scholarQuery = discoveryResult?.query.trim() || discoveryQuery.trim();
     if (!scholarQuery) {
-      onError("请先输入主题关键词，再打开 Google Scholar。");
+      onError("请先输入主题关键词，再采集 Google Scholar。");
       return;
     }
-    void window.paperxcel.citationGraph
-      .openGoogleScholar(scholarQuery)
-      .catch((error: unknown) => {
-        onError(error instanceof Error ? error.message : String(error));
-      });
+    if (discovering) return;
+    setDiscovering(true);
+    try {
+      const scholarResult =
+        await window.paperxcel.citationGraph.searchGoogleScholar({
+          paperIds: discoveryMode === "pure-search" ? [] : selectedPaperIdList,
+          query: scholarQuery,
+          limit:
+            discoveryMode === "pure-search"
+              ? pureSearchLimit
+              : CITATION_DISCOVERY_MAX_CANDIDATES,
+          mode: discoveryMode,
+        });
+      setDiscoveryResult((current) =>
+        mergeDiscoveryResults(current, scholarResult),
+      );
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
+  const importGoogleScholar = async (): Promise<void> => {
+    const scholarQuery = discoveryResult?.query.trim() || discoveryQuery.trim();
+    if (!scholarQuery) {
+      onError("请先输入主题关键词，再导入 Google Scholar 标题。");
+      return;
+    }
+    if (discovering) return;
+    const text = await window.paperxcel.clipboard.readText();
+    if (!text.trim()) {
+      onError("剪贴板为空。请先在 Google Scholar 结果页按 Ctrl+A、Ctrl+C。");
+      return;
+    }
+    setDiscovering(true);
+    try {
+      const scholarResult =
+        await window.paperxcel.citationGraph.importGoogleScholarText({
+          text,
+          paperIds: discoveryMode === "pure-search" ? [] : selectedPaperIdList,
+          query: scholarQuery,
+          limit:
+            discoveryMode === "pure-search"
+              ? pureSearchLimit
+              : CITATION_DISCOVERY_MAX_CANDIDATES,
+          mode: discoveryMode,
+        });
+      setDiscoveryResult((current) =>
+        mergeDiscoveryResults(current, scholarResult),
+      );
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDiscovering(false);
+    }
   };
 
   const analyze = useCallback(async (): Promise<void> => {
@@ -1006,7 +1082,12 @@ function CitationGraphWorkspaceContent({
                 }
                 onChange={(event) => {
                   if (viewMode === "graph") setQuery(event.target.value);
-                  else setDiscoveryQuery(event.target.value);
+                  else {
+                    setDiscoveryQuery(event.target.value);
+                    setPureSearchLimit(
+                      CITATION_DISCOVERY_PURE_SEARCH_DEFAULT_CANDIDATES,
+                    );
+                  }
                 }}
                 onKeyDown={(event) => {
                   if (viewMode === "discovery" && event.key === "Enter") {
@@ -1686,16 +1767,22 @@ function CitationGraphWorkspaceContent({
               onOpenDetails={(work) => openDetails(work.id)}
               onOpenSource={(sourceUrl) => window.open(sourceUrl, "_blank")}
               onOpenGoogleScholar={openGoogleScholar}
+              onImportGoogleScholar={() => void importGoogleScholar()}
+              onLoadMore={loadMorePureSearch}
+              resultLimit={pureSearchLimit}
+              maxResultLimit={CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES}
             />
           ) : (
-            <CitationAnalysisPanel
-              analysis={analysis}
-              snapshot={analysisSnapshot}
-              loading={analyzing}
-              selectedPaperCount={selectedPaperIdList.length}
-              onFocusNodes={focusGraphNodes}
-              onSelectNode={selectAnalysisNode}
-            />
+            <div className="citation-analysis-workspace">
+              <CitationAnalysisPanel
+                analysis={analysis}
+                snapshot={analysisSnapshot}
+                loading={analyzing}
+                selectedPaperCount={selectedPaperIdList.length}
+                onFocusNodes={focusGraphNodes}
+                onSelectNode={selectAnalysisNode}
+              />
+            </div>
           )}
         </main>
       </div>
@@ -1867,6 +1954,45 @@ function CitationGraphWorkspaceContent({
         </button>
       )}
     </section>
+  );
+}
+
+function mergeDiscoveryResults(
+  current: CitationDiscoveryResult | undefined,
+  incoming: CitationDiscoveryResult,
+): CitationDiscoveryResult {
+  if (!current || current.query !== incoming.query) return incoming;
+  const candidates = new Map(
+    current.candidates.map((candidate) => [
+      discoveryCandidateKey(candidate.work),
+      candidate,
+    ]),
+  );
+  for (const candidate of incoming.candidates) {
+    const key = discoveryCandidateKey(candidate.work);
+    const previous = candidates.get(key);
+    candidates.set(
+      key,
+      previous && previous.score >= candidate.score ? previous : candidate,
+    );
+  }
+  return {
+    ...incoming,
+    candidates: [...candidates.values()].sort(
+      (first, second) =>
+        second.score - first.score ||
+        (second.work.citedByCount ?? -1) - (first.work.citedByCount ?? -1),
+    ),
+    terms: [...new Set([...current.terms, ...incoming.terms])],
+    warnings: [...new Set([...current.warnings, ...incoming.warnings])],
+  };
+}
+
+function discoveryCandidateKey(work: CitationGraphNode): string {
+  return (
+    work.doi?.toLocaleLowerCase() ||
+    work.openAlexId ||
+    work.title.normalize("NFKC").toLocaleLowerCase()
   );
 }
 
@@ -2505,6 +2631,8 @@ function formatMetadataSources(sources: CitationMetadataSource[]): string {
     openalex: "OpenAlex",
     "europe-pmc": "Europe PMC",
     arxiv: "arXiv",
+    "google-scholar": "Google Scholar",
+    "ai-assisted": "AI 辅助",
   };
   return [...new Set(sources)].map((source) => labels[source]).join(" / ");
 }

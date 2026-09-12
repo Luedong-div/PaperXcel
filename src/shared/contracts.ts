@@ -121,6 +121,14 @@ export interface ReferencedSnippet {
   imageOnly?: boolean;
 }
 
+export interface TokenUsage {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+}
+
 export type ChatAttachmentKind =
   | "pdf"
   | "image"
@@ -129,7 +137,7 @@ export type ChatAttachmentKind =
   | "other";
 
 export type ChatAttachmentSource = "uploaded" | "library";
-export type ChatTask = "qa" | "repair-markdown";
+export type ChatTask = "qa" | "compact" | "repair-markdown";
 
 export interface ChatAttachment {
   id: string;
@@ -146,6 +154,11 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  /** Missing on legacy messages, which are treated as completed. */
+  status?: "complete" | "cancelled" | "error";
+  error?: string;
+  /** Whether this response included provider-reported reasoning text or tokens. */
+  reasoningObserved?: boolean;
   reasoningContent?: string;
   processingDurationMs?: number;
   prompt?: string;
@@ -155,6 +168,9 @@ export interface ChatMessage {
   selectedPage?: number;
   selectedSnippets?: ReferencedSnippet[];
   citations?: Citation[];
+  citationVerification?: CitationVerification;
+  agentTrace?: AgentTraceEvent[];
+  tokenUsage?: TokenUsage;
   createdAt: string;
 }
 
@@ -187,20 +203,72 @@ export interface AskPaperResult {
 
 export interface AskPaperCancelledResult {
   cancelled: true;
+  /** Last accepted text, including any IPC batch still pending at cancellation. */
+  answerContent?: string;
 }
 
 export type AskPaperResponse = AskPaperResult | AskPaperCancelledResult;
 
-export type ChatProgressPhase = "searching" | "thinking" | "answering";
+export type ChatProgressPhase =
+  | "preparing"
+  | "searching"
+  | "waiting"
+  | "thinking"
+  | "answering";
 
 export interface ChatProgress {
   requestId: string;
+  paperId?: string;
+  /** Monotonic within a request; snapshots (including "") replace content. */
+  sequence?: number;
   phase: ChatProgressPhase;
   detail: string;
+  /** Evidence from provider events, never inferred from elapsed time or effort settings. */
+  reasoningObserved?: boolean;
   reasoningContent?: string;
   reasoningDelta?: string;
   answerContent?: string;
   answerDelta?: string;
+}
+
+export type AgentEventType =
+  | "run.started"
+  | "plan.created"
+  | "step.started"
+  | "step.completed"
+  | "tool.started"
+  | "tool.completed"
+  | "progress.updated"
+  | "content.delta"
+  | "content.snapshot"
+  | "verification.started"
+  | "verification.completed"
+  | "run.completed"
+  | "run.cancelled"
+  | "run.failed";
+
+export interface AgentEvent {
+  requestId: string;
+  sequence: number;
+  timestamp: string;
+  type: AgentEventType;
+  title: string;
+  detail?: string;
+  stepId?: string;
+  tool?: string;
+  status?: "running" | "completed" | "failed";
+  delta?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AgentTraceEvent {
+  type: AgentEventType;
+  title: string;
+  detail?: string;
+  stepId?: string;
+  tool?: string;
+  status?: "running" | "completed" | "failed";
+  metadata?: Record<string, unknown>;
 }
 
 export interface GeneratePaperNoteResult {
@@ -209,6 +277,10 @@ export interface GeneratePaperNoteResult {
   model: string;
   source: "pdf" | "full.md";
   warning?: string;
+}
+
+export interface GeneratePaperNoteCancelled {
+  cancelled: true;
 }
 
 export interface LibraryReview {
@@ -223,6 +295,11 @@ export interface LibraryReview {
 
 export interface GenerateLibraryReviewInput {
   focus?: string;
+  requestId?: string;
+}
+
+export interface GenerateLibraryReviewCancelled {
+  cancelled: true;
 }
 
 export interface KnowledgeBaseExportResult {
@@ -252,10 +329,24 @@ export interface KnowledgeBaseMarkdownPreview {
   pageCount: number;
   generatedAt: string;
   aiRepaired: boolean;
+  hasAiRepairedVersion?: boolean;
   model?: string;
   protocol?: Exclude<ProviderProtocol, "auto">;
   repairedAt?: string;
   warnings?: string[];
+  repairReport?: {
+    batchCount: number;
+    repairedBatchCount: number;
+    preservedBatchCount: number;
+    detectedIssues: string[];
+  };
+  comparison?: {
+    originalCharacters: number;
+    repairedCharacters: number;
+    originalLines: number;
+    repairedLines: number;
+    changedLineEstimate: number;
+  };
 }
 
 export interface KnowledgeBaseMarkdownRepairCancelled {
@@ -298,6 +389,16 @@ export interface KnowledgeBaseRepairProgress {
   detail: string;
 }
 
+export interface KnowledgeBaseMarkdownStream {
+  requestId: string;
+  paperId: string;
+  content: string;
+  characters: number;
+  done: boolean;
+  generatedAt: string;
+  previewOnly?: boolean;
+}
+
 export interface DocumentPageText {
   page: number;
   text: string;
@@ -330,6 +431,7 @@ export interface LibraryAskHistoryMessage {
 }
 
 export interface LibraryAskInput {
+  requestId?: string;
   query: string;
   reasoningEffort?: ModelReasoningEffort;
   selectedHits?: LibrarySearchHit[];
@@ -339,8 +441,14 @@ export interface LibraryAskInput {
 export interface LibraryAskResult {
   content: string;
   citations: LibraryCitation[];
+  citationVerification?: CitationVerification;
   protocol: Exclude<ProviderProtocol, "auto">;
   model: string;
+}
+
+export interface CitationVerification {
+  status: "verified" | "unverified" | "not-applicable";
+  detail: string;
 }
 
 export type PaperIdentifier =
@@ -381,7 +489,9 @@ export type CitationMetadataSource =
   | "crossref"
   | "openalex"
   | "europe-pmc"
-  | "arxiv";
+  | "arxiv"
+  | "google-scholar"
+  | "ai-assisted";
 export type CitationMatchStatus =
   | "verified"
   | "probable"
@@ -502,6 +612,12 @@ export interface CitationDiscoveryResult {
   searchedAt: string;
   warnings: string[];
   mode?: CitationDiscoveryMode;
+}
+
+export interface ScihubSessionStatus {
+  persistent: boolean;
+  cookieCount: number;
+  lastVerifiedAt?: string;
 }
 
 export interface CitationNetworkCommunity {
@@ -664,6 +780,7 @@ export interface PaperXcelApi {
     ask: (input: AskPaperInput) => Promise<AskPaperResponse>;
     cancel: (requestId: string) => Promise<boolean>;
     onProgress: (listener: (progress: ChatProgress) => void) => () => void;
+    onAgentEvent: (listener: (event: AgentEvent) => void) => () => void;
   };
   selectionImages: {
     save: (dataUrl: string) => Promise<{ id: string; url: string }>;
@@ -679,12 +796,21 @@ export interface PaperXcelApi {
     list: () => Promise<PaperNote[]>;
     get: (paperId: string) => Promise<PaperNote | null>;
     save: (paperId: string, content: string) => Promise<PaperNote>;
-    generate: (paperId: string) => Promise<GeneratePaperNoteResult>;
+    generate: (
+      paperId: string,
+      requestId: string,
+    ) => Promise<GeneratePaperNoteResult | GeneratePaperNoteCancelled>;
+    cancel: (requestId: string) => Promise<boolean>;
+    onAgentEvent: (listener: (event: AgentEvent) => void) => () => void;
     exportMarkdown: (paperId: string) => Promise<boolean>;
   };
   reviews: {
     list: () => Promise<LibraryReview[]>;
-    generate: (input: GenerateLibraryReviewInput) => Promise<LibraryReview>;
+    generate: (
+      input: GenerateLibraryReviewInput,
+    ) => Promise<LibraryReview | GenerateLibraryReviewCancelled>;
+    cancel: (requestId: string) => Promise<boolean>;
+    onAgentEvent: (listener: (event: AgentEvent) => void) => () => void;
     remove: (reviewId: string) => Promise<void>;
     exportMarkdown: (reviewId: string) => Promise<boolean>;
   };
@@ -695,7 +821,10 @@ export interface PaperXcelApi {
       KnowledgeBaseExportResult | KnowledgeBaseExportCancelled | null
     >;
     cancel: (requestId: string) => Promise<boolean>;
-    previewMarkdown: (paperId: string) => Promise<KnowledgeBaseMarkdownPreview>;
+    previewMarkdown: (
+      paperId: string,
+      version?: "ai" | "original",
+    ) => Promise<KnowledgeBaseMarkdownPreview>;
     repairMarkdown: (
       paperId: string,
       requestId?: string,
@@ -703,18 +832,25 @@ export interface PaperXcelApi {
     onProgress: (
       listener: (progress: KnowledgeBaseRepairProgress) => void,
     ) => () => void;
+    onAgentEvent: (listener: (event: AgentEvent) => void) => () => void;
+    onMarkdownPreview: (
+      listener: (event: KnowledgeBaseMarkdownStream) => void,
+    ) => () => void;
   };
   search: {
     library: (input: LibrarySearchInput) => Promise<LibrarySearchHit[]>;
     askLibrary: (input: LibraryAskInput) => Promise<LibraryAskResult>;
+    cancelAskLibrary: (requestId: string) => Promise<boolean>;
+    onProgress: (listener: (progress: ChatProgress) => void) => () => void;
+    onAgentEvent: (listener: (event: AgentEvent) => void) => () => void;
   };
   settings: {
     getScihubEnabled: () => Promise<boolean>;
     setScihubEnabled: (enabled: boolean) => Promise<boolean>;
+    getScihubSessionStatus: () => Promise<ScihubSessionStatus>;
+    clearScihubSession: () => Promise<ScihubSessionStatus>;
     getPreprintFallbackEnabled: () => Promise<boolean>;
     setPreprintFallbackEnabled: (enabled: boolean) => Promise<boolean>;
-    getCitationAiOptimizationEnabled: () => Promise<boolean>;
-    setCitationAiOptimizationEnabled: (enabled: boolean) => Promise<boolean>;
     getCitationContentMatchPriority: () => Promise<CitationContentMatchPriority>;
     setCitationContentMatchPriority: (
       priority: CitationContentMatchPriority,
@@ -743,6 +879,12 @@ export interface PaperXcelApi {
       options?: CitationGraphAnalysisOptions,
     ) => Promise<CitationNetworkAnalysis>;
     openGoogleScholar: (query: string) => Promise<boolean>;
+    searchGoogleScholar: (
+      input: CitationDiscoveryInput,
+    ) => Promise<CitationDiscoveryResult>;
+    importGoogleScholarText: (
+      input: CitationDiscoveryInput & { text: string },
+    ) => Promise<CitationDiscoveryResult>;
     clear: () => Promise<CitationGraphClearResult>;
     export: (request: CitationGraphExportRequest) => Promise<boolean>;
   };
@@ -758,6 +900,7 @@ export interface PaperXcelApi {
   };
   clipboard: {
     writeText: (text: string) => Promise<void>;
+    readText: () => Promise<string>;
   };
   events: {
     onPaperUpdated: (listener: (paper: Paper) => void) => () => void;

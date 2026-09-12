@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+﻿import { createHash } from "node:crypto";
 import {
   CITATION_GRAPH_CITING_LIMIT,
   CITATION_GRAPH_CORE_VERSION,
@@ -26,9 +26,6 @@ import { CrossrefClient, type CrossrefWorkRecord } from "./crossref-client";
 import { OpenAlexClient } from "./openalex-client";
 import {
   resolveReferenceWorks,
-  retryUnresolvedReferenceWorksWithAi,
-  type CitationReferenceSearchHint,
-  type CitationReferenceSearchRequest,
 } from "./reference-resolver";
 
 export interface CitationGraphRefreshOptions {
@@ -38,9 +35,6 @@ export interface CitationGraphRefreshOptions {
   force?: boolean;
   extractLocalReferenceDois?: (paper: Paper) => Promise<string[]>;
   extractLocalReferenceCitations?: (paper: Paper) => Promise<string[]>;
-  extractReferenceSearchHints?: (
-    references: CitationReferenceSearchRequest[],
-  ) => Promise<CitationReferenceSearchHint[]>;
   fetchImpl?: typeof fetch;
   now?: Date;
 }
@@ -52,7 +46,6 @@ export async function refreshCitationGraphData({
   force = false,
   extractLocalReferenceDois,
   extractLocalReferenceCitations,
-  extractReferenceSearchHints,
   fetchImpl = fetch,
   now = new Date(),
 }: CitationGraphRefreshOptions): Promise<{
@@ -93,7 +86,6 @@ export async function refreshCitationGraphData({
             crossref,
             libraryDois,
             extractLocalReferenceCitations,
-            extractReferenceSearchHints,
             now,
           )
         : await refreshLocalPaper(
@@ -103,7 +95,6 @@ export async function refreshCitationGraphData({
             crossref,
             extractLocalReferenceDois,
             extractLocalReferenceCitations,
-            extractReferenceSearchHints,
             now,
           );
       nextCache.cores[paper.id] = core;
@@ -352,7 +343,6 @@ async function refreshDoiPaper(
   crossref: CrossrefClient,
   libraryDois: Set<string>,
   extractLocalReferenceCitations: CitationGraphRefreshOptions["extractLocalReferenceCitations"],
-  extractReferenceSearchHints: CitationGraphRefreshOptions["extractReferenceSearchHints"],
   now: Date,
 ) {
   let openAlexLookupError: Error | undefined;
@@ -399,17 +389,7 @@ async function refreshDoiPaper(
           crossref,
         })
       : [];
-  const resolvedReferences =
-    initiallyResolvedReferences.length > 0 && extractReferenceSearchHints
-      ? await retryUnresolvedReferenceWorksWithAi({
-          paperId: paper.id,
-          works: initiallyResolvedReferences,
-          sourceDoi: paper.doi,
-          openAlex: client,
-          crossref,
-          extractSearchHints: extractReferenceSearchHints,
-        })
-      : initiallyResolvedReferences;
+  const resolvedReferences = initiallyResolvedReferences;
   const selectedReferences =
     citations.length === 0
       ? selectRelatedWorks(referencedWorks, undefined, libraryDois)
@@ -454,7 +434,6 @@ async function refreshLocalPaper(
   crossref: CrossrefClient,
   extractLocalReferenceDois: CitationGraphRefreshOptions["extractLocalReferenceDois"],
   extractLocalReferenceCitations: CitationGraphRefreshOptions["extractLocalReferenceCitations"],
-  extractReferenceSearchHints: CitationGraphRefreshOptions["extractReferenceSearchHints"],
   now: Date,
 ) {
   const dois = extractLocalReferenceDois
@@ -482,16 +461,7 @@ async function refreshLocalPaper(
           crossref,
         })
       : [];
-  const resolvedReferences =
-    initiallyResolvedReferences.length > 0 && extractReferenceSearchHints
-      ? await retryUnresolvedReferenceWorksWithAi({
-          paperId: paper.id,
-          works: initiallyResolvedReferences,
-          openAlex: client,
-          crossref,
-          extractSearchHints: extractReferenceSearchHints,
-        })
-      : initiallyResolvedReferences;
+  const resolvedReferences = initiallyResolvedReferences;
   const selectedReferences =
     citations.length === 0
       ? selectRelatedWorks(works)

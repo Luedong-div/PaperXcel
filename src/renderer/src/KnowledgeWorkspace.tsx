@@ -6,9 +6,16 @@ import {
   type KeyboardEvent,
   type PointerEvent,
 } from "react";
-import { Database, FileText, Search } from "lucide-react";
+import {
+  Database,
+  FileText,
+  NotebookPen,
+  Search,
+  Sparkles,
+} from "lucide-react";
 import type { Paper } from "../../shared/contracts";
 import { PaperNotes } from "./PaperNotes";
+import { LibraryReviewsPanel } from "./LibraryReviewsPanel";
 
 interface KnowledgeWorkspaceProps {
   papers: Paper[];
@@ -34,6 +41,7 @@ export function KnowledgeWorkspace({
   const [selectedId, setSelectedId] = useState<string | undefined>(
     papers[0]?.id,
   );
+  const [mode, setMode] = useState<"notes" | "reviews">("notes");
 
   useEffect(() => {
     let disposed = false;
@@ -130,101 +138,127 @@ export function KnowledgeWorkspace({
         <span className="knowledge-header-count">
           {filteredPapers.length} / {papers.length}
         </span>
+        <div className="knowledge-mode-toggle" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === "notes"}
+            className={mode === "notes" ? "active" : ""}
+            onClick={() => setMode("notes")}
+          >
+            <NotebookPen size={14} />
+            论文笔记
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === "reviews"}
+            className={mode === "reviews" ? "active" : ""}
+            onClick={() => setMode("reviews")}
+          >
+            <Sparkles size={14} />
+            全库综述
+          </button>
+        </div>
       </header>
 
-      <div className="knowledge-notes-layout">
-        <aside className="knowledge-paper-index" aria-label="文章列表">
-          <label className="knowledge-search">
-            <Search size={14} />
-            <input
-              type="search"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="搜索标题、作者、期刊、DOI、笔记 Markdown..."
-              aria-label="搜索文章和笔记"
-            />
-          </label>
+      {mode === "reviews" ? (
+        <LibraryReviewsPanel onError={onError} />
+      ) : (
+        <div className="knowledge-notes-layout">
+          <aside className="knowledge-paper-index" aria-label="文章列表">
+            <label className="knowledge-search">
+              <Search size={14} />
+              <input
+                type="search"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="搜索标题、作者、期刊、DOI、笔记 Markdown..."
+                aria-label="搜索文章和笔记"
+              />
+            </label>
 
-          <div className="knowledge-paper-list">
-            {filteredPapers.length ? (
-              filteredPapers.map((paper) => (
-                <button
-                  key={paper.id}
-                  className={`knowledge-paper-row ${
-                    selectedPaper?.id === paper.id ? "selected" : ""
-                  }`}
-                  type="button"
-                  onClick={() => setSelectedId(paper.id)}
-                >
-                  <span>
-                    <strong>{paper.title || "未命名文献"}</strong>
-                    <small>
-                      {paper.authors || "作者未录入"}
-                      {paper.year ? ` · ${paper.year}` : ""}
-                    </small>
+            <div className="knowledge-paper-list">
+              {filteredPapers.length ? (
+                filteredPapers.map((paper) => (
+                  <button
+                    key={paper.id}
+                    className={`knowledge-paper-row ${
+                      selectedPaper?.id === paper.id ? "selected" : ""
+                    }`}
+                    type="button"
+                    onClick={() => setSelectedId(paper.id)}
+                  >
+                    <span>
+                      <strong>{paper.title || "未命名文献"}</strong>
+                      <small>
+                        {paper.authors || "作者未录入"}
+                        {paper.year ? ` · ${paper.year}` : ""}
+                      </small>
+                    </span>
+                    <i
+                      className={paper.status === "ready" ? "ready" : ""}
+                      title={paperStatusLabel(paper.status)}
+                    />
+                  </button>
+                ))
+              ) : (
+                <div className="knowledge-empty compact">
+                  <FileText size={20} />
+                  <strong>没有匹配的文章</strong>
+                </div>
+              )}
+            </div>
+          </aside>
+
+          <div
+            className="panel-resize-handle knowledge-index-resize-handle"
+            role="separator"
+            aria-label="调整知识库文章列表宽度"
+            aria-orientation="vertical"
+            aria-valuemin={indexMinWidth}
+            aria-valuemax={indexMaxWidth}
+            aria-valuenow={indexWidth}
+            tabIndex={0}
+            onPointerDown={onIndexResizePointerDown}
+            onKeyDown={onIndexResizeKeyDown}
+          />
+
+          <main className="knowledge-paper-detail">
+            {selectedPaper ? (
+              <>
+                <header className="knowledge-paper-detail-header">
+                  <div>
+                    <h3>{selectedPaper.title || "未命名文献"}</h3>
+                    <p>{paperMeta(selectedPaper)}</p>
+                  </div>
+                  <span
+                    className={`knowledge-paper-status ${
+                      selectedPaper.status === "ready" ? "ready" : ""
+                    }`}
+                  >
+                    {paperStatusLabel(selectedPaper.status)}
                   </span>
-                  <i
-                    className={paper.status === "ready" ? "ready" : ""}
-                    title={paperStatusLabel(paper.status)}
-                  />
-                </button>
-              ))
+                </header>
+                <PaperNotes
+                  key={selectedPaper.id}
+                  paper={selectedPaper}
+                  onError={onError}
+                  onContentChange={handleNoteContentChange}
+                  showGenerate={false}
+                  emptyMessage="本论文尚未写入任何笔记，请前往“文献库”进行编辑或生成"
+                />
+              </>
             ) : (
-              <div className="knowledge-empty compact">
-                <FileText size={20} />
-                <strong>没有匹配的文章</strong>
+              <div className="knowledge-empty">
+                <Database size={24} />
+                <strong>知识库还是空的</strong>
+                <span>导入文献后，可以在这里整理阅读笔记。</span>
               </div>
             )}
-          </div>
-        </aside>
-
-        <div
-          className="panel-resize-handle knowledge-index-resize-handle"
-          role="separator"
-          aria-label="调整知识库文章列表宽度"
-          aria-orientation="vertical"
-          aria-valuemin={indexMinWidth}
-          aria-valuemax={indexMaxWidth}
-          aria-valuenow={indexWidth}
-          tabIndex={0}
-          onPointerDown={onIndexResizePointerDown}
-          onKeyDown={onIndexResizeKeyDown}
-        />
-
-        <main className="knowledge-paper-detail">
-          {selectedPaper ? (
-            <>
-              <header className="knowledge-paper-detail-header">
-                <div>
-                  <h3>{selectedPaper.title || "未命名文献"}</h3>
-                  <p>{paperMeta(selectedPaper)}</p>
-                </div>
-                <span
-                  className={`knowledge-paper-status ${
-                    selectedPaper.status === "ready" ? "ready" : ""
-                  }`}
-                >
-                  {paperStatusLabel(selectedPaper.status)}
-                </span>
-              </header>
-              <PaperNotes
-                key={selectedPaper.id}
-                paper={selectedPaper}
-                onError={onError}
-                onContentChange={handleNoteContentChange}
-                showGenerate={false}
-                emptyMessage="本论文尚未写入任何笔记，请前往“文献库”进行编辑或生成"
-              />
-            </>
-          ) : (
-            <div className="knowledge-empty">
-              <Database size={24} />
-              <strong>知识库还是空的</strong>
-              <span>导入文献后，可以在这里整理阅读笔记。</span>
-            </div>
-          )}
-        </main>
-      </div>
+          </main>
+        </div>
+      )}
     </section>
   );
 }

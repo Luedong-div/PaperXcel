@@ -1,21 +1,16 @@
 import {
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type CSSProperties,
   type ClipboardEvent as ReactClipboardEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import ReactMarkdown from "react-markdown";
-import rehypeKatex from "rehype-katex";
-import remarkBreaks from "remark-breaks";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
 import {
   Archive,
   ArchiveRestore,
@@ -65,7 +60,6 @@ import type {
   ChatAttachment,
   ChatMessage,
   ChatTask,
-  KnowledgeBaseMarkdownRepairResult,
   LibrarySearchHit,
   LibraryFolder,
   ModelReasoningEffort,
@@ -73,6 +67,7 @@ import type {
   ProviderModel,
   ProviderProfile,
   ReferencedSnippet,
+  TokenUsage,
   TranslationResult,
 } from "../../shared/contracts";
 import { reorderIds, type PaperDropPlacement } from "../../shared/paperOrder";
@@ -85,8 +80,13 @@ import type { PdfTextSelection } from "./PdfViewer";
 import { PaperReader } from "./PaperReader";
 import { PaperNotes } from "./PaperNotes";
 import { shouldIgnorePdfDragEnter, shouldIgnorePdfDragLeave } from "./pdfDrag";
-import { normalizeMarkdownMath } from "./markdown";
 import { formatProcessingDuration } from "./chatProgress";
+import { PaperChatController } from "./paperChatController";
+import { ChatMarkdown as MarkdownMessage } from "./ChatMarkdown";
+import { ChatStreamView } from "./ChatStreamView";
+import { PaperResearchPlanView } from "./PaperResearchPlanView";
+import { AgentExecutionTrace } from "./AgentExecutionTrace";
+import { useChatScroll } from "./useChatScroll";
 import { AppSettingsDialog } from "./AppSettingsDialog";
 import { SettingsDialog } from "./SettingsDialog";
 import {
@@ -242,17 +242,25 @@ export default function App(): React.JSX.Element {
   const [resizingPanel, setResizingPanel] = useState<ResizablePanel>();
   const [translationPanel, setTranslationPanel] =
     useState<TranslationPanelState>();
-  const [messages, setMessages] = useState<Record<string, ChatMessage[]>>({});
+  const [chatController] = useState(
+    () => new PaperChatController(window.paperxcel),
+  );
+  const { messages, activity } = useSyncExternalStore(
+    chatController.subscribeWorkspace,
+    chatController.getWorkspaceSnapshot,
+  );
+  const asking = Boolean(activity);
+  const stoppingAsk = activity?.status === "stopping";
+  const {
+    scrollRef: chatScrollRef,
+    contentRef: chatContentRef,
+    isAtBottom,
+    scrollToBottom,
+  } = useChatScroll(selectedId ?? "");
   const [question, setQuestion] = useState("");
   const [editingMessageId, setEditingMessageId] = useState<string>();
   const [editingMessageText, setEditingMessageText] = useState("");
   const [copiedMessageId, setCopiedMessageId] = useState<string>();
-  const [asking, setAsking] = useState(false);
-  const [stoppingAsk, setStoppingAsk] = useState(false);
-  const [askProgress, setAskProgress] = useState("");
-  const [askReasoning, setAskReasoning] = useState("");
-  const [askAnswer, setAskAnswer] = useState("");
-  const [askElapsedMs, setAskElapsedMs] = useState(0);
   const [composerAttachments, setComposerAttachments] = useState<
     ChatAttachment[]
   >([]);
@@ -285,21 +293,15 @@ export default function App(): React.JSX.Element {
   const [folderDropTargetId, setFolderDropTargetId] = useState<string>();
   const [draggingPdf, setDraggingPdf] = useState(false);
   const [importingDrop, setImportingDrop] = useState(false);
-  const chatScrollRef = useRef<HTMLDivElement>(null);
   const appShellRef = useRef<HTMLDivElement>(null);
   const appSidebarRef = useRef<HTMLElement>(null);
-  const pendingInitialChatScrollRef = useRef<string | undefined>(undefined);
   const questionRef = useRef<HTMLTextAreaElement>(null);
   const paperMenuRef = useRef<HTMLDivElement>(null);
   const composerMenuRef = useRef<HTMLDivElement>(null);
   const dragDepthRef = useRef(0);
   const chatDragDepthRef = useRef(0);
   const copyResetTimerRef = useRef<number | undefined>(undefined);
-  const activeAskRequestRef = useRef<string | undefined>(undefined);
-  const activeAskStartedAtRef = useRef<number | undefined>(undefined);
-  const cancelledAskRequestIdsRef = useRef<Set<string>>(new Set());
-  const providerRef = useRef(provider);
-  const reasoningEffortRef = useRef(reasoningEffort);
+  const composerEpochRef = useRef(0);
   const pendingPageRef = useRef<{ paperId: string; page: number } | undefined>(
     undefined,
   );
@@ -311,8 +313,6 @@ export default function App(): React.JSX.Element {
     knowledgeIndexWidth,
     citationSidebarWidth,
   });
-  providerRef.current = provider;
-  reasoningEffortRef.current = reasoningEffort;
 
   panelLayoutRef.current = {
     paperRailVisible,
@@ -370,9 +370,6 @@ export default function App(): React.JSX.Element {
     ? papers.find((paper) => paper.id === paperActionMenu.paperId)
     : undefined;
   const paperMessages = selectedId ? (messages[selectedId] ?? []) : [];
-  const chatHistoryLoaded = Boolean(
-    selectedId && Object.prototype.hasOwnProperty.call(messages, selectedId),
-  );
   const openPaperActionMenu = useCallback(
     (event: ReactMouseEvent<HTMLElement>, paper: Paper): void => {
       event.preventDefault();
@@ -395,17 +392,6 @@ export default function App(): React.JSX.Element {
       });
     },
     [closeComposerMenu],
-  );
-  const formatReferencesForMessage = useCallback(
-    (references: ChatReference[]): string =>
-      references
-        .map((reference, index) =>
-          reference.imageOnly
-            ? `[${index + 1}] p.${reference.page}\n[公式或图片选区已作为图像附件发送]`
-            : `[${index + 1}] p.${reference.page}\n${reference.text}`,
-        )
-        .join("\n\n"),
-    [],
   );
   const extractPromptFromMessage = useCallback(
     (message: ChatMessage): string => {
@@ -477,12 +463,6 @@ export default function App(): React.JSX.Element {
         .filter((reference) => reference.text);
     },
     [currentPage],
-  );
-  const persistConversation = useCallback(
-    async (paperId: string, history: ChatMessage[]): Promise<void> => {
-      await window.paperxcel.chat.replace(paperId, history);
-    },
-    [],
   );
   const referenceImageUrl = useCallback(
     (
@@ -612,181 +592,16 @@ export default function App(): React.JSX.Element {
     setEditingMessageId(undefined);
     setEditingMessageText("");
   }, []);
-  const beginAskPresentation = useCallback((detail: string): void => {
-    activeAskStartedAtRef.current = Date.now();
-    setAskProgress(detail);
-    setAskReasoning("");
-    setAskAnswer("");
-    setAskElapsedMs(0);
-  }, []);
-  const updateAskProgress = useCallback((detail: string): void => {
-    setAskProgress(detail);
-  }, []);
-  const resetAskPresentation = useCallback((): void => {
-    activeAskStartedAtRef.current = undefined;
-    setAskProgress("");
-    setAskReasoning("");
-    setAskAnswer("");
-    setAskElapsedMs(0);
-  }, []);
   const stopAsking = useCallback(async (): Promise<void> => {
-    const requestId = activeAskRequestRef.current;
-    if (!requestId || stoppingAsk) return;
-    setStoppingAsk(true);
-    cancelledAskRequestIdsRef.current.add(requestId);
-    activeAskRequestRef.current = undefined;
-    setAsking(false);
-    resetAskPresentation();
     try {
-      await window.paperxcel.chat.cancel(requestId);
+      await chatController.cancel();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
-    } finally {
-      setStoppingAsk(false);
     }
-  }, [resetAskPresentation, stoppingAsk]);
-  const cancelMarkdownThroughAssistant = useCallback(
-    async (requestId: string): Promise<boolean> => {
-      cancelledAskRequestIdsRef.current.add(requestId);
-      if (activeAskRequestRef.current === requestId) {
-        activeAskRequestRef.current = undefined;
-        setAsking(false);
-        resetAskPresentation();
-      }
-      try {
-        return await window.paperxcel.chat.cancel(requestId);
-      } catch (error) {
-        setNotice(error instanceof Error ? error.message : String(error));
-        return false;
-      }
-    },
-    [resetAskPresentation],
-  );
-  const repairMarkdownThroughAssistant = useCallback(
-    async (
-      paperId: string,
-      requestId: string,
-    ): Promise<KnowledgeBaseMarkdownRepairResult> => {
-      const activeProvider = providerRef.current;
-      if (!activeProvider?.hasApiKey) {
-        throw new Error("请先配置可用的 AI 模型与 API Key。");
-      }
-      if (activeAskRequestRef.current) {
-        throw new Error("文献助手正在处理其他请求，请稍后再试。");
-      }
+  }, [chatController]);
 
-      const prompt =
-        "请读取当前论文原始 PDF，将整篇论文转换并修复为完整 Markdown，保留页面、标题、段落、公式、表格与引用。PaperXcel 会校验后写回当前论文缓存。";
-      let attachment: ChatAttachment | undefined;
-      let userMessage: ChatMessage | undefined;
-      let attachmentPersisted = false;
+  useEffect(() => chatController.connect(), [chatController]);
 
-      activeAskRequestRef.current = requestId;
-      cancelledAskRequestIdsRef.current.delete(requestId);
-      setAssistantView("chat");
-      setAssistantPaneVisible(true);
-      setStoppingAsk(false);
-      setAsking(true);
-      beginAskPresentation("正在准备 PDF 全文修复");
-
-      try {
-        const baseMessages = await window.paperxcel.chat.list(paperId);
-        if (cancelledAskRequestIdsRef.current.has(requestId)) {
-          return { cancelled: true };
-        }
-
-        attachment = await window.paperxcel.chat.attachPaperMarkdown(paperId);
-        if (cancelledAskRequestIdsRef.current.has(requestId)) {
-          return { cancelled: true };
-        }
-
-        userMessage = {
-          id: crypto.randomUUID(),
-          role: "user",
-          content: prompt,
-          prompt,
-          task: "repair-markdown",
-          attachments: [attachment],
-          createdAt: new Date().toISOString(),
-        };
-        const nextMessages = [...baseMessages, userMessage];
-        await window.paperxcel.chat.append(paperId, userMessage);
-        attachmentPersisted = true;
-        setMessages((current) => ({
-          ...current,
-          [paperId]: nextMessages,
-        }));
-        updateAskProgress("正在一次性提交原始 PDF 进行全文修复");
-
-        const result = await window.paperxcel.chat.ask({
-          requestId,
-          paperId,
-          question: prompt,
-          task: "repair-markdown",
-          attachments: [attachment],
-          reasoningEffort: reasoningEffortRef.current,
-          messages: baseMessages,
-        });
-        if ("cancelled" in result) {
-          return { cancelled: true };
-        }
-        if (cancelledAskRequestIdsRef.current.has(requestId)) {
-          return { cancelled: true };
-        }
-
-        const completeMessages = [...nextMessages, result.message];
-        await window.paperxcel.chat.append(paperId, result.message);
-        setMessages((current) => ({
-          ...current,
-          [paperId]: completeMessages,
-        }));
-        if (!result.markdownPreview) {
-          throw new Error("文献助手未返回可用的文件修复结果。");
-        }
-        setMarkdownRefreshTokens((current) => ({
-          ...current,
-          [paperId]:
-            result.markdownPreview?.repairedAt ?? new Date().toISOString(),
-        }));
-        return result.markdownPreview;
-      } catch (error) {
-        if (cancelledAskRequestIdsRef.current.has(requestId)) {
-          return { cancelled: true };
-        }
-        if (userMessage) {
-          const errorMessage: ChatMessage = {
-            id: crypto.randomUUID(),
-            role: "assistant",
-            content: `请求失败：${
-              error instanceof Error ? error.message : String(error)
-            }`,
-            createdAt: new Date().toISOString(),
-          };
-          try {
-            await window.paperxcel.chat.append(paperId, errorMessage);
-          } catch {
-            // Preserve the original repair error for the reader.
-          }
-          setMessages((current) => ({
-            ...current,
-            [paperId]: [...(current[paperId] ?? []), errorMessage],
-          }));
-        }
-        throw error;
-      } finally {
-        if (attachment && !attachmentPersisted) {
-          void window.paperxcel.chat.removeAttachment(attachment.id);
-        }
-        cancelledAskRequestIdsRef.current.delete(requestId);
-        if (activeAskRequestRef.current === requestId) {
-          activeAskRequestRef.current = undefined;
-          setAsking(false);
-          resetAskPresentation();
-        }
-      }
-    },
-    [beginAskPresentation, resetAskPresentation, updateAskProgress],
-  );
   useEffect(() => {
     cancelEditingMessage();
   }, [cancelEditingMessage, selectedId]);
@@ -1087,6 +902,8 @@ export default function App(): React.JSX.Element {
   }, [selectedPaper?.fileName, selectedPaper?.id]);
 
   useEffect(() => {
+    composerEpochRef.current += 1;
+    setQuestion("");
     setComposerAttachments((current) => {
       if (current.length) {
         void Promise.all(
@@ -1105,88 +922,14 @@ export default function App(): React.JSX.Element {
   useEffect(() => {
     if (!selectedId) return;
     let disposed = false;
-    void window.paperxcel.chat
-      .list(selectedId)
-      .then((history) => {
-        if (disposed) return;
-        setMessages((current) => ({ ...current, [selectedId]: history }));
-      })
-      .catch((error: unknown) => {
-        if (!disposed) {
-          setNotice(error instanceof Error ? error.message : String(error));
-        }
-      });
+    void chatController.load(selectedId).catch((error: unknown) => {
+      if (!disposed)
+        setNotice(error instanceof Error ? error.message : String(error));
+    });
     return () => {
       disposed = true;
     };
-  }, [selectedId]);
-
-  useEffect(() => {
-    return window.paperxcel.chat.onProgress((progress) => {
-      if (progress.requestId !== activeAskRequestRef.current) return;
-      updateAskProgress(progress.detail);
-      if (progress.reasoningContent !== undefined) {
-        setAskReasoning(progress.reasoningContent);
-      } else if (progress.reasoningDelta) {
-        setAskReasoning((current) => current + progress.reasoningDelta);
-      }
-      if (progress.answerContent !== undefined) {
-        setAskAnswer(progress.answerContent);
-      } else if (progress.answerDelta) {
-        setAskAnswer((current) => current + progress.answerDelta);
-      }
-    });
-  }, [updateAskProgress]);
-
-  useEffect(
-    () =>
-      window.paperxcel.knowledgeBase.onProgress((progress) => {
-        if (
-          progress.requestId &&
-          progress.requestId === activeAskRequestRef.current
-        ) {
-          updateAskProgress(progress.detail);
-        }
-      }),
-    [updateAskProgress],
-  );
-
-  useEffect(() => {
-    if (!asking) return;
-    const updateElapsed = (): void => {
-      const startedAt = activeAskStartedAtRef.current;
-      if (startedAt !== undefined) setAskElapsedMs(Date.now() - startedAt);
-    };
-    updateElapsed();
-    const timer = window.setInterval(updateElapsed, 500);
-    return () => window.clearInterval(timer);
-  }, [asking]);
-
-  useLayoutEffect(() => {
-    pendingInitialChatScrollRef.current = selectedId;
-  }, [selectedId]);
-
-  useLayoutEffect(() => {
-    if (!selectedId || assistantView !== "chat") return;
-    const container = chatScrollRef.current;
-    if (!container) return;
-    const isInitialScroll = pendingInitialChatScrollRef.current === selectedId;
-    if (isInitialScroll && !chatHistoryLoaded) return;
-    container.scrollTo({
-      top: container.scrollHeight,
-      behavior: isInitialScroll ? "auto" : "smooth",
-    });
-    if (isInitialScroll) pendingInitialChatScrollRef.current = undefined;
-  }, [
-    assistantView,
-    asking,
-    askAnswer,
-    askProgress,
-    askReasoning,
-    chatHistoryLoaded,
-    paperMessages.length,
-    selectedId,
-  ]);
+  }, [chatController, selectedId]);
 
   const libraryScopePapers = useMemo(() => {
     return papers.filter((paper) => {
@@ -1311,7 +1054,13 @@ export default function App(): React.JSX.Element {
   };
 
   const uploadChatFiles = async (files: File[]): Promise<void> => {
-    if (!selectedPaper || selectedPaper.status !== "ready") return;
+    if (
+      !selectedPaper ||
+      selectedPaper.status !== "ready" ||
+      uploadingAttachmentCount
+    )
+      return;
+    const composerEpoch = composerEpochRef.current;
     const available = Math.max(0, 6 - composerAttachments.length);
     const selectedFiles = files
       .filter((file) => file.size > 0)
@@ -1327,11 +1076,16 @@ export default function App(): React.JSX.Element {
     setUploadingAttachmentCount((count) => count + selectedFiles.length);
     try {
       for (const file of selectedFiles) {
+        if (composerEpochRef.current !== composerEpoch) break;
         try {
           const attachment = await window.paperxcel.chat.attachFile(
             file,
             selectedPaper.id,
           );
+          if (composerEpochRef.current !== composerEpoch) {
+            await window.paperxcel.chat.removeAttachment(attachment.id);
+            break;
+          }
           setComposerAttachments((current) => [...current, attachment]);
         } catch (error) {
           setNotice(
@@ -1340,7 +1094,9 @@ export default function App(): React.JSX.Element {
             }`,
           );
         } finally {
-          setUploadingAttachmentCount((count) => Math.max(0, count - 1));
+          if (composerEpochRef.current === composerEpoch) {
+            setUploadingAttachmentCount((count) => Math.max(0, count - 1));
+          }
         }
       }
     } catch (error) {
@@ -1386,20 +1142,24 @@ export default function App(): React.JSX.Element {
     ) {
       return;
     }
+    const composerEpoch = composerEpochRef.current;
     const oldAttachments = composerAttachments;
     setComposerAttachments([]);
-    if (oldAttachments.length) {
+    setUploadingAttachmentCount(1);
+    try {
       await Promise.all(
         oldAttachments.map((attachment) =>
           window.paperxcel.chat.removeAttachment(attachment.id),
         ),
       );
-    }
-    setUploadingAttachmentCount(1);
-    try {
+      if (composerEpochRef.current !== composerEpoch) return;
       const attachment = await window.paperxcel.chat.attachPaperMarkdown(
         selectedPaper.id,
       );
+      if (composerEpochRef.current !== composerEpoch) {
+        await window.paperxcel.chat.removeAttachment(attachment.id);
+        return;
+      }
       setComposerAttachments([attachment]);
       setComposerTask("repair-markdown");
       setQuestion(
@@ -1407,10 +1167,13 @@ export default function App(): React.JSX.Element {
       );
       window.requestAnimationFrame(() => questionRef.current?.focus());
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error));
-      setComposerTask("qa");
+      if (composerEpochRef.current === composerEpoch) {
+        setNotice(error instanceof Error ? error.message : String(error));
+        setComposerTask("qa");
+      }
     } finally {
-      setUploadingAttachmentCount(0);
+      if (composerEpochRef.current === composerEpoch)
+        setUploadingAttachmentCount(0);
     }
   };
 
@@ -1813,15 +1576,16 @@ export default function App(): React.JSX.Element {
   const removePaper = async (paper = selectedPaper): Promise<void> => {
     if (!paper) return;
     closePaperActionMenu();
+    if (activity?.paperId === paper.id) {
+      setNotice("请先停止这篇论文的任务，再删除文献。");
+      return;
+    }
     try {
-      await window.paperxcel.papers.remove(paper.id);
+      await chatController.remove(paper.id, () =>
+        window.paperxcel.papers.remove(paper.id),
+      );
       const next = papers.filter((item) => item.id !== paper.id);
       setPapers(next);
-      setMessages((current) => {
-        const remaining = { ...current };
-        delete remaining[paper.id];
-        return remaining;
-      });
       setSelectedId((current) =>
         current === paper.id ? next[0]?.id : current,
       );
@@ -1835,120 +1599,49 @@ export default function App(): React.JSX.Element {
     references: ChatReference[] = paperReferences,
     options?: AskOptions,
   ): Promise<void> => {
+    const cleanQuestion = prompt.trim();
     if (
       !selectedPaper ||
-      !prompt.trim() ||
-      asking ||
+      !cleanQuestion ||
+      chatController.isBusy() ||
       uploadingAttachmentCount > 0
-    ) {
+    )
+      return;
+    if (!provider?.hasApiKey) {
+      setNotice("请先配置可用的 AI 模型与 API Key。");
+      setSettingsOpen(true);
       return;
     }
-    const cleanQuestion = prompt.trim();
-    const task = options?.task ?? (options?.history ? "qa" : composerTask);
+    const paperId = selectedPaper.id;
+    const compact = cleanQuestion.toLowerCase() === "/compact";
     const attachments =
       options?.attachments ?? (options?.history ? [] : composerAttachments);
-    const cleanReferences = references
-      .map((reference) => ({
-        page: reference.page,
-        text: reference.text.replace(/\s+/g, " ").trim(),
-        imageAssetId: reference.imageAssetId,
-        imageDataUrl: reference.imageDataUrl,
-        imageOnly: reference.imageOnly,
-      }))
-      .filter(
-        (reference) =>
-          reference.text || reference.imageAssetId || reference.imageDataUrl,
-      );
-    const persistedReferences: ReferencedSnippet[] = await Promise.all(
-      cleanReferences.map(
-        async ({ page, text, imageAssetId, imageDataUrl, imageOnly }) => {
-          const storedImageId =
-            imageAssetId ||
-            (imageDataUrl
-              ? (await window.paperxcel.selectionImages.save(imageDataUrl)).id
-              : undefined);
-          return {
-            page,
-            text,
-            imageAssetId: storedImageId,
-            imageOnly,
-          };
-        },
-      ),
-    );
-    const shouldReplaceHistory = options?.history !== undefined;
-    const baseMessages = options?.history ?? paperMessages;
-    const userMessage: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: "user",
-      content: cleanReferences.length
-        ? `${cleanQuestion}\n\n引用原文：\n${formatReferencesForMessage(cleanReferences)}`
-        : cleanQuestion,
-      prompt: cleanQuestion,
+    const task = compact
+      ? "compact"
+      : (options?.task ?? (options?.history ? "qa" : composerTask));
+    // submit acquires ownership synchronously, before saving images or loading history.
+    const pending = chatController.submit({
+      paperId,
+      question: cleanQuestion,
+      currentPage,
+      selectedSnippets: references,
       task,
-      attachments: attachments.length ? attachments : undefined,
-      selectedText: persistedReferences[0]?.text,
-      selectedPage: persistedReferences[0]?.page,
-      selectedSnippets: persistedReferences.length
-        ? persistedReferences
-        : undefined,
-      createdAt: new Date().toISOString(),
-    };
-    const paperId = selectedPaper.id;
-    const requestId = crypto.randomUUID();
-    const nextMessages = [...baseMessages, userMessage];
+      attachments,
+      reasoningEffort,
+      history: options?.history,
+    });
     setQuestion("");
-    setPaperReferences([]);
-    setComposerAttachments([]);
-    setComposerTask("qa");
+    if (!compact && options?.history === undefined) {
+      setPaperReferences([]);
+      setComposerAttachments([]);
+      setComposerTask("qa");
+    }
     window.getSelection()?.removeAllRanges();
-    setMessages((current) => ({
-      ...current,
-      [paperId]: nextMessages,
-    }));
-    activeAskRequestRef.current = requestId;
-    setStoppingAsk(false);
-    setAsking(true);
-    beginAskPresentation(
-      task === "repair-markdown"
-        ? "正在准备文件修复"
-        : attachments.length
-          ? "正在上传附件给模型"
-          : "正在准备当前论文 PDF",
-    );
+    scrollToBottom();
     try {
-      if (shouldReplaceHistory) {
-        await persistConversation(paperId, nextMessages);
-      } else {
-        await window.paperxcel.chat.append(paperId, userMessage);
-      }
-      const result = await window.paperxcel.chat.ask({
-        requestId,
-        paperId,
-        question: cleanQuestion,
-        currentPage,
-        selectedText: cleanReferences[0]?.text,
-        selectedPage: cleanReferences[0]?.page,
-        selectedSnippets: persistedReferences,
-        task,
-        attachments,
-        reasoningEffort,
-        messages: baseMessages,
-      });
+      const result = await pending;
       if ("cancelled" in result) return;
-      if (cancelledAskRequestIdsRef.current.has(requestId)) {
-        return;
-      }
-      const completeMessages = [...nextMessages, result.message];
-      if (shouldReplaceHistory) {
-        await persistConversation(paperId, completeMessages);
-      } else {
-        await window.paperxcel.chat.append(paperId, result.message);
-      }
-      setMessages((current) => ({
-        ...current,
-        [paperId]: completeMessages,
-      }));
+      if (compact) setNotice("上下文已压缩，原始聊天记录已保留。");
       if (result.markdownPreview) {
         setMarkdownRefreshTokens((current) => ({
           ...current,
@@ -1959,30 +1652,7 @@ export default function App(): React.JSX.Element {
         }));
       }
     } catch (error) {
-      if (
-        cancelledAskRequestIdsRef.current.has(requestId) ||
-        isAbortError(error)
-      ) {
-        return;
-      }
-      const errorMessage: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: `请求失败：${error instanceof Error ? error.message : String(error)}`,
-        createdAt: new Date().toISOString(),
-      };
-      setMessages((current) => ({
-        ...current,
-        [paperId]: [...nextMessages, errorMessage],
-      }));
-    } finally {
-      if (activeAskRequestRef.current === requestId) {
-        activeAskRequestRef.current = undefined;
-        setStoppingAsk(false);
-        setAsking(false);
-        resetAskPresentation();
-      }
-      cancelledAskRequestIdsRef.current.delete(requestId);
+      setNotice(error instanceof Error ? error.message : String(error));
     }
   };
 
@@ -2006,7 +1676,27 @@ export default function App(): React.JSX.Element {
     cancelEditingMessage();
     await ask(cleanDraft, references, {
       history: paperMessages.slice(0, messageIndex),
+      task: message.task,
+      attachments: message.attachments,
     });
+  };
+
+  const retryAnswer = async (messageIndex: number): Promise<void> => {
+    if (chatController.isBusy()) return;
+    let userIndex = messageIndex - 1;
+    while (userIndex >= 0 && paperMessages[userIndex].role !== "user")
+      userIndex -= 1;
+    if (userIndex < 0) return;
+    const original = paperMessages[userIndex];
+    await ask(
+      extractPromptFromMessage(original),
+      extractReferencesFromMessage(original),
+      {
+        history: paperMessages.slice(0, userIndex),
+        task: original.task,
+        attachments: original.attachments,
+      },
+    );
   };
 
   const reprocessPaper = async (paper = selectedPaper): Promise<void> => {
@@ -2042,8 +1732,12 @@ export default function App(): React.JSX.Element {
   const clearConversation = async (): Promise<void> => {
     if (!selectedId || !paperMessages.length || asking) return;
     if (!window.confirm("清空这篇论文的本地问答记录？")) return;
-    await window.paperxcel.chat.clear(selectedId);
-    setMessages((current) => ({ ...current, [selectedId]: [] }));
+    try {
+      await chatController.clear(selectedId);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+      return;
+    }
     setExpandedCitation(undefined);
     setPaperReferences([]);
     cancelEditingMessage();
@@ -2898,7 +2592,9 @@ export default function App(): React.JSX.Element {
                           }
                         >
                           <ExternalLink size={16} />
-                          在浏览器中打开
+                          {/sci-?hub/i.test(selectedPaper.statusText ?? "")
+                            ? "继续验证并自动导入"
+                            : "在浏览器中打开"}
                         </button>
                       )}
                       <button
@@ -2948,8 +2644,6 @@ export default function App(): React.JSX.Element {
                     provider={provider}
                     refreshToken={markdownRefreshTokens[selectedPaper.id]}
                     onNotice={(message) => setNotice(message)}
-                    onRepairMarkdown={repairMarkdownThroughAssistant}
-                    onCancelRepair={cancelMarkdownThroughAssistant}
                     onTranslateSelection={(selection) => {
                       if (!selection.imageOnly) {
                         void translateSelectedText(selection.text);
@@ -3078,345 +2772,421 @@ export default function App(): React.JSX.Element {
                       </div>
                     )}
                     <div className="chat-scroll" ref={chatScrollRef}>
-                      {!paperMessages.length && (
-                        <div className="chat-start">
-                          <div className="chat-start-heading">
-                            <Bot size={21} />
-                            <span>第 {currentPage} 页</span>
-                          </div>
-                          <div className="prompt-grid">
-                            {prompts.map((item) => (
-                              <button
-                                type="button"
-                                key={item.label}
-                                disabled={selectedPaper.status !== "ready"}
-                                onClick={() =>
-                                  item.task === "repair-markdown"
-                                    ? void prepareMarkdownPrompt()
-                                    : void ask(item.prompt)
-                                }
-                              >
-                                {item.label}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                      {paperMessages.map((message, messageIndex) => {
-                        const evidence = message.citations?.find(
-                          (citation) =>
-                            expandedCitation ===
-                            `${message.id}-${citation.page}`,
-                        );
-                        const canEditMessage =
-                          message.role === "user" &&
-                          !message.attachments?.length;
-                        const isEditing =
-                          canEditMessage && editingMessageId === message.id;
-                        return (
-                          <article
-                            className={`message message-${message.role}`}
-                            key={message.id}
-                          >
-                            <div className="message-label">
-                              {message.role === "user" ? (
-                                <>
-                                  <MessageSquareText size={14} /> 你
-                                </>
-                              ) : (
-                                <>
-                                  <Sparkles size={14} /> PaperXcel
-                                </>
-                              )}
+                      <div className="chat-scroll-content" ref={chatContentRef}>
+                        {!paperMessages.length && (
+                          <div className="chat-start">
+                            <div className="chat-start-heading">
+                              <Bot size={21} />
+                              <span>第 {currentPage} 页</span>
                             </div>
-                            {isEditing ? (
-                              <div className="message-edit-panel">
-                                <textarea
-                                  className="message-edit-textarea"
-                                  rows={3}
-                                  value={editingMessageText}
-                                  placeholder="修改这轮提问"
-                                  disabled={asking}
-                                  onChange={(event) =>
-                                    setEditingMessageText(event.target.value)
+                            <div className="prompt-grid">
+                              {prompts.map((item) => (
+                                <button
+                                  type="button"
+                                  key={item.label}
+                                  disabled={selectedPaper.status !== "ready"}
+                                  onClick={() =>
+                                    item.task === "repair-markdown"
+                                      ? void prepareMarkdownPrompt()
+                                      : void ask(item.prompt)
                                   }
-                                  onKeyDown={(event) => {
-                                    if (
-                                      event.key === "Enter" &&
-                                      !event.shiftKey
-                                    ) {
-                                      event.preventDefault();
-                                      void submitMessageEdit(
-                                        message,
-                                        messageIndex,
-                                      );
-                                    }
-                                    if (event.key === "Escape") {
-                                      event.preventDefault();
-                                      cancelEditingMessage();
-                                    }
-                                  }}
-                                />
-                                {paperReferences.length > 0 && (
-                                  <div
-                                    className="message-edit-references"
-                                    aria-label="正在编辑的引用"
-                                  >
-                                    {paperReferences.map((reference) => (
-                                      <div
-                                        className="message-edit-reference"
-                                        key={reference.id}
-                                      >
-                                        {referenceImageUrl(reference) ? (
-                                          <img
-                                            src={referenceImageUrl(reference)}
-                                            alt=""
-                                          />
-                                        ) : (
-                                          <Quote size={14} />
-                                        )}
-                                        <span>
-                                          <strong>p.{reference.page}</strong>
-                                          {reference.imageOnly
-                                            ? " 图片选区"
-                                            : ` ${reference.text}`}
-                                        </span>
-                                      </div>
-                                    ))}
-                                  </div>
-                                )}
-                                <div className="message-edit-actions">
-                                  <button
-                                    className="message-edit-cancel"
-                                    type="button"
-                                    disabled={asking}
-                                    onClick={cancelEditingMessage}
-                                  >
-                                    取消
-                                  </button>
-                                  <button
-                                    className="message-edit-submit"
-                                    type="button"
-                                    disabled={
-                                      asking || !editingMessageText.trim()
-                                    }
-                                    onClick={() =>
-                                      void submitMessageEdit(
-                                        message,
-                                        messageIndex,
-                                      )
-                                    }
-                                  >
-                                    发送
-                                  </button>
-                                </div>
-                              </div>
-                            ) : (
-                              <>
-                                {message.role === "assistant" &&
-                                  (message.reasoningContent ||
-                                    message.processingDurationMs !==
-                                      undefined) && (
-                                    <ThinkingBlock
-                                      content={message.reasoningContent}
-                                      durationMs={message.processingDurationMs}
-                                    />
-                                  )}
-                                <div className="message-content">
-                                  {message.role === "assistant" ? (
-                                    <MarkdownMessage
-                                      content={message.content}
-                                    />
-                                  ) : (
-                                    <>
-                                      <div className="message-user-prompt">
-                                        {extractPromptFromMessage(message)}
-                                      </div>
-                                      {message.attachments?.map(
-                                        (attachment) => (
-                                          <div
-                                            className="message-user-file"
-                                            key={`${message.id}-${attachment.id}`}
-                                          >
-                                            <FileText size={15} />
-                                            <span>
-                                              {getAttachmentDisplayName(
-                                                attachment,
-                                              )}
-                                            </span>
-                                            <small>
-                                              {formatAttachmentSize(
-                                                attachment.size,
-                                              )}
-                                            </small>
-                                          </div>
-                                        ),
-                                      )}
-                                      {extractReferencesFromMessage(message)
-                                        .length > 0 && (
-                                        <div
-                                          className="message-user-references"
-                                          aria-label="已发送的引用"
-                                        >
-                                          {extractReferencesFromMessage(
-                                            message,
-                                          ).map((reference, referenceIndex) => (
-                                            <button
-                                              className="message-user-reference"
-                                              type="button"
-                                              key={`${message.id}-${referenceIndex}`}
-                                              title={`查看第 ${reference.page} 页引用`}
-                                              onClick={() =>
-                                                setCurrentPage(reference.page)
-                                              }
-                                            >
-                                              {referenceImageUrl(reference) ? (
-                                                <img
-                                                  src={referenceImageUrl(
-                                                    reference,
-                                                  )}
-                                                  alt={`第 ${reference.page} 页图片选区`}
-                                                />
-                                              ) : (
-                                                <Quote size={14} />
-                                              )}
-                                              <span>
-                                                p.{reference.page} ·{" "}
-                                                {reference.imageOnly
-                                                  ? "图片选区"
-                                                  : reference.text}
-                                              </span>
-                                            </button>
-                                          ))}
-                                        </div>
-                                      )}
-                                    </>
-                                  )}
-                                </div>
-                                <div
-                                  className="message-actions"
-                                  aria-label="消息操作"
                                 >
-                                  <span className="message-time">
-                                    {formatMessageTime(message.createdAt)}
-                                  </span>
-                                  <button
-                                    className={`message-action-button ${
-                                      copiedMessageId === message.id
-                                        ? "copied"
-                                        : ""
-                                    }`}
-                                    type="button"
-                                    title={
-                                      copiedMessageId === message.id
-                                        ? "已复制"
-                                        : "复制"
+                                  {item.label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {paperMessages.map((message, messageIndex) => {
+                          const evidence = message.citations?.find(
+                            (citation) =>
+                              expandedCitation ===
+                              `${message.id}-${citation.page}`,
+                          );
+                          const canEditMessage = message.role === "user";
+                          const isEditing =
+                            canEditMessage && editingMessageId === message.id;
+                          return (
+                            <article
+                              className={`message message-${message.role}`}
+                              key={message.id}
+                            >
+                              <div className="message-label">
+                                {message.role === "user" ? (
+                                  <>
+                                    <MessageSquareText size={14} /> 你
+                                  </>
+                                ) : (
+                                  <>
+                                    <Sparkles size={14} /> PaperXcel
+                                  </>
+                                )}
+                              </div>
+                              {isEditing ? (
+                                <div className="message-edit-panel">
+                                  <textarea
+                                    className="message-edit-textarea"
+                                    rows={3}
+                                    value={editingMessageText}
+                                    placeholder="修改这轮提问"
+                                    disabled={asking}
+                                    onChange={(event) =>
+                                      setEditingMessageText(event.target.value)
                                     }
-                                    onClick={() => void copyMessage(message)}
-                                  >
-                                    {copiedMessageId === message.id ? (
-                                      <Check size={14} />
-                                    ) : (
-                                      <Copy size={14} />
-                                    )}
-                                  </button>
-                                  {canEditMessage && (
+                                    onKeyDown={(event) => {
+                                      if (
+                                        !event.nativeEvent.isComposing &&
+                                        event.key === "Enter" &&
+                                        !event.shiftKey
+                                      ) {
+                                        event.preventDefault();
+                                        void submitMessageEdit(
+                                          message,
+                                          messageIndex,
+                                        );
+                                      }
+                                      if (event.key === "Escape") {
+                                        event.preventDefault();
+                                        cancelEditingMessage();
+                                      }
+                                    }}
+                                  />
+                                  {paperReferences.length > 0 && (
+                                    <div
+                                      className="message-edit-references"
+                                      aria-label="正在编辑的引用"
+                                    >
+                                      {paperReferences.map((reference) => (
+                                        <div
+                                          className="message-edit-reference"
+                                          key={reference.id}
+                                        >
+                                          {referenceImageUrl(reference) ? (
+                                            <img
+                                              src={referenceImageUrl(reference)}
+                                              alt=""
+                                            />
+                                          ) : (
+                                            <Quote size={14} />
+                                          )}
+                                          <span>
+                                            <strong>p.{reference.page}</strong>
+                                            {reference.imageOnly
+                                              ? " 图片选区"
+                                              : ` ${reference.text}`}
+                                          </span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                  <div className="message-edit-actions">
                                     <button
-                                      className="message-action-button"
+                                      className="message-edit-cancel"
                                       type="button"
-                                      title="编辑"
                                       disabled={asking}
+                                      onClick={cancelEditingMessage}
+                                    >
+                                      取消
+                                    </button>
+                                    <button
+                                      className="message-edit-submit"
+                                      type="button"
+                                      disabled={
+                                        asking || !editingMessageText.trim()
+                                      }
                                       onClick={() =>
-                                        startEditingMessage(message)
+                                        void submitMessageEdit(
+                                          message,
+                                          messageIndex,
+                                        )
                                       }
                                     >
-                                      <Pencil size={14} />
+                                      发送
                                     </button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <>
+                                  {message.role === "assistant" &&
+                                    message.processingDurationMs !==
+                                      undefined && (
+                                      <ProcessingSummary
+                                        durationMs={
+                                          message.processingDurationMs
+                                        }
+                                      />
+                                    )}
+                                  {message.role === "assistant" &&
+                                  message.tokenUsage ? (
+                                    <TokenUsageSummary
+                                      usage={message.tokenUsage}
+                                    />
+                                  ) : null}
+                                  {message.role === "assistant" &&
+                                  message.agentTrace?.length ? (
+                                    <>
+                                      <PaperResearchPlanView
+                                        events={message.agentTrace}
+                                      />
+                                      <AgentExecutionTrace
+                                        events={message.agentTrace}
+                                      />
+                                    </>
+                                  ) : null}
+                                  <div className="message-content">
+                                    {message.role === "assistant" ? (
+                                      <MarkdownMessage
+                                        content={message.content}
+                                      />
+                                    ) : (
+                                      <>
+                                        <div className="message-user-prompt">
+                                          {extractPromptFromMessage(message)}
+                                        </div>
+                                        {message.attachments?.map(
+                                          (attachment) => (
+                                            <div
+                                              className="message-user-file"
+                                              key={`${message.id}-${attachment.id}`}
+                                            >
+                                              <FileText size={15} />
+                                              <span>
+                                                {getAttachmentDisplayName(
+                                                  attachment,
+                                                )}
+                                              </span>
+                                              <small>
+                                                {formatAttachmentSize(
+                                                  attachment.size,
+                                                )}
+                                              </small>
+                                            </div>
+                                          ),
+                                        )}
+                                        {extractReferencesFromMessage(message)
+                                          .length > 0 && (
+                                          <div
+                                            className="message-user-references"
+                                            aria-label="已发送的引用"
+                                          >
+                                            {extractReferencesFromMessage(
+                                              message,
+                                            ).map(
+                                              (reference, referenceIndex) => (
+                                                <button
+                                                  className="message-user-reference"
+                                                  type="button"
+                                                  key={`${message.id}-${referenceIndex}`}
+                                                  title={`查看第 ${reference.page} 页引用`}
+                                                  onClick={() =>
+                                                    setCurrentPage(
+                                                      reference.page,
+                                                    )
+                                                  }
+                                                >
+                                                  {referenceImageUrl(
+                                                    reference,
+                                                  ) ? (
+                                                    <img
+                                                      src={referenceImageUrl(
+                                                        reference,
+                                                      )}
+                                                      alt={`第 ${reference.page} 页图片选区`}
+                                                    />
+                                                  ) : (
+                                                    <Quote size={14} />
+                                                  )}
+                                                  <span>
+                                                    p.{reference.page} ·{" "}
+                                                    {reference.imageOnly
+                                                      ? "图片选区"
+                                                      : reference.text}
+                                                  </span>
+                                                </button>
+                                              ),
+                                            )}
+                                          </div>
+                                        )}
+                                      </>
+                                    )}
+                                  </div>
+                                  {(message.status === "cancelled" ||
+                                    message.status === "error") && (
+                                    <div
+                                      className="chat-message-outcome"
+                                      role="status"
+                                    >
+                                      <CircleAlert size={14} />
+                                      <span>
+                                        {message.status === "cancelled"
+                                          ? "已停止 · 此回答未完成"
+                                          : `本轮未完成 · ${message.error || "请重试"}`}
+                                      </span>
+                                    </div>
                                   )}
-                                </div>
-                              </>
-                            )}
-                            {!isEditing &&
-                              message.citations &&
-                              message.citations.length > 0 && (
-                                <div className="citation-list">
-                                  {message.citations.map((citation) => {
-                                    const citationId = `${message.id}-${citation.page}`;
-                                    return (
+                                  {message.role === "assistant" &&
+                                  message.citationVerification?.status ===
+                                    "unverified" ? (
+                                    <div
+                                      className="citation-verification-warning"
+                                      role="status"
+                                    >
+                                      <CircleAlert size={14} />
+                                      <span>
+                                        {message.citationVerification.detail}
+                                      </span>
+                                    </div>
+                                  ) : null}
+                                  <div
+                                    className="message-actions"
+                                    aria-label="消息操作"
+                                  >
+                                    <span className="message-time">
+                                      {formatMessageTime(message.createdAt)}
+                                    </span>
+                                    <button
+                                      className={`message-action-button ${
+                                        copiedMessageId === message.id
+                                          ? "copied"
+                                          : ""
+                                      }`}
+                                      type="button"
+                                      title={
+                                        copiedMessageId === message.id
+                                          ? "已复制"
+                                          : "复制"
+                                      }
+                                      onClick={() => void copyMessage(message)}
+                                    >
+                                      {copiedMessageId === message.id ? (
+                                        <Check size={14} />
+                                      ) : (
+                                        <Copy size={14} />
+                                      )}
+                                    </button>
+                                    {canEditMessage && (
                                       <button
-                                        className={
-                                          expandedCitation === citationId
-                                            ? "active"
-                                            : ""
-                                        }
+                                        className="message-action-button"
                                         type="button"
-                                        key={citationId}
-                                        title={`跳转至第 ${citation.page} 页并查看证据`}
-                                        aria-expanded={
-                                          expandedCitation === citationId
+                                        title="编辑"
+                                        disabled={asking}
+                                        onClick={() =>
+                                          startEditingMessage(message)
                                         }
-                                        onClick={() => {
-                                          setCurrentPage(citation.page);
-                                          setExpandedCitation((current) =>
-                                            citation.excerpt &&
-                                            current !== citationId
-                                              ? citationId
-                                              : undefined,
-                                          );
-                                        }}
                                       >
-                                        p.{citation.page}
+                                        <Pencil size={14} />
                                       </button>
-                                    );
-                                  })}
+                                    )}
+                                    {message.role === "assistant" &&
+                                      message.task !== "compact" &&
+                                      messageIndex ===
+                                        paperMessages.length - 1 && (
+                                        <button
+                                          className="message-action-button"
+                                          type="button"
+                                          title="重新生成"
+                                          aria-label="重新生成"
+                                          disabled={asking}
+                                          onClick={() =>
+                                            void retryAnswer(messageIndex)
+                                          }
+                                        >
+                                          <RefreshCw size={14} />
+                                        </button>
+                                      )}
+                                  </div>
+                                </>
+                              )}
+                              {!isEditing &&
+                                message.citations &&
+                                message.citations.length > 0 && (
+                                  <div className="citation-list">
+                                    {message.citations.map((citation) => {
+                                      const citationId = `${message.id}-${citation.page}`;
+                                      return (
+                                        <button
+                                          className={
+                                            expandedCitation === citationId
+                                              ? "active"
+                                              : ""
+                                          }
+                                          type="button"
+                                          key={citationId}
+                                          title={`跳转至第 ${citation.page} 页并查看证据`}
+                                          aria-expanded={
+                                            expandedCitation === citationId
+                                          }
+                                          onClick={() => {
+                                            setCurrentPage(citation.page);
+                                            setExpandedCitation((current) =>
+                                              citation.excerpt &&
+                                              current !== citationId
+                                                ? citationId
+                                                : undefined,
+                                            );
+                                          }}
+                                        >
+                                          p.{citation.page}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              {!isEditing && evidence?.excerpt && (
+                                <div className="citation-evidence">
+                                  <div>
+                                    <Quote size={13} />
+                                    <strong>
+                                      原文证据 · p.{evidence.page}
+                                    </strong>
+                                  </div>
+                                  <p>{evidence.excerpt}</p>
                                 </div>
                               )}
-                            {!isEditing && evidence?.excerpt && (
-                              <div className="citation-evidence">
-                                <div>
-                                  <Quote size={13} />
-                                  <strong>原文证据 · p.{evidence.page}</strong>
-                                </div>
-                                <p>{evidence.excerpt}</p>
-                              </div>
-                            )}
-                          </article>
-                        );
-                      })}
-                      {asking && (
-                        <article className="message message-assistant pending-message">
-                          {askReasoning && (
-                            <ThinkingBlock
-                              content={askReasoning}
-                              durationMs={askElapsedMs}
-                              isStreaming
-                            />
-                          )}
-                          {!askReasoning && !askAnswer && (
-                            <div className="pending-status" role="status">
-                              <LoaderCircle className="spin" size={15} />
-                              <span>{askProgress || "等待模型响应"}</span>
-                              {formatProcessingDuration(askElapsedMs) && (
-                                <small>
-                                  {formatProcessingDuration(askElapsedMs)}
-                                </small>
-                              )}
-                            </div>
-                          )}
-                          {askAnswer && (
-                            <div className="message-content pending-answer-content">
-                              <MarkdownMessage content={askAnswer} />
-                            </div>
-                          )}
-                        </article>
-                      )}
+                            </article>
+                          );
+                        })}
+                        <ChatStreamView
+                          store={chatController}
+                          paperId={selectedPaper.id}
+                        />
+                      </div>
                     </div>
+                    {!isAtBottom && (
+                      <button
+                        className="chat-scroll-to-bottom"
+                        type="button"
+                        onClick={scrollToBottom}
+                      >
+                        <ChevronDown size={14} /> 回到最新消息
+                      </button>
+                    )}
+                    {activity && activity.paperId !== selectedPaper.id && (
+                      <div className="chat-background-run" role="status">
+                        <span>
+                          另一篇论文的任务正在{stoppingAsk ? "停止" : "进行"}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedId(activity.paperId)}
+                        >
+                          查看任务
+                        </button>
+                        <button
+                          type="button"
+                          disabled={stoppingAsk}
+                          onClick={() => void stopAsking()}
+                        >
+                          停止
+                        </button>
+                      </div>
+                    )}
                     <div className="composer">
                       <div className="composer-context">
                         <span>当前页 p.{currentPage}</span>
                         <span>
                           {selectedPaper.fileName
-                            ? "自动附带当前 PDF"
+                            ? "按需使用当前 PDF · 优先页级证据"
                             : selectedPaper.statusText}
                         </span>
                       </div>
@@ -3508,9 +3278,13 @@ export default function App(): React.JSX.Element {
                           onChange={(event) => setQuestion(event.target.value)}
                           onPaste={handleChatPaste}
                           onKeyDown={(event) => {
-                            if (event.key === "Enter" && !event.shiftKey) {
+                            if (
+                              event.key === "Enter" &&
+                              !event.shiftKey &&
+                              !event.nativeEvent.isComposing
+                            ) {
                               event.preventDefault();
-                              void ask();
+                              void ask(questionRef.current?.value ?? "");
                             }
                           }}
                         />
@@ -3694,10 +3468,13 @@ export default function App(): React.JSX.Element {
                               asking
                                 ? stoppingAsk
                                 : !question.trim() ||
-                                  selectedPaper.status !== "ready"
+                                  selectedPaper.status !== "ready" ||
+                                  uploadingAttachmentCount > 0
                             }
                             onClick={() =>
-                              asking ? void stopAsking() : void ask()
+                              asking
+                                ? void stopAsking()
+                                : void ask(questionRef.current?.value ?? "")
                             }
                           >
                             {asking ? (
@@ -3861,76 +3638,48 @@ export default function App(): React.JSX.Element {
   );
 }
 
-function ThinkingBlock({
-  content,
+function ProcessingSummary({
   durationMs,
-  isStreaming = false,
+  reasoningObserved,
 }: {
-  content?: string;
   durationMs?: number;
-  isStreaming?: boolean;
+  reasoningObserved?: boolean;
 }): React.JSX.Element {
-  const [expanded, setExpanded] = useState(isStreaming);
-  const hasReasoning = Boolean(content?.trim());
   const duration = formatProcessingDuration(durationMs);
-  const title = isStreaming
-    ? `模型推理中${duration ? ` ${duration}` : ""}`
-    : hasReasoning
-      ? `模型推理${duration ? ` · ${duration}` : ""}`
-      : `已处理${duration ? ` ${duration}` : ""}`;
-
-  useEffect(() => {
-    if (isStreaming) setExpanded(true);
-  }, [isStreaming]);
-
-  if (!hasReasoning) {
-    return <div className="processing-duration">{title}</div>;
-  }
-
   return (
-    <section className={`thinking-block${isStreaming ? " is-streaming" : ""}`}>
-      <button
-        className="thinking-block-toggle"
-        type="button"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
-      >
-        {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        <span>{title}</span>
-      </button>
-      {expanded && (
-        <div className="thinking-block-content">
-          <div className="thinking-summary">
-            <MarkdownMessage content={content ?? ""} />
-          </div>
-        </div>
+    <div className="processing-duration">
+      {duration ? `已用时 ${duration}` : "处理完成"}
+      {reasoningObserved && (
+        <span title="服务商实际返回了推理内容或非零推理 Token">
+          {" "}
+          · 已收到推理信号
+        </span>
       )}
-    </section>
+    </div>
   );
 }
 
-function MarkdownMessage({ content }: { content: string }): React.JSX.Element {
-  const normalizedContent = normalizeMarkdownMath(content);
-
+function TokenUsageSummary({
+  usage,
+}: {
+  usage: TokenUsage;
+}): React.JSX.Element {
+  const cacheLabel = usage.cachedInputTokens
+    ? `，缓存命中 ${formatTokenCount(usage.cachedInputTokens)}`
+    : "";
   return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
-      rehypePlugins={[rehypeKatex]}
-      components={{
-        a: (props) => <a {...props} target="_blank" rel="noreferrer" />,
-      }}
+    <div
+      className="token-usage-summary"
+      title={`输入 ${usage.inputTokens}，输出 ${usage.outputTokens}，推理 ${usage.reasoningTokens}，总计 ${usage.totalTokens}`}
     >
-      {normalizedContent}
-    </ReactMarkdown>
+      Token {formatTokenCount(usage.totalTokens)}
+      {cacheLabel}
+    </div>
   );
 }
 
-function isAbortError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return (
-    error.name === "AbortError" ||
-    /aborted|aborterror|cancelled|canceled/i.test(error.message)
-  );
+function formatTokenCount(value: number): string {
+  return value.toLocaleString("zh-CN");
 }
 
 function formatAttachmentSize(bytes: number): string {

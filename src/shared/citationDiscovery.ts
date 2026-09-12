@@ -31,6 +31,7 @@ export interface RankCitationDiscoveryInput {
 
 export const CITATION_DISCOVERY_MAX_CANDIDATES = 400;
 export const CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES = 800;
+export const CITATION_DISCOVERY_PURE_SEARCH_DEFAULT_CANDIDATES = 250;
 export const CITATION_DISCOVERY_PAGE_SIZE = 50;
 
 const CONTENT_MATCH_MAX_SCORE: Record<CitationContentMatchPriority, number> = {

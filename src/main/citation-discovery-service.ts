@@ -99,31 +99,30 @@ export async function discoverCitationWorks({
     ? [effectiveQuery]
     : buildCitationDiscoveryQueries(papers, effectiveQuery);
 
-  const searchLimit = Math.max(20, Math.min(100, requestedLimit));
+  const searchLimit = pureSearch
+    ? 50
+    : Math.max(20, Math.min(100, requestedLimit));
   const primaryQueryPageCount = Math.max(
     1,
     Math.min(4, Math.ceil(requestedLimit / searchLimit)),
   );
   const pureSearchPageCount = Math.max(
     1,
-    Math.min(8, Math.ceil(requestedLimit / searchLimit)),
-  );
-  const pureSearchVariantPageCount = Math.max(
-    1,
-    Math.ceil(pureSearchPageCount / 2),
+    Math.min(16, Math.ceil(requestedLimit / searchLimit)),
   );
   const searchRequests: Array<{
     searchQuery: string;
     page: number;
     sort?: "relevance" | "publication-date";
   }> = pureSearch
-    ? (["relevance", "publication-date"] as const).flatMap((sort) =>
-        Array.from({ length: pureSearchVariantPageCount }, (_, pageIndex) => ({
-          searchQuery: queries[0],
-          page: pageIndex + 1,
-          sort,
-        })),
-      )
+    ? Array.from({ length: pureSearchPageCount }, (_, requestIndex) => ({
+        searchQuery: queries[0],
+        page: Math.floor(requestIndex / 2) + 1,
+        sort:
+          requestIndex % 2 === 0
+            ? ("relevance" as const)
+            : ("publication-date" as const),
+      }))
     : queries.flatMap((searchQuery, queryIndex) =>
         Array.from(
           { length: queryIndex === 0 ? primaryQueryPageCount : 1 },

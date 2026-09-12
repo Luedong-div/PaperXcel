@@ -507,6 +507,25 @@ export const DEFAULT_SCIHUB_MIRRORS = [
   "https://sci-hub.box",
 ];
 
+export function isScihubPageUrl(
+  value: string,
+  mirrors: string[] = DEFAULT_SCIHUB_MIRRORS,
+): boolean {
+  try {
+    const hostname = new URL(value).hostname.toLocaleLowerCase();
+    if (hostname.includes("sci-hub")) return true;
+    return mirrors.some((mirror) => {
+      try {
+        return new URL(mirror).hostname.toLocaleLowerCase() === hostname;
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return false;
+  }
+}
+
 const SCIHUB_BLOCK_TOKENS = [
   "scientific mutual aid community",
   "you can request this article",

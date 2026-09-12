@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer, webUtils } from "electron";
 import type {
   AskPaperInput,
   AskPaperResponse,
+  AgentEvent,
   ChatAttachment,
   ChatMessage,
   ChatProgress,
@@ -16,7 +17,9 @@ import type {
   CitationGraphSnapshot,
   CitationNetworkAnalysis,
   GeneratePaperNoteResult,
+  GeneratePaperNoteCancelled,
   GenerateLibraryReviewInput,
+  GenerateLibraryReviewCancelled,
   ImportPdfInput,
   KnowledgeBaseExportCancelled,
   KnowledgeBaseExportOptions,
@@ -24,6 +27,7 @@ import type {
   KnowledgeBaseMarkdownPreview,
   KnowledgeBaseMarkdownRepairResult,
   KnowledgeBaseRepairProgress,
+  KnowledgeBaseMarkdownStream,
   LibraryAskInput,
   LibraryAskResult,
   LibraryReview,
@@ -154,6 +158,14 @@ const api: PaperXcelApi = {
       ipcRenderer.on("chat:progress", handler);
       return () => ipcRenderer.removeListener("chat:progress", handler);
     },
+    onAgentEvent: (listener: (event: AgentEvent) => void) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        agentEvent: AgentEvent,
+      ): void => listener(agentEvent);
+      ipcRenderer.on("chat:agent-event", handler);
+      return () => ipcRenderer.removeListener("chat:agent-event", handler);
+    },
   },
   selectionImages: {
     save: (dataUrl: string): Promise<{ id: string; url: string }> =>
@@ -177,15 +189,40 @@ const api: PaperXcelApi = {
       ipcRenderer.invoke("notes:get", paperId),
     save: (paperId: string, content: string): Promise<PaperNote> =>
       ipcRenderer.invoke("notes:save", paperId, content),
-    generate: (paperId: string): Promise<GeneratePaperNoteResult> =>
-      ipcRenderer.invoke("notes:generate", paperId),
+    generate: (
+      paperId: string,
+      requestId: string,
+    ): Promise<GeneratePaperNoteResult | GeneratePaperNoteCancelled> =>
+      ipcRenderer.invoke("notes:generate", paperId, requestId),
+    cancel: (requestId: string): Promise<boolean> =>
+      ipcRenderer.invoke("notes:cancel", requestId),
+    onAgentEvent: (listener: (event: AgentEvent) => void) => {
+      const wrapped = (
+        _event: Electron.IpcRendererEvent,
+        agentEvent: AgentEvent,
+      ): void => listener(agentEvent);
+      ipcRenderer.on("notes:agent-event", wrapped);
+      return () => ipcRenderer.removeListener("notes:agent-event", wrapped);
+    },
     exportMarkdown: (paperId: string): Promise<boolean> =>
       ipcRenderer.invoke("notes:export-markdown", paperId),
   },
   reviews: {
     list: (): Promise<LibraryReview[]> => ipcRenderer.invoke("reviews:list"),
-    generate: (input: GenerateLibraryReviewInput): Promise<LibraryReview> =>
+    generate: (
+      input: GenerateLibraryReviewInput,
+    ): Promise<LibraryReview | GenerateLibraryReviewCancelled> =>
       ipcRenderer.invoke("reviews:generate", input),
+    cancel: (requestId: string): Promise<boolean> =>
+      ipcRenderer.invoke("reviews:cancel", requestId),
+    onAgentEvent: (listener: (event: AgentEvent) => void) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        agentEvent: AgentEvent,
+      ): void => listener(agentEvent);
+      ipcRenderer.on("reviews:agent-event", handler);
+      return () => ipcRenderer.removeListener("reviews:agent-event", handler);
+    },
     remove: (reviewId: string): Promise<void> =>
       ipcRenderer.invoke("reviews:remove", reviewId),
     exportMarkdown: (reviewId: string): Promise<boolean> =>
@@ -199,8 +236,11 @@ const api: PaperXcelApi = {
     > => ipcRenderer.invoke("knowledge-base:export", options),
     cancel: (requestId: string): Promise<boolean> =>
       ipcRenderer.invoke("knowledge-base:cancel", requestId),
-    previewMarkdown: (paperId: string): Promise<KnowledgeBaseMarkdownPreview> =>
-      ipcRenderer.invoke("knowledge-base:preview-markdown", paperId),
+    previewMarkdown: (
+      paperId: string,
+      version?: "ai" | "original",
+    ): Promise<KnowledgeBaseMarkdownPreview> =>
+      ipcRenderer.invoke("knowledge-base:preview-markdown", paperId, version),
     repairMarkdown: (
       paperId: string,
       requestId?: string,
@@ -215,29 +255,64 @@ const api: PaperXcelApi = {
       return () =>
         ipcRenderer.removeListener("knowledge-base:progress", handler);
     },
+    onAgentEvent: (listener: (event: AgentEvent) => void) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        agentEvent: AgentEvent,
+      ): void => listener(agentEvent);
+      ipcRenderer.on("knowledge-base:agent-event", handler);
+      return () =>
+        ipcRenderer.removeListener("knowledge-base:agent-event", handler);
+    },
+    onMarkdownPreview: (
+      listener: (event: KnowledgeBaseMarkdownStream) => void,
+    ) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        streamEvent: KnowledgeBaseMarkdownStream,
+      ): void => listener(streamEvent);
+      ipcRenderer.on("knowledge-base:markdown-preview", handler);
+      return () =>
+        ipcRenderer.removeListener("knowledge-base:markdown-preview", handler);
+    },
   },
   search: {
     library: (input: LibrarySearchInput): Promise<LibrarySearchHit[]> =>
       ipcRenderer.invoke("search:library", input),
     askLibrary: (input: LibraryAskInput): Promise<LibraryAskResult> =>
       ipcRenderer.invoke("search:ask-library", input),
+    cancelAskLibrary: (requestId: string): Promise<boolean> =>
+      ipcRenderer.invoke("search:cancel-ask-library", requestId),
+    onProgress: (listener: (progress: ChatProgress) => void) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        progress: ChatProgress,
+      ): void => listener(progress);
+      ipcRenderer.on("search:progress", handler);
+      return () => ipcRenderer.removeListener("search:progress", handler);
+    },
+    onAgentEvent: (listener: (event: AgentEvent) => void) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        agentEvent: AgentEvent,
+      ): void => listener(agentEvent);
+      ipcRenderer.on("search:agent-event", handler);
+      return () => ipcRenderer.removeListener("search:agent-event", handler);
+    },
   },
   settings: {
     getScihubEnabled: (): Promise<boolean> =>
       ipcRenderer.invoke("settings:get-scihub-enabled"),
     setScihubEnabled: (enabled: boolean): Promise<boolean> =>
       ipcRenderer.invoke("settings:set-scihub-enabled", enabled),
+    getScihubSessionStatus: () =>
+      ipcRenderer.invoke("settings:get-scihub-session-status"),
+    clearScihubSession: () =>
+      ipcRenderer.invoke("settings:clear-scihub-session"),
     getPreprintFallbackEnabled: (): Promise<boolean> =>
       ipcRenderer.invoke("settings:get-preprint-fallback-enabled"),
     setPreprintFallbackEnabled: (enabled: boolean): Promise<boolean> =>
       ipcRenderer.invoke("settings:set-preprint-fallback-enabled", enabled),
-    getCitationAiOptimizationEnabled: (): Promise<boolean> =>
-      ipcRenderer.invoke("settings:get-citation-ai-optimization-enabled"),
-    setCitationAiOptimizationEnabled: (enabled: boolean): Promise<boolean> =>
-      ipcRenderer.invoke(
-        "settings:set-citation-ai-optimization-enabled",
-        enabled,
-      ),
     getCitationContentMatchPriority:
       (): Promise<CitationContentMatchPriority> =>
         ipcRenderer.invoke("settings:get-citation-content-match-priority"),
@@ -280,6 +355,14 @@ const api: PaperXcelApi = {
       ipcRenderer.invoke("citation-graph:analyze", paperIds, options),
     openGoogleScholar: (query: string): Promise<boolean> =>
       ipcRenderer.invoke("citation-graph:open-google-scholar", query),
+    searchGoogleScholar: (
+      input: CitationDiscoveryInput,
+    ): Promise<CitationDiscoveryResult> =>
+      ipcRenderer.invoke("citation-graph:search-google-scholar", input),
+    importGoogleScholarText: (
+      input: CitationDiscoveryInput & { text: string },
+    ): Promise<CitationDiscoveryResult> =>
+      ipcRenderer.invoke("citation-graph:import-google-scholar-text", input),
     clear: (): Promise<CitationGraphClearResult> =>
       ipcRenderer.invoke("citation-graph:clear"),
     export: (request: CitationGraphExportRequest): Promise<boolean> =>
@@ -302,6 +385,7 @@ const api: PaperXcelApi = {
   clipboard: {
     writeText: (text: string): Promise<void> =>
       ipcRenderer.invoke("clipboard:write-text", text).then(() => undefined),
+    readText: (): Promise<string> => ipcRenderer.invoke("clipboard:read-text"),
   },
   events: {
     onPaperUpdated: (listener: (paper: Paper) => void) => {

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   Check,
+  ClipboardPaste,
   Compass,
   Copy,
   ChevronLeft,
@@ -28,6 +29,10 @@ interface CitationDiscoveryPanelProps {
   onOpenDetails: (work: CitationGraphNode) => void;
   onOpenSource: (sourceUrl: string) => void;
   onOpenGoogleScholar: () => void;
+  onImportGoogleScholar?: () => void;
+  onLoadMore?: (amount: 50 | 100) => void;
+  resultLimit?: number;
+  maxResultLimit?: number;
 }
 
 const reasonLabels: Record<CitationDiscoveryReason, string> = {
@@ -52,6 +57,10 @@ export function CitationDiscoveryPanel({
   onOpenDetails,
   onOpenSource,
   onOpenGoogleScholar,
+  onImportGoogleScholar,
+  onLoadMore,
+  resultLimit,
+  maxResultLimit,
 }: CitationDiscoveryPanelProps): React.JSX.Element {
   const [copiedDoi, setCopiedDoi] = useState<string>();
   const [sort, setSort] = useState<DiscoverySort>("relevance");
@@ -154,15 +163,55 @@ export function CitationDiscoveryPanel({
           <strong>{result.candidates.length} 篇候选</strong>
         </div>
         <div className="citation-discovery-summary-actions">
+          {mode === "pure-search" && onLoadMore && (
+            <div className="citation-discovery-load-more">
+              <span>当前上限 {resultLimit ?? result.candidates.length}</span>
+              <button
+                type="button"
+                disabled={
+                  loading ||
+                  (resultLimit ?? 0) >=
+                    (maxResultLimit ?? Number.MAX_SAFE_INTEGER)
+                }
+                onClick={() => onLoadMore(50)}
+              >
+                +50
+              </button>
+              <button
+                type="button"
+                disabled={
+                  loading ||
+                  (resultLimit ?? 0) >=
+                    (maxResultLimit ?? Number.MAX_SAFE_INTEGER)
+                }
+                onClick={() => onLoadMore(100)}
+              >
+                +100
+              </button>
+            </div>
+          )}
           <button
             className="citation-discovery-scholar"
             type="button"
-            title="在 Google Scholar 网页中继续检索"
+            title="打开交互式 Google Scholar 窗口；可翻页采集，关闭窗口后导入标题"
+            disabled={loading}
             onClick={onOpenGoogleScholar}
           >
             <ExternalLink size={13} />
-            Google Scholar
+            Scholar 多页采集
           </button>
+          {onImportGoogleScholar && (
+            <button
+              className="citation-discovery-scholar"
+              type="button"
+              title="从剪贴板导入 Google Scholar 标题"
+              disabled={loading}
+              onClick={onImportGoogleScholar}
+            >
+              <ClipboardPaste size={13} />
+              导入标题
+            </button>
+          )}
           <label className="citation-discovery-sort">
             <span>排序</span>
             <select
@@ -371,11 +420,11 @@ function GoogleScholarButton({
     <button
       className="citation-discovery-scholar"
       type="button"
-      title="在 Google Scholar 网页中搜索"
+      title="打开交互式 Google Scholar 窗口；可翻页采集，关闭窗口后导入标题"
       onClick={onClick}
     >
       <ExternalLink size={13} />
-      Google Scholar
+      Scholar 多页采集
     </button>
   );
 }

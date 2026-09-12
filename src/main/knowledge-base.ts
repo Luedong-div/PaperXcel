@@ -663,7 +663,6 @@ function buildReadme(paperCount: number, noteCount: number): string {
 - \`papers/<序号-标题>/ai_repair.json\`：单篇 AI 修复记录、模型与警告
 - \`papers/<序号-标题>/notes.md\`：PaperXcel 阅读笔记
 - \`metadata_index.json\`：全库元数据索引
-- \`citation_graph.json\`：正式引文图谱；AI 只校对现有节点元数据，不改引用边
 - \`citation_graph.raw.json\`：AI 修复导出时保留的原始引文图谱
 - \`reviews/\`：全库综述
 - \`query.mjs\`：离线查询脚本

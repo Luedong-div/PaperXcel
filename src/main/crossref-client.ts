@@ -9,7 +9,7 @@ interface CrossrefDateParts {
 
 interface CrossrefWorkPayload {
   DOI?: string;
-  title?: string[];
+  title?: string[] | string;
   author?: Array<{
     given?: string;
     family?: string;
@@ -139,7 +139,8 @@ export function parseCrossrefWork(
   payload?: CrossrefWorkPayload,
 ): CrossrefWorkRecord | undefined {
   if (!payload) return undefined;
-  const title = payload.title?.find((value) => value.trim())?.trim();
+  const titleValues = Array.isArray(payload.title) ? payload.title : [payload.title];
+  const title = titleValues.find((value) => typeof value === "string" && value.trim())?.trim();
   const doi = normalizeCitationDoi(payload.DOI);
   const authors = (payload.author ?? [])
     .map((author) => {

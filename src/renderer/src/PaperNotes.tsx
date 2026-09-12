@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
+import rehypeRaw from "rehype-raw";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -11,8 +12,9 @@ import {
   NotebookPen,
   PencilLine,
   Sparkles,
+  Square,
 } from "lucide-react";
-import type { Paper } from "../../shared/contracts";
+import type { AgentEvent, Paper } from "../../shared/contracts";
 import { normalizeMarkdownMath } from "./markdown";
 
 interface PaperNotesProps {
@@ -61,6 +63,10 @@ export function PaperNotes({
   const [view, setView] = useState<NoteView>(readStoredNoteView);
   const [saveState, setSaveState] = useState<SaveState>("loading");
   const [generating, setGenerating] = useState(false);
+  const [agentEvents, setAgentEvents] = useState<AgentEvent[]>([]);
+  const activeRequestIdRef = useRef<string | undefined>(undefined);
+  const generationOriginalRef = useRef("");
+  const generationStreamRef = useRef("");
   const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const draftRef = useRef("");
   const savedRef = useRef("");
@@ -104,6 +110,28 @@ export function PaperNotes({
       }
     };
   }, [onContentChange, onError, paper.id]);
+
+  useEffect(
+    () =>
+      window.paperxcel.notes.onAgentEvent((event) => {
+        if (event.requestId !== activeRequestIdRef.current) return;
+        if (
+          event.type === "content.snapshot" &&
+          typeof event.metadata?.content === "string"
+        ) {
+          generationStreamRef.current = event.metadata.content;
+          setContent(event.metadata.content);
+          return;
+        }
+        if (event.type === "content.delta" && event.delta) {
+          generationStreamRef.current += event.delta;
+          setContent(generationStreamRef.current);
+          return;
+        }
+        setAgentEvents((current) => [...current, event].slice(-8));
+      }),
+    [],
+  );
 
   useEffect(() => {
     try {
@@ -161,9 +189,19 @@ export function PaperNotes({
       timerRef.current = undefined;
     }
     setGenerating(true);
+    const requestId = crypto.randomUUID();
+    activeRequestIdRef.current = requestId;
+    generationOriginalRef.current = draftRef.current;
+    generationStreamRef.current = "";
+    setAgentEvents([]);
     onGeneratingChange?.(paper.id, true);
     try {
-      const result = await window.paperxcel.notes.generate(paper.id);
+      const result = await window.paperxcel.notes.generate(paper.id, requestId);
+      if ("cancelled" in result) {
+        setContent(generationOriginalRef.current);
+        setSaveState("saved");
+        return;
+      }
       draftRef.current = result.note.content;
       savedRef.current = result.note.content;
       setContent(result.note.content);
@@ -171,12 +209,20 @@ export function PaperNotes({
       setSaveState("generated");
       if (result.warning) onError(result.warning);
     } catch (error) {
+      setContent(generationOriginalRef.current);
       setSaveState("error");
       onError(error instanceof Error ? error.message : String(error));
     } finally {
+      activeRequestIdRef.current = undefined;
       setGenerating(false);
       onGeneratingChange?.(paper.id, false);
     }
+  };
+
+  const cancelGeneration = async (): Promise<void> => {
+    const requestId = activeRequestIdRef.current;
+    if (!requestId) return;
+    await window.paperxcel.notes.cancel(requestId);
   };
 
   const exportMarkdown = async (): Promise<void> => {
@@ -237,19 +283,44 @@ export function PaperNotes({
             <button
               className="note-generate-button"
               type="button"
-              disabled={paper.status !== "ready" || generating}
-              onClick={() => void generate()}
+              disabled={paper.status !== "ready"}
+              onClick={() =>
+                generating ? void cancelGeneration() : void generate()
+              }
             >
-              {generating ? (
-                <LoaderCircle className="spin" size={15} />
-              ) : (
-                <Sparkles size={15} />
-              )}
-              {generating ? "生成中" : "AI 生成"}
+              {generating ? <Square size={13} /> : <Sparkles size={15} />}
+              {generating ? "停止生成" : "AI 生成"}
             </button>
           ) : null}
         </div>
       </header>
+      {generating && agentEvents.length ? (
+        <div className="note-agent-timeline" aria-live="polite">
+          {agentEvents
+            .filter(
+              (event) =>
+                event.type !== "content.delta" &&
+                event.type !== "content.snapshot" &&
+                event.type !== "progress.updated",
+            )
+            .map((event) => (
+              <div
+                className={`note-agent-event ${event.status ?? "running"}`}
+                key={`${event.requestId}-${event.sequence}`}
+              >
+                {event.status === "running" ? (
+                  <LoaderCircle className="spin" size={13} />
+                ) : (
+                  <span className="note-agent-event-dot" />
+                )}
+                <span>
+                  <strong>{event.title}</strong>
+                  {event.detail ? <small>{event.detail}</small> : null}
+                </span>
+              </div>
+            ))}
+        </div>
+      ) : null}
       {view === "edit" ? (
         <textarea
           className="note-editor"
@@ -266,7 +337,7 @@ export function PaperNotes({
           {content.trim() ? (
             <ReactMarkdown
               remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
-              rehypePlugins={[rehypeKatex]}
+              rehypePlugins={[rehypeKatex, rehypeRaw]}
               components={{
                 a: (props) => <a {...props} target="_blank" rel="noreferrer" />,
               }}

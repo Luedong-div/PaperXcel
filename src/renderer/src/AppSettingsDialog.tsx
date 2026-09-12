@@ -21,6 +21,7 @@ import type {
   OpenAlexConfigInput,
   OpenAlexTestResult,
   Paper,
+  ScihubSessionStatus,
   TranslationConfigInput,
   TranslationTestResult,
   ZoteroConfigInput,
@@ -76,15 +77,14 @@ export function AppSettingsDialog({
 }: AppSettingsDialogProps): React.JSX.Element | null {
   const [section, setSection] = useState<AppSettingsSection>(initialSection);
   const [scihubEnabled, setScihubEnabled] = useState(false);
+  const [scihubSession, setScihubSession] = useState<ScihubSessionStatus>();
+  const [scihubSessionClearing, setScihubSessionClearing] = useState(false);
   const [preprintFallbackEnabled, setPreprintFallbackEnabled] = useState(false);
-  const [citationAiOptimizationEnabled, setCitationAiOptimizationEnabled] =
-    useState(false);
   const [citationContentMatchPriority, setCitationContentMatchPriority] =
     useState<CitationContentMatchPriority>("standard");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [preprintSaving, setPreprintSaving] = useState(false);
-  const [citationAiSaving, setCitationAiSaving] = useState(false);
   const [citationContentPrioritySaving, setCitationContentPrioritySaving] =
     useState(false);
   const [zotero, setZotero] = useState<ZoteroConfigInput>(emptyZoteroConfig);
@@ -118,8 +118,8 @@ export function AppSettingsDialog({
     setLoading(true);
     Promise.all([
       window.paperxcel.settings.getScihubEnabled(),
+      window.paperxcel.settings.getScihubSessionStatus(),
       window.paperxcel.settings.getPreprintFallbackEnabled(),
-      window.paperxcel.settings.getCitationAiOptimizationEnabled(),
       window.paperxcel.settings.getCitationContentMatchPriority(),
       window.paperxcel.zotero.getConfig(),
       window.paperxcel.openAlex.getConfig(),
@@ -128,8 +128,8 @@ export function AppSettingsDialog({
       .then(
         ([
           enabled,
+          sessionStatus,
           preprintEnabled,
-          citationAiEnabled,
           contentMatchPriority,
           config,
           openAlexConfig,
@@ -137,8 +137,8 @@ export function AppSettingsDialog({
         ]) => {
           if (cancelled) return;
           setScihubEnabled(enabled);
+          setScihubSession(sessionStatus);
           setPreprintFallbackEnabled(preprintEnabled);
-          setCitationAiOptimizationEnabled(citationAiEnabled);
           setCitationContentMatchPriority(contentMatchPriority);
           setZotero({
             mode: config.mode,
@@ -192,14 +192,12 @@ export function AppSettingsDialog({
     }
   };
 
-  const toggleCitationAiOptimization = async (next: boolean): Promise<void> => {
-    setCitationAiSaving(true);
+  const clearScihubSession = async (): Promise<void> => {
+    setScihubSessionClearing(true);
     try {
-      const saved =
-        await window.paperxcel.settings.setCitationAiOptimizationEnabled(next);
-      setCitationAiOptimizationEnabled(saved);
+      setScihubSession(await window.paperxcel.settings.clearScihubSession());
     } finally {
-      setCitationAiSaving(false);
+      setScihubSessionClearing(false);
     }
   };
 
@@ -483,6 +481,38 @@ export function AppSettingsDialog({
                       </span>
                       {loading || saving}
                     </label>
+                    {scihubEnabled && scihubSession ? (
+                      <div className="settings-inline-status">
+                        <div>
+                          <strong>人机验证会话</strong>
+                          <p>
+                            持久 Cookie {scihubSession.cookieCount} 个
+                            {scihubSession.lastVerifiedAt
+                              ? ` · 最近验证 ${new Date(
+                                  scihubSession.lastVerifiedAt,
+                                ).toLocaleString()}`
+                              : " · 尚无成功验证记录"}
+                          </p>
+                        </div>
+                        <button
+                          className="secondary-button"
+                          type="button"
+                          disabled={
+                            loading ||
+                            scihubSessionClearing ||
+                            scihubSession.cookieCount === 0
+                          }
+                          onClick={() => void clearScihubSession()}
+                        >
+                          {scihubSessionClearing ? (
+                            <LoaderCircle className="spin" size={14} />
+                          ) : (
+                            <Trash2 size={14} />
+                          )}
+                          清除验证会话
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                 </section>
 
@@ -543,29 +573,6 @@ export function AppSettingsDialog({
                     <h3>引文解析</h3>
                     <p>注意：对早期论文的解析出错率会提高！</p>
                   </div>
-                </div>
-
-                <div className="parsing-option">
-                  <div>
-                    <strong>使用 AI 优化引文解析</strong>
-                    <p>
-                      先使用 OpenAlex 和 Crossref
-                      常规匹配；仅对未解析或结果冲突的书目，由当前模型提取题名、作者、年份和
-                      DOI 后再次检索。
-                    </p>
-                  </div>
-                  <label className="settings-switch">
-                    <input
-                      type="checkbox"
-                      aria-label="使用 AI 优化引文解析"
-                      checked={citationAiOptimizationEnabled}
-                      disabled={loading || citationAiSaving}
-                      onChange={(event) =>
-                        void toggleCitationAiOptimization(event.target.checked)
-                      }
-                    />
-                    <span aria-hidden="true" />
-                  </label>
                 </div>
 
                 <div className="parsing-option">
