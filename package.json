@@ -1,7 +1,7 @@
 {
   "name": "paperxcel",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Local-first AI workspace for reading, organizing, and comparing research papers.",
   "main": "./out/main/index.js",
   "author": "PaperXcel",

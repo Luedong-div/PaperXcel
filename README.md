@@ -40,7 +40,7 @@ Agent 使用模型原生工具调用。AI 根据问题自主制定通常 2–4 �
 ## 下载与安装
 
 1. 打开 [Releases](https://github.com/Luedong-div/PaperXcel/releases/latest)。
-2. 下载 `PaperXcel-1.0.0-win-x64.zip`。
+2. 下载 `PaperXcel-1.1.0-win-x64.zip`。
 3. 将压缩包完整解压到可写目录。
 4. 运行解压目录中的 `PaperXcel.exe`。
 5. 如需使用 AI 功能，在“应用设置”中配置服务地址、API Key 和模型。
