@@ -213,7 +213,7 @@ export class DocumentEngine {
     const chunks = pages.flatMap((page) =>
       splitChunks(paperId, page.page, page.text),
     );
-    if (!chunks.length) {
+    if (!chunks.length && params.allow_empty !== true) {
       throw new Error("Markdown 文件中没有可索引的文本。请检查 markdown 文件.");
     }
 

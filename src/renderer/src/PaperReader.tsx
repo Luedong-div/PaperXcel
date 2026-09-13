@@ -1,21 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import rehypeKatex from "rehype-katex";
-import rehypeRaw from "rehype-raw";
-import remarkBreaks from "remark-breaks";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
-import {
-  Check,
-  CircleAlert,
-  LoaderCircle,
-  RefreshCw,
-  Sparkles,
-  Square,
-  Undo2,
-} from "lucide-react";
+import { LoaderCircle, RefreshCw, Sparkles, Square } from "lucide-react";
 import type {
-  AgentEvent,
   KnowledgeBaseMarkdownPreview,
   KnowledgeBaseMarkdownRepairResult,
   Paper,
@@ -25,7 +10,8 @@ import {
   DocumentViewToggle,
   type DocumentViewMode,
 } from "./DocumentViewToggle";
-import { normalizeMarkdownMath } from "./markdown";
+import { PaperTextStreamController } from "./paperTextStreamController";
+import { PaperRepairStreamView } from "./PaperRepairStreamView";
 import { PdfViewer, type PdfTextSelection } from "./PdfViewer";
 
 interface PaperReaderProps {
@@ -41,6 +27,7 @@ interface PaperReaderProps {
   onRepairMarkdown?: (
     paperId: string,
     requestId: string,
+    mode?: "restart" | "retry",
   ) => Promise<KnowledgeBaseMarkdownRepairResult>;
   onCancelRepair?: (requestId: string) => Promise<boolean>;
 }
@@ -62,14 +49,11 @@ export function PaperReader({
   const [preview, setPreview] = useState<KnowledgeBaseMarkdownPreview>();
   const [loading, setLoading] = useState(false);
   const [repairing, setRepairing] = useState(false);
-  const [restoring, setRestoring] = useState(false);
   const [repairDetail, setRepairDetail] = useState("");
-  const [repairAgentEvents, setRepairAgentEvents] = useState<AgentEvent[]>([]);
+  const [streamStore] = useState(() => new PaperTextStreamController());
   const [error, setError] = useState("");
-  const [markdownVersion, setMarkdownVersion] = useState<"ai" | "original">(
-    "ai",
-  );
   const requestSequenceRef = useRef(0);
+  const attemptedRebuildRef = useRef(false);
   const activeRepairRequestRef = useRef<string | undefined>(undefined);
 
   const loadMarkdown = useCallback(async (): Promise<void> => {
@@ -80,11 +64,37 @@ export function PaperReader({
     try {
       const next = await window.paperxcel.knowledgeBase.previewMarkdown(
         paper.id,
-        markdownVersion,
+        "ai",
       );
       if (requestSequence === requestSequenceRef.current) {
-        setPreview(next);
-        setMarkdownVersion(next.aiRepaired ? "ai" : "original");
+        if (next.draft && next.draft.mode !== "pdf-rebuild") {
+          setPreview(undefined);
+          streamStore.clear(paper.id);
+          attemptedRebuildRef.current = true;
+          return;
+        }
+        setPreview(
+          next.aiRepaired || next.draft ? next : { ...next, markdown: "" },
+        );
+        if (next.draft) {
+          streamStore.restore(
+            paper.id,
+            {
+              content: next.markdown,
+              phase: "streaming",
+              completed: next.draft.completed,
+              total: next.draft.total,
+              detail: next.draft.detail,
+              mode: next.draft.mode,
+              unit: next.draft.unit,
+              currentPage: next.draft.currentPage,
+              batchStartPage: next.draft.batchStartPage,
+              batchEndPage: next.draft.batchEndPage,
+              skippedPages: next.draft.skippedPages,
+            },
+            next.draft.status === "running" ? "interrupted" : next.draft.status,
+          );
+        } else streamStore.clear(paper.id);
       }
     } catch (reason) {
       if (requestSequence === requestSequenceRef.current) {
@@ -93,36 +103,62 @@ export function PaperReader({
     } finally {
       if (requestSequence === requestSequenceRef.current) setLoading(false);
     }
-  }, [markdownVersion, paper.id]);
+  }, [paper.id, streamStore]);
 
-  const repairMarkdown = async (): Promise<void> => {
+  const repairMarkdown = async (
+    mode: "restart" | "retry" = "restart",
+  ): Promise<void> => {
     if (repairing || !provider?.hasApiKey) return;
     const requestId = crypto.randomUUID();
     activeRepairRequestRef.current = requestId;
+    requestSequenceRef.current++;
+    attemptedRebuildRef.current = true;
+    const previous =
+      mode === "retry" ? streamStore.getSnapshot().update : undefined;
+    if (mode === "restart") setPreview(undefined);
+    setLoading(false);
     setRepairing(true);
-    setPreview(undefined);
-    setLoading(true);
-    setRepairDetail("正在准备 PDF 全文修复");
-    setRepairAgentEvents([]);
+    streamStore.start(paper.id, requestId, previous?.content ?? "", {
+      ...previous,
+      phase: "preparing",
+      mode: "pdf-rebuild",
+      unit: "pages",
+    });
+    setRepairDetail(
+      mode === "retry"
+        ? "正在重试未完成批次"
+        : "正在打开原始 PDF，每 10 页一批重新生成",
+    );
     setError("");
     try {
       const next = onRepairMarkdown
-        ? await onRepairMarkdown(paper.id, requestId)
+        ? await onRepairMarkdown(paper.id, requestId, mode)
         : await window.paperxcel.knowledgeBase.repairMarkdown(
             paper.id,
             requestId,
+            mode,
           );
       if (activeRepairRequestRef.current !== requestId) return;
       if ("cancelled" in next) {
-        onNotice?.("文件修复已停止。");
+        const partial =
+          next.preview?.draft?.mode === "pdf-rebuild"
+            ? next.preview
+            : undefined;
+        if (partial) setPreview(partial);
+        streamStore.finish("interrupted", partial?.markdown);
+        onNotice?.("重建已停止，已生成的 Markdown 保留为草稿。");
         return;
       }
       setPreview(next);
-      setMarkdownVersion("ai");
-      onNotice?.(`论文全文已由 ${next.model || provider.model} 修复并缓存。`);
+      streamStore.finish("complete", next.markdown);
+      setError("");
+      onNotice?.(
+        `论文全文已由 ${next.model || provider.model} 从原始 PDF 重建并缓存。`,
+      );
     } catch (reason) {
       if (activeRepairRequestRef.current !== requestId) return;
       const message = errorMessage(reason);
+      streamStore.finish("error");
       setError(message);
       onNotice?.(message);
     } finally {
@@ -131,7 +167,6 @@ export function PaperReader({
         setRepairing(false);
         setLoading(false);
         setRepairDetail("");
-        setRepairAgentEvents([]);
       }
     }
   };
@@ -139,21 +174,17 @@ export function PaperReader({
   const stopRepair = async (): Promise<void> => {
     const requestId = activeRepairRequestRef.current;
     if (!requestId) return;
-    setRepairDetail("正在停止文件修复");
+    setRepairDetail("正在停止 Markdown 重建");
     try {
       const stopped = onCancelRepair
         ? await onCancelRepair(requestId)
         : await window.paperxcel.knowledgeBase.cancel(requestId);
       if (!stopped && activeRepairRequestRef.current === requestId) {
-        activeRepairRequestRef.current = undefined;
-        setRepairing(false);
-        setRepairDetail("");
+        setRepairDetail("重建正在完成保存");
       }
     } catch (reason) {
       if (activeRepairRequestRef.current === requestId) {
-        activeRepairRequestRef.current = undefined;
-        setRepairing(false);
-        setRepairDetail("");
+        setRepairDetail("停止请求失败，可以再次停止");
         const message = errorMessage(reason);
         setError(message);
         onNotice?.(message);
@@ -161,107 +192,61 @@ export function PaperReader({
     }
   };
 
-  const switchMarkdownVersion = async (): Promise<void> => {
-    if (repairing || restoring || !preview) return;
-    setRestoring(true);
-    setError("");
-    try {
-      const targetVersion = preview.aiRepaired ? "original" : "ai";
-      const next = await window.paperxcel.knowledgeBase.previewMarkdown(
-        paper.id,
-        targetVersion,
-      );
-      setPreview(next);
-      setMarkdownVersion(targetVersion);
-      onNotice?.(
-        targetVersion === "original"
-          ? "已切换到 PDF.js 原始 Markdown，AI 修复缓存仍然保留。"
-          : "已切换到 AI 修复 Markdown。",
-      );
-    } catch (reason) {
-      const message = errorMessage(reason);
-      setError(message);
-      onNotice?.(message);
-    } finally {
-      setRestoring(false);
-    }
-  };
-
-  useEffect(
-    () =>
-      window.paperxcel.knowledgeBase.onProgress((progress) => {
-        if (
-          progress.requestId &&
-          progress.requestId === activeRepairRequestRef.current
-        ) {
-          setRepairDetail(progress.detail);
-        }
-      }),
-    [],
-  );
-
-  useEffect(
-    () =>
-      window.paperxcel.knowledgeBase.onAgentEvent((event) => {
-        if (event.requestId !== activeRepairRequestRef.current) return;
-        setRepairAgentEvents((current) => [...current, event].slice(-12));
-      }),
-    [],
-  );
-
   useEffect(() => {
-    const subscribe = window.paperxcel.knowledgeBase.onMarkdownPreview;
-    if (!subscribe) return;
-    return subscribe((event) => {
-      if (event.requestId !== activeRepairRequestRef.current) return;
-      setPreview((current) => ({
-        ...(current ?? {
-          paperId: paper.id,
-          pageCount: paper.pageCount ?? 0,
-          generatedAt: event.generatedAt,
-          aiRepaired: true,
-        }),
-        markdown: event.content,
-        generatedAt: event.generatedAt,
-        aiRepaired: true,
-        model: provider?.model,
-      }));
-      setRepairDetail(
-        event.done
-          ? "Markdown 已生成，正在写入正式缓存"
-          : `正在接收 Markdown · ${event.characters.toLocaleString()} 字符`,
-      );
-    });
-  }, [paper.id, paper.pageCount, provider?.model]);
+    const offPreview = window.paperxcel.knowledgeBase.onMarkdownPreview(
+      streamStore.receive,
+    );
+    const offAgent = window.paperxcel.knowledgeBase.onAgentEvent(
+      streamStore.receiveAgent,
+    );
+    return () => {
+      offPreview();
+      offAgent();
+    };
+  }, [streamStore]);
 
   useEffect(() => {
     setPreview(undefined);
     setError("");
     setRepairing(false);
     setRepairDetail("");
-    setRepairAgentEvents([]);
+    streamStore.clear(paper.id);
+    attemptedRebuildRef.current = false;
     return () => {
       const requestId = activeRepairRequestRef.current;
       activeRepairRequestRef.current = undefined;
+      requestSequenceRef.current++;
+      streamStore.clear();
       if (requestId) {
-        void (onCancelRepair
-          ? onCancelRepair(requestId)
-          : window.paperxcel.knowledgeBase.cancel(requestId));
+        void (
+          onCancelRepair
+            ? onCancelRepair(requestId)
+            : window.paperxcel.knowledgeBase.cancel(requestId)
+        ).catch(() => undefined);
       }
     };
-  }, [onCancelRepair, paper.id]);
+  }, [onCancelRepair, paper.id, streamStore]);
 
   useEffect(() => {
-    if (!refreshToken) return;
+    if (!refreshToken || activeRepairRequestRef.current) return;
+    attemptedRebuildRef.current = false;
     setPreview(undefined);
     setError("");
-  }, [refreshToken]);
+    streamStore.clear(paper.id);
+  }, [refreshToken, paper.id, streamStore]);
 
   useEffect(() => {
-    if (viewMode === "markdown" && !preview && !loading && !error) {
+    if (
+      viewMode === "markdown" &&
+      !preview &&
+      !attemptedRebuildRef.current &&
+      !loading &&
+      !repairing &&
+      !error
+    ) {
       void loadMarkdown();
     }
-  }, [error, loadMarkdown, loading, preview, viewMode]);
+  }, [error, loadMarkdown, loading, preview, repairing, viewMode]);
 
   if (viewMode === "pdf") {
     return (
@@ -283,9 +268,9 @@ export function PaperReader({
         <div className="markdown-preview-meta">
           {preview
             ? preview.aiRepaired
-              ? `${preview.pageCount} 页 · AI 文件修复 · ${preview.model || "当前模型"}`
-              : `${preview.pageCount} 页 · 本地版面重建`
-            : "本地版面重建"}
+              ? `${preview.pageCount} 页 · AI 重建 · ${preview.model || "当前模型"}`
+              : `${preview.pageCount} 页 · 尚未生成 Markdown`
+            : "从原始 PDF 重建 Markdown"}
           {repairing && repairDetail ? ` · ${repairDetail}` : ""}
         </div>
         <DocumentViewToggle value={viewMode} onChange={setViewMode} />
@@ -295,12 +280,12 @@ export function PaperReader({
             type="button"
             title={
               repairing
-                ? "停止当前文件修复"
+                ? "停止当前 Markdown 重建"
                 : provider?.hasApiKey
-                  ? `使用 ${provider.model} 修复当前论文全文文件`
+                  ? `使用 ${provider.model} 每 10 页读取原始 PDF 并重建 Markdown`
                   : "请先在模型设置中配置 API Key"
             }
-            disabled={loading || (!repairing && !provider?.hasApiKey)}
+            disabled={!repairing && (loading || !provider?.hasApiKey)}
             onClick={() => void (repairing ? stopRepair() : repairMarkdown())}
           >
             {repairing ? (
@@ -308,28 +293,8 @@ export function PaperReader({
             ) : (
               <Sparkles size={15} />
             )}
-            <span>{repairing ? "停止修复" : "文件修复"}</span>
+            <span>{repairing ? "停止重建" : "重建 Markdown"}</span>
           </button>
-          {preview?.hasAiRepairedVersion ? (
-            <button
-              className="secondary-button markdown-restore-button"
-              type="button"
-              title={
-                preview.aiRepaired
-                  ? "切换到 PDF.js 原始 Markdown"
-                  : "切换到 AI 修复 Markdown"
-              }
-              disabled={loading || repairing || restoring}
-              onClick={() => void switchMarkdownVersion()}
-            >
-              {restoring ? (
-                <LoaderCircle className="spin" size={14} />
-              ) : (
-                <Undo2 size={14} />
-              )}
-              <span>{restoring ? "切换中" : "切换版本"}</span>
-            </button>
-          ) : null}
           <button
             className="icon-button"
             type="button"
@@ -347,67 +312,23 @@ export function PaperReader({
       </div>
 
       <div className="paper-markdown-stage">
-        {repairAgentEvents.length ? (
-          <div
-            className="paper-markdown-agent-timeline"
-            aria-label="Markdown 修复 Agent 执行过程"
-          >
-            <strong>修复 Agent</strong>
-            {repairAgentEvents.map((event) => (
-              <div
-                className={`note-agent-event ${event.status ?? "running"}`}
-                key={`${event.sequence}-${event.type}`}
-              >
-                {event.status === "running" ? (
-                  <LoaderCircle className="spin" size={13} />
-                ) : event.status === "failed" ? (
-                  <CircleAlert size={13} />
-                ) : (
-                  <Check size={13} />
-                )}
-                <span>
-                  <strong>{event.title}</strong>
-                  {event.detail ? <small>{event.detail}</small> : null}
-                </span>
-              </div>
-            ))}
-          </div>
-        ) : null}
-        {loading && !preview ? (
-          <div className="paper-markdown-state">
-            <LoaderCircle className="spin" size={24} />
-            <strong>正在重建 Markdown</strong>
-            <span>从本地 PDF 索引恢复页面与段落结构</span>
-          </div>
-        ) : error && !preview ? (
-          <div className="paper-markdown-state error-state">
-            <CircleAlert size={24} />
-            <strong>Markdown 生成失败</strong>
-            <span>{error}</span>
-            <button
-              className="secondary-button"
-              type="button"
-              onClick={() => void loadMarkdown()}
-            >
-              重试
-            </button>
-          </div>
-        ) : preview ? (
-          <article className="paper-markdown-document knowledge-markdown">
-            {repairing && preview.aiRepaired ? (
-              <div className="paper-markdown-streaming" role="status">
-                <LoaderCircle className="spin" size={14} />
-                <span>实时预览（尚未写入正式缓存）</span>
-              </div>
-            ) : null}
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
-              rehypePlugins={[rehypeKatex, rehypeRaw]}
-            >
-              {normalizeMarkdownMath(preview.markdown)}
-            </ReactMarkdown>
-          </article>
-        ) : null}
+        {loading && !preview && (
+          <p className="paper-text-loading" role="status">
+            正在读取 Markdown…
+          </p>
+        )}
+        <PaperRepairStreamView
+          store={streamStore}
+          paperId={paper.id}
+          preview={preview}
+          error={error}
+          onRetry={
+            !repairing && provider?.hasApiKey
+              ? () => void repairMarkdown("retry")
+              : undefined
+          }
+          onReload={() => void loadMarkdown()}
+        />
       </div>
     </section>
   );

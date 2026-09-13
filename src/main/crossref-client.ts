@@ -8,6 +8,8 @@ interface CrossrefDateParts {
 }
 
 interface CrossrefWorkPayload {
+  abstract?: string;
+  "is-referenced-by-count"?: number;
   DOI?: string;
   title?: string[] | string;
   author?: Array<{
@@ -42,6 +44,8 @@ interface CrossrefSearchResponse {
 }
 
 export interface CrossrefWorkRecord {
+  abstract?: string;
+  citedByCount?: number;
   doi?: string;
   title?: string;
   authors: string[];
@@ -73,20 +77,28 @@ export class CrossrefClient {
     return works;
   }
 
-  async getWorkByDoi(doi: string): Promise<CrossrefWorkRecord | undefined> {
+  async getWorkByDoi(
+    doi: string,
+    signal?: AbortSignal,
+    strict = false,
+  ): Promise<CrossrefWorkRecord | undefined> {
     const normalizedDoi = normalizeCitationDoi(doi);
     if (!normalizedDoi) return undefined;
     const payload = await this.request<CrossrefResponse>(
       `${CROSSREF_BASE_URL}/works/${encodeURIComponent(normalizedDoi)}`,
+      signal,
+      strict,
     );
     return parseCrossrefWork(payload?.message);
   }
 
-  async getReferenceDois(doi: string): Promise<string[]> {
+  async getReferenceDois(doi: string, strict = false): Promise<string[]> {
     const normalizedDoi = normalizeCitationDoi(doi);
     if (!normalizedDoi) return [];
     const payload = await this.request<CrossrefResponse>(
       `${CROSSREF_BASE_URL}/works/${encodeURIComponent(normalizedDoi)}`,
+      undefined,
+      strict,
     );
     return [
       ...new Set(
@@ -104,17 +116,46 @@ export class CrossrefClient {
   async findWorksByBibliographic(
     citation: string,
     limit = 5,
+    options: {
+      offset?: number;
+      yearFrom?: number;
+      yearTo?: number;
+      sort?: "relevance" | "newest" | "citations";
+      signal?: AbortSignal;
+      strict?: boolean;
+    } = {},
   ): Promise<CrossrefWorkRecord[]> {
     const url = new URL(`${CROSSREF_BASE_URL}/works`);
     url.searchParams.set("query.bibliographic", citation.slice(0, 800));
     url.searchParams.set("rows", String(Math.max(1, Math.min(limit, 100))));
-    const payload = await this.request<CrossrefSearchResponse>(url.toString());
+    if (options.offset) url.searchParams.set("offset", String(options.offset));
+    const filters = [
+      options.yearFrom && `from-pub-date:${options.yearFrom}-01-01`,
+      options.yearTo && `until-pub-date:${options.yearTo}-12-31`,
+    ].filter(Boolean);
+    if (filters.length) url.searchParams.set("filter", filters.join(","));
+    if (options.sort && options.sort !== "relevance") {
+      url.searchParams.set(
+        "sort",
+        options.sort === "newest" ? "published" : "is-referenced-by-count",
+      );
+      url.searchParams.set("order", "desc");
+    }
+    const payload = await this.request<CrossrefSearchResponse>(
+      url.toString(),
+      options.signal,
+      options.strict,
+    );
     return (payload?.message?.items ?? [])
       .map(parseCrossrefWork)
       .filter((work): work is CrossrefWorkRecord => Boolean(work?.title));
   }
 
-  private async request<T>(url: string): Promise<T | undefined> {
+  private async request<T>(
+    url: string,
+    signal?: AbortSignal,
+    strict = false,
+  ): Promise<T | undefined> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), CROSSREF_TIMEOUT_MS);
     try {
@@ -123,11 +164,19 @@ export class CrossrefClient {
           Accept: "application/json",
           "User-Agent": "PaperXcel/0.1",
         },
-        signal: controller.signal,
+        signal: signal
+          ? AbortSignal.any([signal, controller.signal])
+          : controller.signal,
       });
-      if (!response.ok) return undefined;
+      if (!response.ok) {
+        if (strict)
+          throw new Error(`Crossref 请求失败 (HTTP ${response.status})。`);
+        return undefined;
+      }
       return (await response.json()) as T;
-    } catch {
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (strict) throw error;
       return undefined;
     } finally {
       clearTimeout(timeout);
@@ -139,8 +188,12 @@ export function parseCrossrefWork(
   payload?: CrossrefWorkPayload,
 ): CrossrefWorkRecord | undefined {
   if (!payload) return undefined;
-  const titleValues = Array.isArray(payload.title) ? payload.title : [payload.title];
-  const title = titleValues.find((value) => typeof value === "string" && value.trim())?.trim();
+  const titleValues = Array.isArray(payload.title)
+    ? payload.title
+    : [payload.title];
+  const title = titleValues
+    .find((value) => typeof value === "string" && value.trim())
+    ?.trim();
   const doi = normalizeCitationDoi(payload.DOI);
   const authors = (payload.author ?? [])
     .map((author) => {
@@ -158,6 +211,12 @@ export function parseCrossrefWork(
     payload["published-online"],
   );
   return {
+    abstract:
+      payload.abstract
+        ?.replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim() || undefined,
+    citedByCount: payload["is-referenced-by-count"],
     doi,
     title,
     authors: [...new Set(authors)],

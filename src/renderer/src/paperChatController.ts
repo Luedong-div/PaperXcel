@@ -17,6 +17,7 @@ export interface PaperChatRun {
   detail: string;
   answer: string;
   reasoningObserved?: boolean;
+  contextUsage?: import("../../shared/assistantContext").AssistantContextUsage;
   events: AgentEvent[];
 }
 
@@ -198,8 +199,8 @@ export class PaperChatController {
     try {
       const saved = await this.load(input.paperId);
       this.checkCancelled(run);
-      let history = input.history ?? saved;
-      let context = conversationContext(history);
+      const history = input.history ?? saved;
+      const context = conversationContext(history);
       if (input.task === "compact") {
         if (!context.length) throw new Error("当前对话还没有可压缩的历史。");
         const result = await this.request(run, { ...input, messages: context });
@@ -219,31 +220,6 @@ export class PaperChatController {
         input.selectedSnippets ?? [],
       );
       this.checkCancelled(run);
-      // A summary is an additional checkpoint. Full readable history is retained.
-      if (
-        context.length >= 8 &&
-        context.reduce((sum, message) => sum + message.content.length, 0) >
-          50_000
-      ) {
-        this.updateRun(run, { detail: "正在压缩对话上下文" });
-        const compacted = await this.request(run, {
-          paperId: input.paperId,
-          question: "请压缩当前历史对话。",
-          task: "compact",
-          messages: context,
-        });
-        this.checkCancelled(run);
-        if ("cancelled" in compacted) return compacted;
-        // Only persist the summary in the branch actually being submitted below.
-        history = [...history, { ...compacted.message, task: "compact" }];
-        context = [compacted.message];
-        this.updateRun(run, {
-          answer: "",
-          events: [],
-          reasoningObserved: false,
-          detail: "正在准备论文回答",
-        });
-      }
       const userMessage: ChatMessage = {
         id: crypto.randomUUID(),
         role: "user",
@@ -370,6 +346,7 @@ export class PaperChatController {
     run.view = {
       ...run.view,
       detail: progress.detail || run.view.detail,
+      contextUsage: progress.contextUsage ?? run.view.contextUsage,
       reasoningObserved:
         progress.reasoningObserved ?? run.view.reasoningObserved,
       answer:
@@ -396,7 +373,10 @@ export class PaperChatController {
       )
     )
       return;
-    run.view = { ...run.view, events: [...run.view.events, event].slice(-40) };
+    run.view = {
+      ...run.view,
+      events: retainAgentEvents([...run.view.events, event], 40),
+    };
     this.scheduleRender();
   };
 
@@ -537,19 +517,30 @@ export function conversationContext(messages: ChatMessage[]): ChatMessage[] {
   return summaryIndex < 0 ? completed : completed.slice(summaryIndex);
 }
 
-function buildAgentTrace(events: AgentEvent[]): AgentTraceEvent[] {
+/** Keep model-authored state and commentary when noisy tool events are trimmed. */
+function retainAgentEvents(events: AgentEvent[], limit: number): AgentEvent[] {
   const latestPlan = [...events]
     .reverse()
     .find(
       (event) =>
         event.type === "plan.created" && event.metadata?.source === "model",
     );
-  const recent = events.slice(-24);
-  const trace =
-    latestPlan && !recent.includes(latestPlan)
-      ? [latestPlan, ...recent.slice(-23)]
-      : recent;
-  return trace.map(
+  const retained = new Set(
+    events.filter(
+      (event) => event === latestPlan || event.type === "assistant.message",
+    ),
+  );
+  // Public commentary is bounded by the Agent turn budget. Always leave room
+  // for the last tool result and terminal event as well as that commentary.
+  const recent = events
+    .filter((event) => !retained.has(event))
+    .slice(-Math.max(2, limit - retained.size));
+  for (const event of recent) retained.add(event);
+  return events.filter((event) => retained.has(event));
+}
+
+function buildAgentTrace(events: AgentEvent[]): AgentTraceEvent[] {
+  return retainAgentEvents(events, 24).map(
     ({ type, title, detail, stepId, tool, status, metadata }) => ({
       type,
       title,

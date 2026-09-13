@@ -52,6 +52,10 @@ interface EuropePmcFullTextUrl {
 export interface EuropePmcSearchOptions {
   page?: number;
   pageSize?: number;
+  yearFrom?: number;
+  yearTo?: number;
+  sort?: "relevance" | "newest" | "citations";
+  signal?: AbortSignal;
 }
 
 export class EuropePmcClient {
@@ -65,7 +69,19 @@ export class EuropePmcClient {
     if (!normalizedQuery) return [];
 
     const url = new URL(EUROPE_PMC_SEARCH_URL);
-    url.searchParams.set("query", normalizedQuery.slice(0, 500));
+    let searchQuery = `(${normalizedQuery.slice(0, 500)})`;
+    if (options.yearFrom || options.yearTo)
+      searchQuery += ` AND FIRST_PDATE:[${options.yearFrom ?? 1500}-01-01 TO ${options.yearTo ?? 2100}-12-31]`;
+    if (options.sort === "newest") searchQuery += " sort_date:y";
+    if (options.sort === "citations") searchQuery += " sort_cited:y";
+    url.searchParams.set(
+      "query",
+      options.yearFrom ||
+        options.yearTo ||
+        (options.sort && options.sort !== "relevance")
+        ? searchQuery
+        : normalizedQuery.slice(0, 500),
+    );
     url.searchParams.set(
       "page",
       String(Math.max(1, Math.floor(options.page ?? 1))),
@@ -85,7 +101,9 @@ export class EuropePmcClient {
           Accept: "application/json",
           "User-Agent": "PaperXcel/1.0",
         },
-        signal: controller.signal,
+        signal: options.signal
+          ? AbortSignal.any([options.signal, controller.signal])
+          : controller.signal,
       });
       if (!response.ok) {
         throw new Error(`Europe PMC 请求失败 (HTTP ${response.status})。`);
@@ -95,6 +113,7 @@ export class EuropePmcClient {
         .map(parseEuropePmcWork)
         .filter((work): work is CitationWorkRecord => Boolean(work));
     } catch (error) {
+      options.signal?.throwIfAborted();
       if (error instanceof Error && error.name === "AbortError") {
         throw new Error("Europe PMC 请求超时。", { cause: error });
       }

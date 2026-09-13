@@ -3,10 +3,7 @@ import {
   normalizeOpenAlexId,
   type CitationWorkRecord,
 } from "../shared/citationGraph";
-import type {
-  OpenAlexConfigInput,
-  OpenAlexTestResult,
-} from "../shared/contracts";
+import type { OpenAlexTestResult } from "../shared/contracts";
 
 // OpenAlex 把每篇论文称为一个 Work。这里只请求图谱和详情面板需要的字段，
 // 避免下载完整记录，减少网络传输与 JSON 解析开销。
@@ -51,7 +48,10 @@ interface OpenAlexListPayload {
 
 export interface OpenAlexSearchOptions {
   page?: number;
-  sort?: "relevance" | "publication-date";
+  sort?: "relevance" | "publication-date" | "citations";
+  yearFrom?: number;
+  yearTo?: number;
+  signal?: AbortSignal;
 }
 
 /**
@@ -69,14 +69,17 @@ export class OpenAlexClient {
   ) {}
 
   // DOI 是连接本地论文与 OpenAlex 记录的首选稳定标识符。
-  async getWorkByDoi(doi: string): Promise<CitationWorkRecord | undefined> {
+  async getWorkByDoi(
+    doi: string,
+    signal?: AbortSignal,
+  ): Promise<CitationWorkRecord | undefined> {
     const normalized = normalizeCitationDoi(doi);
     if (!normalized) return undefined;
     const url = new URL(
       `${OPENALEX_BASE_URL}/works/doi:${encodeURIComponent(normalized)}`,
     );
     url.searchParams.set("select", OPENALEX_SELECT);
-    const payload = await this.request<OpenAlexWorkPayload>(url);
+    const payload = await this.request<OpenAlexWorkPayload>(url, signal);
     return parseOpenAlexWork(payload);
   }
 
@@ -116,9 +119,20 @@ export class OpenAlexClient {
     }
     if (options.sort === "publication-date") {
       url.searchParams.set("sort", "publication_date:desc");
+    } else if (options.sort === "citations") {
+      url.searchParams.set("sort", "cited_by_count:desc");
+    }
+    if (options.yearFrom || options.yearTo) {
+      url.searchParams.set(
+        "filter",
+        `publication_year:${options.yearFrom ?? 1500}-${options.yearTo ?? 2100}`,
+      );
     }
     url.searchParams.set("select", OPENALEX_SELECT);
-    const payload = await this.request<OpenAlexListPayload>(url);
+    const payload = await this.request<OpenAlexListPayload>(
+      url,
+      options.signal,
+    );
     return (payload.results ?? [])
       .map(parseOpenAlexWork)
       .filter((work): work is CitationWorkRecord => Boolean(work));
@@ -129,6 +143,7 @@ export class OpenAlexClient {
   async getCitingWorks(
     openAlexId: string,
     limit: number,
+    signal?: AbortSignal,
   ): Promise<CitationWorkRecord[]> {
     const normalized = normalizeOpenAlexId(openAlexId);
     if (!normalized) return [];
@@ -137,7 +152,7 @@ export class OpenAlexClient {
     url.searchParams.set("sort", "cited_by_count:desc");
     url.searchParams.set("per_page", String(Math.max(1, Math.min(limit, 100))));
     url.searchParams.set("select", OPENALEX_SELECT);
-    const payload = await this.request<OpenAlexListPayload>(url);
+    const payload = await this.request<OpenAlexListPayload>(url, signal);
     return (payload.results ?? [])
       .map(parseOpenAlexWork)
       .filter((work): work is CitationWorkRecord => Boolean(work));
@@ -180,11 +195,13 @@ export class OpenAlexClient {
     return works;
   }
 
-  private async request<T>(url: URL): Promise<T> {
+  private async request<T>(url: URL, signal?: AbortSignal): Promise<T> {
     if (this.apiKey) url.searchParams.set("api_key", this.apiKey);
     let lastError: Error | undefined;
     // 超时、限流和服务端错误最多重试三次；参数或鉴权错误直接抛出。
     for (let attempt = 0; attempt < 3; attempt += 1) {
+      signal?.throwIfAborted();
+      let retryable = true;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15_000);
       try {
@@ -193,7 +210,9 @@ export class OpenAlexClient {
             Accept: "application/json",
             "User-Agent": "PaperXcel/0.1",
           },
-          signal: controller.signal,
+          signal: signal
+            ? AbortSignal.any([signal, controller.signal])
+            : controller.signal,
         });
         if (response.ok) return (await response.json()) as T;
         const detail = (await response.text()).slice(0, 240);
@@ -204,9 +223,14 @@ export class OpenAlexClient {
               ? "OpenAlex 请求过于频繁或今日额度已用尽。"
               : `OpenAlex 请求失败 (${response.status})${detail ? `：${detail}` : ""}`,
         );
-        if (response.status !== 429 && response.status < 500) throw error;
+        if (response.status !== 429 && response.status < 500) {
+          retryable = false;
+          throw error;
+        }
         lastError = error;
       } catch (error) {
+        signal?.throwIfAborted();
+        if (!retryable) throw error;
         lastError =
           error instanceof Error && error.name === "AbortError"
             ? new Error("OpenAlex 请求超时。")
@@ -222,12 +246,6 @@ export class OpenAlexClient {
     }
     throw lastError ?? new Error("OpenAlex 请求失败。");
   }
-}
-
-export function createOpenAlexClient(
-  input: OpenAlexConfigInput & { apiKey?: string },
-): OpenAlexClient {
-  return new OpenAlexClient(input.apiKey?.trim() ?? "");
 }
 
 /**

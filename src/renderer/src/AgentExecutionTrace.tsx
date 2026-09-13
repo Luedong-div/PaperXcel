@@ -20,14 +20,32 @@ export const AgentExecutionTrace = memo(function AgentExecutionTrace({
   events: Array<AgentEvent | AgentTraceEvent>;
   live?: boolean;
 }): React.JSX.Element | null {
-  const entries = events.filter((event) => EXECUTION_EVENTS.has(event.type));
+  const entries: Array<AgentEvent | AgentTraceEvent> = [];
+  const toolEntries = new Map<string, number>();
+  for (const event of events) {
+    if (!EXECUTION_EVENTS.has(event.type)) continue;
+    const callId =
+      event.type === "tool.started" || event.type === "tool.completed"
+        ? (event.metadata?.callId ?? event.metadata?.toolCallId ?? event.stepId)
+        : undefined;
+    if (typeof callId === "string" && callId) {
+      const previous = toolEntries.get(callId);
+      if (previous !== undefined) {
+        // Keep one row per actual call; a later terminal event replaces its start.
+        if (event.type === "tool.completed") entries[previous] = event;
+        continue;
+      }
+      toolEntries.set(callId, entries.length);
+    }
+    entries.push(event);
+  }
   if (!entries.length) return null;
 
   return (
     <details
       className={`message-agent-trace${live ? " chat-stream-trace" : ""}`}
     >
-      <summary>执行记录 · {entries.length} 项</summary>
+      <summary>工具与执行记录 · {entries.length} 项</summary>
       <div className="message-agent-trace-list">
         {entries.map((event, index) => {
           const cancelled = event.type === "run.cancelled";

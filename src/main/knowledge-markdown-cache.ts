@@ -2,8 +2,10 @@ import { mkdir, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ProviderProtocol } from "../shared/contracts";
 import { writeCancellableUtf8 } from "./cancellable-file";
+import { filterPaperMarkdownContent } from "../shared/paperMarkdownContent";
 
 export interface KnowledgeMarkdownRepairCache {
+  sourceMode?: "pdf-rebuild";
   version: 2;
   paperId: string;
   source: {
@@ -25,6 +27,7 @@ export interface KnowledgeMarkdownRepairCache {
 }
 
 interface WriteKnowledgeMarkdownRepairCacheInput {
+  sourceMode?: "pdf-rebuild";
   markdown: string;
   pageCount: number;
   model: string;
@@ -66,23 +69,29 @@ export async function readKnowledgeMarkdownRepairCache(
         await rm(candidatePath, { force: true });
         continue;
       }
-      if (candidatePath !== cachePath) {
+      const filteredMarkdown =
+        cache.sourceMode === "pdf-rebuild"
+          ? normalizeMarkdown(filterPaperMarkdownContent(cache.markdown))
+          : cache.markdown;
+      const contentChanged = filteredMarkdown !== cache.markdown;
+      cache.markdown = filteredMarkdown;
+      if (candidatePath !== cachePath || contentChanged) {
         await mkdir(paperDirectory, { recursive: true });
         signal?.throwIfAborted();
         await writeCancellableUtf8(
           cachePath,
           `${JSON.stringify(cache, null, 2)}\n`,
-          signal,
+          signal ?? new AbortController().signal,
         );
         signal?.throwIfAborted();
-        await rm(candidatePath, { force: true });
+        if (candidatePath !== cachePath)
+          await rm(candidatePath, { force: true });
       }
       return cache;
     } catch (error) {
       signal?.throwIfAborted();
-      if (!isMissingFileError(error)) {
-        await rm(candidatePath, { force: true });
-      }
+      // Storage failures during migration must not delete a valid AI result.
+      if (!isMissingFileError(error)) throw error;
     }
   }
   return null;
@@ -99,13 +108,18 @@ export async function writeKnowledgeMarkdownRepairCache(
   const sourceInfo = await stat(pdfPath);
   signal?.throwIfAborted();
   const cache: KnowledgeMarkdownRepairCache = {
+    sourceMode: input.sourceMode,
     version: 2,
     paperId,
     source: {
       size: sourceInfo.size,
       mtimeMs: sourceInfo.mtimeMs,
     },
-    markdown: normalizeMarkdown(input.markdown),
+    markdown: normalizeMarkdown(
+      input.sourceMode === "pdf-rebuild"
+        ? filterPaperMarkdownContent(input.markdown)
+        : input.markdown,
+    ),
     pageCount: input.pageCount,
     model: input.model,
     protocol: input.protocol,
@@ -194,6 +208,8 @@ function parseKnowledgeMarkdownRepairCache(
         : undefined;
     const repairReport = parseRepairReport(value.repairReport);
     return {
+      sourceMode:
+        value.sourceMode === "pdf-rebuild" ? "pdf-rebuild" : undefined,
       version: 2,
       paperId: value.paperId,
       source: { size: source.size, mtimeMs: source.mtimeMs },

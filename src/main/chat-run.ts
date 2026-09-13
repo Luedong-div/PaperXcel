@@ -111,6 +111,12 @@ export class ChatRun {
     this.latestProgress = {
       phase: progress.phase,
       detail: progress.detail,
+      ...(progress.contextUsage || this.latestProgress.contextUsage
+        ? {
+            contextUsage:
+              progress.contextUsage ?? this.latestProgress.contextUsage,
+          }
+        : {}),
       ...(progress.reasoningObserved === undefined
         ? {}
         : { reasoningObserved: progress.reasoningObserved }),

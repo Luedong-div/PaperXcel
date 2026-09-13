@@ -1,5 +1,5 @@
 import {
-  normalizeMarkdownScriptTags,
+  mapMarkdownProse,
   renderMarkdownScriptSyntax,
 } from "../../shared/markdownScripts";
 
@@ -9,7 +9,14 @@ const DISPLAY_MATH_INLINE = /[ \t]*\\{1,2}\[([^\n]*?)\\{1,2}\][ \t]*/g;
 const INLINE_MATH = /\\{1,2}\(([^\n]*?)\\{1,2}\)/g;
 
 export function normalizeMarkdownMath(content: string): string {
-  const displayBlocks = normalizeMarkdownScriptTags(content).replace(
+  const normalized = mapMarkdownProse(content, normalizeLatexDelimiters, {
+    includeMath: true,
+  });
+  return renderMarkdownScriptSyntax(normalized);
+}
+
+function normalizeLatexDelimiters(content: string): string {
+  const displayBlocks = content.replace(
     DISPLAY_MATH_BLOCK,
     (_match, linePrefix: string, indentation: string, expression: string) => {
       const math = normalizeDisplayMath(expression)
@@ -24,11 +31,10 @@ export function normalizeMarkdownMath(content: string): string {
     (_match, expression: string) =>
       `\n\n$$\n${normalizeLatexEscapes(expression)}\n$$\n\n`,
   );
-  const normalized = inlineDisplays.replace(
+  return inlineDisplays.replace(
     INLINE_MATH,
     (_match, expression: string) => `$${normalizeLatexEscapes(expression)}$`,
   );
-  return renderMarkdownScriptSyntax(normalized);
 }
 
 function normalizeLatexEscapes(expression: string): string {

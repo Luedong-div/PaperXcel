@@ -86,6 +86,7 @@ import { ChatMarkdown as MarkdownMessage } from "./ChatMarkdown";
 import { ChatStreamView } from "./ChatStreamView";
 import { PaperResearchPlanView } from "./PaperResearchPlanView";
 import { AgentExecutionTrace } from "./AgentExecutionTrace";
+import { AgentCommentaryView } from "./AgentCommentaryView";
 import { useChatScroll } from "./useChatScroll";
 import { AppSettingsDialog } from "./AppSettingsDialog";
 import { SettingsDialog } from "./SettingsDialog";
@@ -1135,11 +1136,7 @@ export default function App(): React.JSX.Element {
   };
 
   const prepareMarkdownPrompt = async (): Promise<void> => {
-    if (
-      !selectedPaper ||
-      selectedPaper.status !== "ready" ||
-      uploadingAttachmentCount
-    ) {
+    if (!selectedPaper || uploadingAttachmentCount) {
       return;
     }
     const composerEpoch = composerEpochRef.current;
@@ -1153,17 +1150,9 @@ export default function App(): React.JSX.Element {
         ),
       );
       if (composerEpochRef.current !== composerEpoch) return;
-      const attachment = await window.paperxcel.chat.attachPaperMarkdown(
-        selectedPaper.id,
-      );
-      if (composerEpochRef.current !== composerEpoch) {
-        await window.paperxcel.chat.removeAttachment(attachment.id);
-        return;
-      }
-      setComposerAttachments([attachment]);
       setComposerTask("repair-markdown");
       setQuestion(
-        "请读取附件中的论文全文文件，修复并返回完整结果，写入当前论文缓存。",
+        "请逐页读取当前论文的原始 PDF，从头生成完整 Markdown 并保存。",
       );
       window.requestAnimationFrame(() => questionRef.current?.focus());
     } catch (error) {
@@ -2457,6 +2446,8 @@ export default function App(): React.JSX.Element {
             aria-hidden={workspaceView !== "citation"}
           >
             <CitationGraphWorkspace
+              analysisModel={provider?.model}
+              reasoningEffort={reasoningEffort}
               papers={activePapers}
               folders={folders}
               sidebarWidth={citationSidebarWidth}
@@ -2469,10 +2460,6 @@ export default function App(): React.JSX.Element {
                 resizePanelWithKeyboard("citation", event)
               }
               onOpenPaper={openGraphPaper}
-              onOpenSettings={() => {
-                setAppSettingsSection("openalex");
-                setAppSettingsOpen(true);
-              }}
               onError={setNotice}
             />
           </div>
@@ -2683,6 +2670,7 @@ export default function App(): React.JSX.Element {
                       </span>
                       <div>
                         <strong>文献助手</strong>
+                        <small>273K 上下文 · 自动压缩</small>
                         <small>
                           {provider
                             ? `${provider.name} · ${provider.model}`
@@ -2784,14 +2772,19 @@ export default function App(): React.JSX.Element {
                                 <button
                                   type="button"
                                   key={item.label}
-                                  disabled={selectedPaper.status !== "ready"}
+                                  disabled={
+                                    item.task !== "repair-markdown" &&
+                                    selectedPaper.status !== "ready"
+                                  }
                                   onClick={() =>
                                     item.task === "repair-markdown"
                                       ? void prepareMarkdownPrompt()
                                       : void ask(item.prompt)
                                   }
                                 >
-                                  {item.label}
+                                  {item.task === "repair-markdown"
+                                    ? "重建 Markdown"
+                                    : item.label}
                                 </button>
                               ))}
                             </div>
@@ -2926,6 +2919,9 @@ export default function App(): React.JSX.Element {
                                   message.agentTrace?.length ? (
                                     <>
                                       <PaperResearchPlanView
+                                        events={message.agentTrace}
+                                      />
+                                      <AgentCommentaryView
                                         events={message.agentTrace}
                                       />
                                       <AgentExecutionTrace
@@ -3184,11 +3180,6 @@ export default function App(): React.JSX.Element {
                     <div className="composer">
                       <div className="composer-context">
                         <span>当前页 p.{currentPage}</span>
-                        <span>
-                          {selectedPaper.fileName
-                            ? "按需使用当前 PDF · 优先页级证据"
-                            : selectedPaper.statusText}
-                        </span>
                       </div>
                       {paperReferences.length > 0 && (
                         <div
@@ -3273,7 +3264,10 @@ export default function App(): React.JSX.Element {
                           ref={questionRef}
                           rows={3}
                           placeholder="询问研究问题、方法、数据、结果或局限"
-                          disabled={selectedPaper.status !== "ready"}
+                          disabled={
+                            composerTask !== "repair-markdown" &&
+                            selectedPaper.status !== "ready"
+                          }
                           value={question}
                           onChange={(event) => setQuestion(event.target.value)}
                           onPaste={handleChatPaste}
@@ -3468,7 +3462,8 @@ export default function App(): React.JSX.Element {
                               asking
                                 ? stoppingAsk
                                 : !question.trim() ||
-                                  selectedPaper.status !== "ready" ||
+                                  (composerTask !== "repair-markdown" &&
+                                    selectedPaper.status !== "ready") ||
                                   uploadingAttachmentCount > 0
                             }
                             onClick={() =>

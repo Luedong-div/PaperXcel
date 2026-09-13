@@ -15,6 +15,7 @@ export interface CitationDiscoveryWorkInput {
   work: CitationWorkRecord;
   reasons?: CitationDiscoveryReason[];
   matchedPaperIds?: string[];
+  retrievalRank?: number;
 }
 
 export interface RankCitationDiscoveryInput {
@@ -31,7 +32,7 @@ export interface RankCitationDiscoveryInput {
 
 export const CITATION_DISCOVERY_MAX_CANDIDATES = 400;
 export const CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES = 800;
-export const CITATION_DISCOVERY_PURE_SEARCH_DEFAULT_CANDIDATES = 250;
+export const CITATION_DISCOVERY_PURE_SEARCH_DEFAULT_CANDIDATES = 50;
 export const CITATION_DISCOVERY_PAGE_SIZE = 50;
 
 const CONTENT_MATCH_MAX_SCORE: Record<CitationContentMatchPriority, number> = {
@@ -115,32 +116,24 @@ export function buildCitationDiscoveryQueries(
   query = "",
 ): string[] {
   const normalizedQuery = normalizeSpace(query);
-  const keywordQueries = parseCitationDiscoveryKeywords(normalizedQuery);
   const terms = buildCitationDiscoveryTerms(papers, normalizedQuery, 10);
-  const queries = [
-    normalizedQuery,
-    ...keywordQueries,
-    terms.slice(0, 8).join(" "),
-    ...papers.slice(0, normalizedQuery ? 1 : 2).map((paper) => paper.title),
-  ]
+  // Preserve research phrases. Searching every individual word loses the user's topic.
+  const queries = (
+    normalizedQuery
+      ? [
+          normalizedQuery,
+          ...normalizedQuery
+            .split(/[,，;；]/u)
+            .filter((part) => part.trim().includes(" ")),
+        ]
+      : [
+          ...papers.slice(0, 2).map((paper) => paper.title),
+          terms.slice(0, 6).join(" "),
+        ]
+  )
     .map((value) => normalizeSpace(value).slice(0, 360))
     .filter(Boolean);
-  return [...new Set(queries)].slice(0, 8);
-}
-
-/**
- * 发现搜索支持 `空格` 和英文逗号作为多个主题关键词的分隔符。
- * 保留完整查询的同时，再为每个关键词建立独立 OpenAlex 搜索，避免
- * 一个长查询被搜索引擎当成单一短语后漏掉相关证据。
- */
-export function parseCitationDiscoveryKeywords(query = ""): string[] {
-  return unique(
-    query
-      .replace(/，/g, ",")
-      .split(/[,\s]+/u)
-      .map((keyword) => keyword.trim())
-      .filter((keyword) => keyword.length >= 2),
-  );
+  return [...new Set(queries)].slice(0, 3);
 }
 
 export function rankCitationDiscoveryCandidates({
@@ -186,6 +179,7 @@ export function rankCitationDiscoveryCandidates({
   const merged = new Map<string, CitationDiscoveryWorkInput>();
 
   for (const candidate of candidates) {
+    if (isExcludedDiscoveryWork(candidate.work)) continue;
     const doi = normalizeCitationDoi(candidate.work.doi);
     const openAlexId = normalizeOpenAlexId(candidate.work.openAlexId);
     if (
@@ -203,10 +197,15 @@ export function rankCitationDiscoveryCandidates({
         work: candidate.work,
         reasons: unique(candidate.reasons ?? []),
         matchedPaperIds: unique(candidate.matchedPaperIds ?? []),
+        retrievalRank: candidate.retrievalRank,
       });
       continue;
     }
     previous.work = mergeCitationWorkMetadata(previous.work, candidate.work);
+    previous.retrievalRank = Math.min(
+      previous.retrievalRank ?? Infinity,
+      candidate.retrievalRank ?? Infinity,
+    );
     previous.reasons = unique([
       ...(previous.reasons ?? []),
       ...(candidate.reasons ?? []),
@@ -239,15 +238,22 @@ export function rankCitationDiscoveryCandidates({
       matchedPaperIds.add(paperId);
     }
 
-    const reasons = new Set(candidate.reasons ?? []);
+    const reasons = new Set<CitationDiscoveryReason>(
+      (candidate.reasons ?? []).filter((reason) => reason !== "topic-match"),
+    );
     if (sharedReferenceCount > 0) reasons.add("shared-references");
     if (citesLibrary) reasons.add("cites-library");
-    const relevanceScore = scoreRelevance(
-      candidate.work,
-      terms,
-      CONTENT_MATCH_MAX_SCORE[contentMatchPriority],
-    );
-    if (relevanceScore >= 8) reasons.add("topic-match");
+    const exactDoi =
+      parseDiscoveryDoi(query) === normalizeCitationDoi(candidate.work.doi) &&
+      Boolean(parseDiscoveryDoi(query));
+    const relevanceScore = exactDoi
+      ? CONTENT_MATCH_MAX_SCORE[contentMatchPriority]
+      : scoreRelevance(
+          candidate.work,
+          terms,
+          CONTENT_MATCH_MAX_SCORE[contentMatchPriority],
+        );
+    if (relevanceScore > 0) reasons.add("topic-match");
     const citationImpactScore = Math.round(
       (Math.log1p(candidate.work.citedByCount ?? 0) / Math.log1p(maxCitedBy)) *
         20,
@@ -262,7 +268,17 @@ export function rankCitationDiscoveryCandidates({
     const score = Math.min(
       100,
       Math.round(
-        relevanceScore + citationImpactScore + recencyScore + relationScore,
+        exactDoi
+          ? 100
+          : relevanceScore +
+              relationScore +
+              // Popularity is a tie breaker; it must not rescue an unrelated paper.
+              (relevanceScore > 0 || relationScore > 0
+                ? (citationImpactScore + recencyScore) * 0.35
+                : 0) +
+              (candidate.retrievalRank && relevanceScore > 0
+                ? 6 / Math.sqrt(candidate.retrievalRank)
+                : 0),
       ),
     );
 
@@ -314,7 +330,7 @@ export function tokenizeResearchText(value: string): string[] {
   );
 }
 
-function mergeCitationWorkMetadata(
+export function mergeCitationWorkMetadata(
   current: CitationWorkRecord,
   incoming: CitationWorkRecord,
 ): CitationWorkRecord {
@@ -360,6 +376,29 @@ function mergeCitationWorkMetadata(
   };
 }
 
+export function parseDiscoveryDoi(query: string): string | undefined {
+  const normalized = normalizeCitationDoi(query);
+  return normalized && /^10\.\d{4,9}\/\S+$/i.test(normalized)
+    ? normalized
+    : undefined;
+}
+
+export function deduplicateDiscoveryWorks(
+  works: CitationWorkRecord[],
+): CitationWorkRecord[] {
+  const merged = new Map<string, CitationDiscoveryWorkInput>();
+  for (const work of works) {
+    if (isExcludedDiscoveryWork(work)) continue;
+    const identity = findCandidateIdentity(work, merged);
+    if (!identity) continue;
+    const previous = merged.get(identity);
+    merged.set(identity, {
+      work: previous ? mergeCitationWorkMetadata(previous.work, work) : work,
+    });
+  }
+  return [...merged.values()].map(({ work }) => work);
+}
+
 function findCandidateIdentity(
   work: CitationWorkRecord,
   merged: Map<string, CitationDiscoveryWorkInput>,
@@ -372,14 +411,32 @@ function findCandidateIdentity(
   for (const [identity, previous] of merged) {
     const previousDoi = normalizeCitationDoi(previous.work.doi);
     if (doi && previousDoi && doi === previousDoi) return identity;
+    if (
+      openAlexId &&
+      openAlexId === normalizeOpenAlexId(previous.work.openAlexId)
+    )
+      return identity;
+    if (doi && previousDoi && doi !== previousDoi) continue;
 
     const previousTitle = normalizeTitle(previous.work.title);
-    if (title && previousTitle && title === previousTitle) return identity;
+    if (
+      title &&
+      title === previousTitle &&
+      (title.length >= 24 ||
+        authorsOverlap(
+          authors,
+          normalizedAuthorFamilies(previous.work.authors),
+        ))
+    )
+      return identity;
 
     if (
       title &&
       previousTitle &&
       titleSimilarity(title, previousTitle) >= 0.9 &&
+      (!work.year ||
+        !previous.work.year ||
+        Math.abs(work.year - previous.work.year) <= 1) &&
       authorsOverlap(authors, normalizedAuthorFamilies(previous.work.authors))
     ) {
       return identity;
@@ -425,7 +482,7 @@ function scoreRelevance(
   maxScore: number,
 ): number {
   if (!terms.length) return 0;
-  const title = normalizeSpace(work.title).toLocaleLowerCase();
+  const title = new Set(tokenizeResearchText(work.title));
   const body = normalizeSpace(
     [
       work.title,
@@ -437,16 +494,40 @@ function scoreRelevance(
       .filter(Boolean)
       .join(" "),
   ).toLocaleLowerCase();
+  const bodyTokens = new Set(tokenizeResearchText(body));
   let matchedWeight = 0;
   let totalWeight = 0;
   for (const [index, term] of terms.entries()) {
     const weight = Math.max(1, terms.length - index);
     totalWeight += weight * 3;
-    if (title.includes(term)) matchedWeight += weight * 3;
-    else if (body.includes(term)) matchedWeight += weight;
+    if (title.has(term)) matchedWeight += weight * 3;
+    else if (bodyTokens.has(term)) matchedWeight += weight;
   }
   return Math.round(
     (matchedWeight / Math.max(1, totalWeight)) * Math.max(0, maxScore),
+  );
+}
+
+/** Also excludes arXiv-only records returned by aggregators and old discovery caches. */
+export function isExcludedDiscoveryWork(work: {
+  openAlexId?: string;
+  id?: string;
+  doi?: string;
+  journal?: string;
+  sourceUrl?: string;
+  metadataSources?: string[];
+}): boolean {
+  const doi = normalizeCitationDoi(work.doi);
+  return (
+    /^10\.48550\/arxiv\./i.test(doi ?? "") ||
+    /^(?:external:)?arxiv:/i.test(work.openAlexId ?? work.id ?? "") ||
+    /^arxiv(?:\b|\s*:)/i.test(work.journal ?? "") ||
+    (!doi &&
+      (/^https?:\/\/(?:[^/]+\.)?arxiv\.org(?:\/|$)/i.test(
+        work.sourceUrl ?? "",
+      ) ||
+        (work.metadataSources?.every((source) => source === "arxiv") === true &&
+          work.metadataSources.length > 0)))
   );
 }
 

@@ -1,10 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import rehypeKatex from "rehype-katex";
-import rehypeRaw from "rehype-raw";
-import remarkBreaks from "remark-breaks";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
 import {
   Download,
   FileText,
@@ -14,7 +8,7 @@ import {
   Trash2,
 } from "lucide-react";
 import type { AgentEvent, LibraryReview } from "../../shared/contracts";
-import { normalizeMarkdownMath } from "./markdown";
+import { ChatMarkdown } from "./ChatMarkdown";
 
 interface LibraryReviewsPanelProps {
   onError: (message: string) => void;
@@ -190,12 +184,7 @@ export function LibraryReviewsPanel({
         ) : null}
         {visibleContent?.trim() ? (
           <article className="knowledge-markdown">
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
-              rehypePlugins={[rehypeKatex, rehypeRaw]}
-            >
-              {normalizeMarkdownMath(visibleContent)}
-            </ReactMarkdown>
+            <ChatMarkdown content={visibleContent} />
           </article>
         ) : (
           <div className="knowledge-empty">

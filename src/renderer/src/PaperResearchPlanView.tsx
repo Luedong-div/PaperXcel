@@ -1,9 +1,10 @@
 import { memo } from "react";
+import { Check, Circle, CircleDot } from "lucide-react";
 import type { AgentEvent, AgentTraceEvent } from "../../shared/contracts";
 
 type ResearchEvent = AgentEvent | AgentTraceEvent;
 
-/** Displays only the model's public analysis and proposed actions. */
+/** Task titles and progress are supplied by the model's update_plan call. */
 export const PaperResearchPlanView = memo(function PaperResearchPlanView({
   events,
 }: {
@@ -18,9 +19,12 @@ export const PaperResearchPlanView = memo(function PaperResearchPlanView({
   const metadata = event?.metadata;
   if (!metadata) return null;
   const analysis =
-    typeof metadata.analysisSummary === "string"
-      ? metadata.analysisSummary.trim()
-      : "";
+    [metadata.explanation, metadata.analysisSummary, event.detail]
+      .find(
+        (value): value is string =>
+          typeof value === "string" && Boolean(value.trim()),
+      )
+      ?.trim() ?? "";
   const plan = Array.isArray(metadata.plan)
     ? metadata.plan.flatMap((item: unknown) => {
         if (!item || typeof item !== "object") return [];
@@ -30,33 +34,26 @@ export const PaperResearchPlanView = memo(function PaperResearchPlanView({
               {
                 id: typeof step.id === "string" ? step.id : "",
                 title: step.title.trim(),
+                status:
+                  step.status === "completed" || step.status === "in_progress"
+                    ? step.status
+                    : "pending",
               },
             ]
           : [];
       })
     : [];
   if (!analysis && !plan.length) return null;
-  const queries = Array.isArray(metadata.queries)
-    ? metadata.queries.filter(
-        (query): query is string =>
-          typeof query === "string" && Boolean(query.trim()),
-      )
-    : [];
-  const round = positiveInteger(metadata.round);
-  const evidenceCount = positiveInteger(metadata.evidenceCount);
-  const action =
-    metadata.action === "search"
-      ? "继续检索"
-      : metadata.action === "answer"
-        ? "组织回答"
-        : "";
+  const completedCount = plan.filter(
+    (step) => step.status === "completed",
+  ).length;
 
   return (
     <details className="paper-research-plan" open>
       <summary>
-        <span>分析与计划</span>
+        <span>任务计划</span>
         <small>
-          {[round ? `第 ${round} 轮` : "", action].filter(Boolean).join(" · ")}
+          {plan.length > 0 ? ` · ${completedCount}/${plan.length} 已完成` : ""}
         </small>
       </summary>
       <div className="paper-research-plan-body">
@@ -64,32 +61,37 @@ export const PaperResearchPlanView = memo(function PaperResearchPlanView({
         {plan.length > 0 && (
           <ol
             className="paper-research-plan-steps"
-            aria-label="模型提出的研究计划"
+            aria-label="模型制定的任务计划"
           >
-            {plan.map((step, index) => (
-              <li key={`${step.id}-${index}`}>{step.title}</li>
-            ))}
+            {plan.map((step, index) => {
+              const statusLabel =
+                step.status === "completed"
+                  ? "已完成"
+                  : step.status === "in_progress"
+                    ? "进行中"
+                    : "待处理";
+              return (
+                <li
+                  key={`${step.id}-${index}`}
+                  className={`paper-research-step is-${step.status}`}
+                  data-status={step.status}
+                  aria-label={`${step.title}：${statusLabel}`}
+                >
+                  {step.status === "completed" ? (
+                    <Check size={15} aria-hidden="true" />
+                  ) : step.status === "in_progress" ? (
+                    <CircleDot size={15} aria-hidden="true" />
+                  ) : (
+                    <Circle size={15} aria-hidden="true" />
+                  )}
+                  <span>{step.title}</span>
+                  <small>{statusLabel}</small>
+                </li>
+              );
+            })}
           </ol>
-        )}
-        {queries.length > 0 && metadata.action === "search" && (
-          <div className="paper-research-queries" aria-label="本轮检索式">
-            {queries.map((query, index) => (
-              <code key={`${index}-${query}`}>{query}</code>
-            ))}
-          </div>
-        )}
-        {evidenceCount !== undefined && (
-          <small className="paper-research-evidence-count">
-            已提供 {evidenceCount} 段论文证据
-          </small>
         )}
       </div>
     </details>
   );
 });
-
-function positiveInteger(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-    ? Math.floor(value)
-    : undefined;
-}

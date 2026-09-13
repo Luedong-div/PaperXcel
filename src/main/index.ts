@@ -9,27 +9,19 @@ import {
   session,
   shell,
 } from "electron";
-import {
-  copyFile,
-  mkdir,
-  readFile,
-  rm,
-  stat,
-  writeFile,
-} from "node:fs/promises";
+import { copyFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, extname, isAbsolute, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type {
   AskPaperInput,
   AgentEvent,
   ChatAttachment,
-  ChatProgress,
   CitationContentMatchPriority,
   CitationDiscoveryInput,
-  CitationGraphAnalysisOptions,
   CitationGraphExportRequest,
   CitationGraphExpansionResult,
   CitationGraphSnapshot,
+  CitationReferencesInput,
   ChatMessage,
   CreateLibraryFolderInput,
   DocumentPageText,
@@ -45,6 +37,8 @@ import type {
   LibrarySearchHit,
   OpenAlexConfigInput,
   Paper,
+  PaperNote,
+  PaperNoteStream,
   PaperIdentifier,
   PaperMetadata,
   ProviderProfileInput,
@@ -53,17 +47,20 @@ import type {
   ZoteroConfigInput,
   ZoteroPullResult,
 } from "../shared/contracts";
+import type { PaperTextUpdate } from "../shared/paperText";
+import { runPaperTextTask } from "./paper-text-task";
+import { installDevBrowserBridge } from "./dev-browser-bridge";
+let browserBridge: ReturnType<typeof installDevBrowserBridge>;
 import {
-  CITATION_GRAPH_EXTERNAL_NODE_MAX,
-  CITATION_GRAPH_FOCUSED_EXTERNAL_NODE_MAX,
-  buildCitationGraphSnapshot,
-} from "../shared/citationGraph";
+  readPaperMarkdownRebuildStart,
+  clearPaperMarkdownRebuildArtifacts,
+} from "./paper-markdown-rebuild";
+import { readPaperTextDraft, removePaperTextDraft } from "./paper-text-drafts";
+import { buildCitationGraphSnapshot } from "../shared/citationGraph";
 import {
   buildLibraryReviewExport,
-  buildPaperFullTextMarkdown,
   libraryReviewFileName,
 } from "../shared/knowledge";
-import { compareMarkdownVersions } from "../shared/markdownComparison";
 import { buildPaperNoteExport, paperNoteFileName } from "../shared/notes";
 import {
   mapZoteroItem,
@@ -129,16 +126,12 @@ import {
   refreshCitationGraphData,
 } from "./citation-graph-service";
 import { discoverCitationWorks } from "./citation-discovery-service";
-import { analyzeCitationNetwork } from "./citation-analysis-service";
+import { registerCitationResearch } from "./citation-research-service";
 import { OpenAlexClient } from "./openalex-client";
 import { CrossrefClient } from "./crossref-client";
 import { EuropePmcClient } from "./europe-pmc-client";
-import { ArxivClient } from "./arxiv-client";
-import { buildGoogleScholarSearchUrl } from "../shared/externalSearch";
-import {
-  importGoogleScholarText,
-  searchGoogleScholarInteractively,
-} from "./google-scholar-service";
+import { CitationDiscoveryRuns } from "./citation-discovery-runs";
+import { CitationReferenceService } from "./citation-reference-service";
 import { BaiduTranslationClient } from "./baidu-translation-client";
 import {
   downloadZoteroAttachment,
@@ -147,21 +140,19 @@ import {
   testZoteroConnection,
 } from "./zotero-client";
 import {
-  answerLibraryQuestion,
-  askPaper,
+  createPaperAgentSession,
+  createLibraryAgentSession,
   compactPaperConversation,
   generateLibraryReview,
   generatePaperNote,
   listProviderModels,
-  planPaperResearch,
-  planLibraryResearch,
   repairKnowledgePaperExport,
   testProvider,
 } from "./provider";
-import type { PaperEvidenceCandidate } from "./paper-research";
+import type { PaperEvidenceCandidate } from "./paper-agent-tools";
 import { ChatRunRegistry } from "./chat-run";
+import { runLibraryAgent } from "./library-agent";
 import { runPaperChat } from "./chat-service";
-import { toPublicChatProgress } from "./agent-progress";
 import { exportKnowledgeBase } from "./knowledge-base";
 import {
   readKnowledgeMarkdownRepairCache,
@@ -179,10 +170,7 @@ import {
 } from "./paper-artifacts";
 import { DocumentEngineClient } from "./document-engine-client";
 import { configureApplicationDataPaths } from "./portable-data";
-import {
-  createAgentBatchCheckpoint,
-  createPaperAgentBatchCheckpoint,
-} from "./agent-batch-checkpoint";
+import { createAgentBatchCheckpoint } from "./agent-batch-checkpoint";
 
 const mainDirectory = dirname(fileURLToPath(import.meta.url));
 
@@ -206,13 +194,21 @@ protocol.registerSchemesAsPrivileged([
 configureApplicationDataPaths();
 
 let mainWindow: BrowserWindow | null = null;
-const LIBRARY_ASK_TIMEOUT_MS = 5 * 60_000;
 const LIBRARY_SEARCH_TIMEOUT_MS = 90_000;
 let store: AppStore;
 const documentEngine = new DocumentEngineClient();
 const chatRuns = new ChatRunRegistry();
-const libraryAskAbortControllers = new Map<string, AbortController>();
+const libraryChatRuns = new ChatRunRegistry();
+let citationResearch: ReturnType<typeof registerCitationResearch> | undefined;
 const noteGenerationAbortControllers = new Map<string, AbortController>();
+const noteGenerationOwners = new Map<
+  string,
+  { senderId: number; paperId: string; committing: boolean }
+>();
+const markdownRepairOwners = new Map<
+  string,
+  { senderId: number; paperId: string; committing: boolean }
+>();
 const reviewGenerationAbortControllers = new Map<string, AbortController>();
 const knowledgeExportAbortControllers = new Map<string, AbortController>();
 const knowledgeMarkdownRepairAbortControllers = new Map<
@@ -226,7 +222,6 @@ const paperMarkdownIndexSyncs = new Map<
 >();
 const MAX_AUTO_PDF_BYTES = 120 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_COUNT = 6;
-const MAX_CHAT_ATTACHMENT_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 80 * 1024 * 1024;
 const MARKDOWN_REPAIR_TIMEOUT_MS = 20 * 60_000;
 const SCIHUB_SESSION_PARTITION = "persist:paperxcel-scihub";
@@ -248,37 +243,6 @@ function selectCitationPapers(papers: Paper[], paperIds: unknown): Paper[] {
     ),
   );
   return activePapers.filter((paper) => selectedIds.has(paper.id));
-}
-
-function normalizeCitationGraphAnalysisOptions(
-  input: unknown,
-): CitationGraphAnalysisOptions {
-  if (!input || typeof input !== "object") return {};
-  const value = input as {
-    mode?: unknown;
-    externalLimits?: { references?: unknown; citing?: unknown };
-  };
-  const mode =
-    value.mode === "focused-two-hop" || value.mode === "standard"
-      ? value.mode
-      : undefined;
-  const references = Number(value.externalLimits?.references);
-  const citing = Number(value.externalLimits?.citing);
-  const externalNodeMax =
-    mode === "focused-two-hop"
-      ? CITATION_GRAPH_FOCUSED_EXTERNAL_NODE_MAX
-      : CITATION_GRAPH_EXTERNAL_NODE_MAX;
-  const externalLimits =
-    Number.isFinite(references) && Number.isFinite(citing)
-      ? {
-          references: Math.max(
-            0,
-            Math.min(externalNodeMax, Math.round(references)),
-          ),
-          citing: Math.max(0, Math.min(externalNodeMax, Math.round(citing))),
-        }
-      : undefined;
-  return { mode, externalLimits };
 }
 
 if (!app.requestSingleInstanceLock()) {
@@ -350,6 +314,7 @@ function createWindow(): void {
     },
   });
 
+  browserBridge?.forwardWebContents(mainWindow.webContents);
   mainWindow.on("ready-to-show", () => mainWindow?.show());
   mainWindow.on("closed", () => {
     mainWindow = null;
@@ -366,31 +331,43 @@ function createWindow(): void {
   }
 }
 
+async function readPaperAsset(assetUrl: string): Promise<Response> {
+  const url = new URL(assetUrl);
+  if (url.protocol !== "paperxcel:")
+    return new Response("Not found", { status: 404 });
+  if (url.hostname === "selection") {
+    try {
+      const id = decodeURIComponent(url.pathname.slice(1));
+      return net.fetch(pathToFileURL(selectionImagePath(id)).toString());
+    } catch {
+      return new Response("Not found", { status: 404 });
+    }
+  }
+  if (url.hostname !== "paper")
+    return new Response("Not found", { status: 404 });
+  const id = decodeURIComponent(url.pathname.slice(1));
+  const filePath = store.resolvePaperPath(id);
+  if (!filePath) return new Response("Not found", { status: 404 });
+  return net.fetch(pathToFileURL(filePath).toString());
+}
+
 app.whenReady().then(async () => {
   store = new AppStore();
   await synchronizeStoredPaperArtifacts();
   session.defaultSession.setPermissionRequestHandler(
     (_webContents, _permission, callback) => callback(false),
   );
-  await protocol.handle("paperxcel", async (request) => {
-    const url = new URL(request.url);
-    if (url.hostname === "selection") {
-      try {
-        const id = decodeURIComponent(url.pathname.slice(1));
-        return net.fetch(pathToFileURL(selectionImagePath(id)).toString());
-      } catch {
-        return new Response("Not found", { status: 404 });
-      }
-    }
-    if (url.hostname !== "paper")
-      return new Response("Not found", { status: 404 });
-    const id = decodeURIComponent(url.pathname.slice(1));
-    const filePath = store.resolvePaperPath(id);
-    if (!filePath) return new Response("Not found", { status: 404 });
-    return net.fetch(pathToFileURL(filePath).toString());
-  });
+  await protocol.handle("paperxcel", (request) => readPaperAsset(request.url));
   await migrateLegacySelectionImages();
+  browserBridge = installDevBrowserBridge(ipcMain, {
+    enabled: !app.isPackaged,
+    port: Number(process.env.PAPERXCEL_DEV_BRIDGE_PORT),
+    nonce: process.env.PAPERXCEL_DEV_BRIDGE_NONCE,
+    rendererUrl: process.env.ELECTRON_RENDERER_URL,
+    readAsset: readPaperAsset,
+  });
   registerIpc();
+  await browserBridge?.start();
   createWindow();
   resumeRecoverablePaperProcessing();
   void documentEngine.start();
@@ -408,9 +385,11 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  browserBridge?.close();
   chatRuns.cancelAll();
+  libraryChatRuns.cancelAll();
+  citationResearch?.cancelAll();
   for (const controller of [
-    ...libraryAskAbortControllers.values(),
     ...noteGenerationAbortControllers.values(),
     ...reviewGenerationAbortControllers.values(),
     ...knowledgeExportAbortControllers.values(),
@@ -708,120 +687,106 @@ function registerIpc(): void {
       store.getCitationGraphCache(),
     ),
   );
-  ipcMain.handle("citation-graph:clear", () => store.clearCitationGraphCache());
+  const citationReferences = new CitationReferenceService();
   ipcMain.handle(
-    "citation-graph:discover",
-    async (_event, input: CitationDiscoveryInput) => {
-      const papers = selectCitationPapers(store.listPapers(), input?.paperIds);
-      const cache = store.getCitationGraphCache();
-      const discoveryMode =
-        input?.mode === "pure-search" ? "pure-search" : "contextual";
-      const translationCredentials = store.resolveTranslationCredentials();
-      const canTranslateDiscoveryQuery = Boolean(
-        translationCredentials.appId && translationCredentials.secretKey,
-      );
-      const { result, works } = await discoverCitationWorks({
-        papers,
-        cache,
+    "citation-graph:references",
+    (_event, input: CitationReferencesInput) =>
+      citationReferences.get(input ?? {}, {
+        papers: store.listPapers(),
+        cache: store.getCitationGraphCache(),
         client: new OpenAlexClient(store.resolveOpenAlexApiKey()),
         crossref: new CrossrefClient(),
-        europePmc: new EuropePmcClient(),
-        arxiv: new ArxivClient(),
-        query: typeof input?.query === "string" ? input.query : "",
-        mode: discoveryMode,
-        limit:
-          typeof input?.limit === "number" && Number.isFinite(input.limit)
-            ? input.limit
+      }),
+  );
+  ipcMain.handle("citation-graph:clear", () => {
+    citationReferences.clear();
+    return store.clearCitationGraphCache();
+  });
+  const discoveryRuns = new CitationDiscoveryRuns();
+  ipcMain.handle(
+    "citation-graph:cancel-discovery",
+    (event, requestId: string) =>
+      discoveryRuns.cancel(event.sender.id, requestId),
+  );
+  ipcMain.handle(
+    "citation-graph:discover",
+    async (event, input: CitationDiscoveryInput) => {
+      if (input?.mode !== "pure-search")
+        throw new Error("请通过 AI 发现论文入口读取 PDF 并执行针对性检索。");
+      discoveryRuns.watchOwner(event.sender.id, (listener) =>
+        event.sender.once("destroyed", listener),
+      );
+      const run = discoveryRuns.begin(event.sender.id, input ?? {});
+      let sequence = 0;
+      try {
+        const papers = selectCitationPapers(
+          store.listPapers(),
+          input?.paperIds,
+        );
+        const cache = store.getCitationGraphCache();
+        const discoveryMode = "pure-search" as const;
+        const translationCredentials = store.resolveTranslationCredentials();
+        const canTranslateDiscoveryQuery = Boolean(
+          translationCredentials.appId && translationCredentials.secretKey,
+        );
+        const { result } = await discoverCitationWorks({
+          papers,
+          cache,
+          client: new OpenAlexClient(store.resolveOpenAlexApiKey()),
+          crossref: new CrossrefClient(),
+          europePmc: new EuropePmcClient(),
+          filters: input?.filters,
+          signal: run.signal,
+          session: run.session,
+          onProgress: (result) => {
+            if (!event.sender.isDestroyed())
+              event.sender.send("citation-graph:discovery-progress", {
+                requestId: run.requestId,
+                sequence: ++sequence,
+                result: { ...result, cursor: run.cursor },
+              });
+          },
+          query: typeof input?.query === "string" ? input.query : "",
+          mode: discoveryMode,
+          limit:
+            typeof input?.limit === "number" && Number.isFinite(input.limit)
+              ? input.limit
+              : undefined,
+          contentMatchPriority: store.getCitationContentMatchPriority(),
+          translateQuery: canTranslateDiscoveryQuery
+            ? async (text) =>
+                (
+                  await new BaiduTranslationClient(
+                    translationCredentials.appId,
+                    translationCredentials.secretKey,
+                  ).translate(text)
+                ).translatedText
             : undefined,
-        contentMatchPriority: store.getCitationContentMatchPriority(),
-        translateQuery: canTranslateDiscoveryQuery
-          ? async (text) =>
-              (
-                await new BaiduTranslationClient(
-                  translationCredentials.appId,
-                  translationCredentials.secretKey,
-                ).translate(text)
-              ).translatedText
-          : undefined,
-      });
-      // 纯搜索结果是灵感/证据临时结果，不写入图谱缓存，避免污染后续上下文发现。
-      if (discoveryMode !== "pure-search") {
-        for (const work of works) cache.works[work.openAlexId] = work;
+        });
+        return { ...result, cursor: run.cursor };
+      } finally {
+        run.finish();
       }
-      if (discoveryMode !== "pure-search" && works.length > 0) {
-        cache.updatedAt = new Date().toISOString();
-        store.saveCitationGraphCache(cache);
-      }
-      return result;
     },
   );
-  ipcMain.handle(
-    "citation-graph:analyze",
-    (_event, paperIds?: unknown, options?: unknown) =>
-      analyzeCitationNetwork(
-        selectCitationPapers(store.listPapers(), paperIds),
-        store.getCitationGraphCache(),
-        new Date(),
-        normalizeCitationGraphAnalysisOptions(options),
-      ),
-  );
-  ipcMain.handle(
-    "citation-graph:open-google-scholar",
-    async (_event, input: unknown) => {
-      const query = typeof input === "string" ? input.trim() : "";
-      if (!query) throw new Error("Google Scholar 搜索需要主题关键词。");
-      await shell.openExternal(buildGoogleScholarSearchUrl(query));
-      return true;
-    },
-  );
-  ipcMain.handle(
-    "citation-graph:search-google-scholar",
-    async (_event, input: CitationDiscoveryInput) => {
-      const mode = input?.mode === "pure-search" ? "pure-search" : "contextual";
-      const query = typeof input?.query === "string" ? input.query.trim() : "";
-      if (!query) throw new Error("Google Scholar 搜索需要主题关键词。");
-      const papers =
-        mode === "pure-search"
-          ? []
-          : selectCitationPapers(store.listPapers(), input?.paperIds);
-      return searchGoogleScholarInteractively({
-        parent: mainWindow ?? undefined,
-        query,
-        papers,
-        cache: store.getCitationGraphCache(),
-        client: new OpenAlexClient(store.resolveOpenAlexApiKey()),
-        mode,
-        limit:
-          typeof input?.limit === "number" && Number.isFinite(input.limit)
-            ? input.limit
-            : undefined,
-      });
-    },
-  );
-  ipcMain.handle(
-    "citation-graph:import-google-scholar-text",
-    async (_event, input: CitationDiscoveryInput & { text?: unknown }) => {
-      const mode = input?.mode === "pure-search" ? "pure-search" : "contextual";
-      const query = typeof input?.query === "string" ? input.query.trim() : "";
-      const text = typeof input?.text === "string" ? input.text : "";
-      if (!query) throw new Error("Google Scholar 导入需要主题关键词。");
-      if (!text.trim()) throw new Error("剪贴板中没有可导入文本。");
-      const papers =
-        mode === "pure-search"
-          ? []
-          : selectCitationPapers(store.listPapers(), input?.paperIds);
-      return importGoogleScholarText({
-        text,
-        query,
-        papers,
-        cache: store.getCitationGraphCache(),
-        client: new OpenAlexClient(store.resolveOpenAlexApiKey()),
-        mode,
-        limit:
-          typeof input?.limit === "number" && Number.isFinite(input.limit)
-            ? input.limit
-            : undefined,
-      });
+  citationResearch = registerCitationResearch(
+    ipcMain,
+    store,
+    join(app.getPath("userData"), "research-conversations"),
+    async (paperId, signal) => {
+      signal.throwIfAborted();
+      const pdfPath = store.resolvePaperPath(paperId);
+      if (!pdfPath) throw new Error("本地 PDF 文件不存在，请补充 PDF 后重试。");
+      const pages = await waitForAbort(
+        documentEngine.request<DocumentPageText[]>(
+          "document_text",
+          { paper_id: paperId, pdf_path: pdfPath },
+          60_000,
+        ),
+        signal,
+      );
+      signal.throwIfAborted();
+      return pages;
     },
   );
   ipcMain.handle(
@@ -829,74 +794,43 @@ function registerIpc(): void {
     async (_event, input: CitationGraphExportRequest) => {
       if (
         !input ||
-        (input.format !== "json" && input.format !== "html") ||
+        input.format !== "json" ||
         typeof input.content !== "string"
       ) {
         throw new Error("图谱导出参数不正确。");
       }
-      const config =
-        input.format === "json"
-          ? {
-              title: "导出引文图谱数据",
-              name: "JSON 数据",
-              extension: "json",
-              maximumLength: 80 * 1024 * 1024,
-            }
-          : {
-              title: "导出交互式引文图谱",
-              name: "HTML 网页",
-              extension: "html",
-              maximumLength: 40 * 1024 * 1024,
-            };
-      if (
-        !input.content.length ||
-        input.content.length > config.maximumLength
-      ) {
+      if (!input.content.length || input.content.length > 80 * 1024 * 1024) {
         throw new Error("图谱导出内容为空或体积过大。");
       }
       const date = new Date().toISOString().slice(0, 10);
       const selected = await dialog.showSaveDialog(mainWindow!, {
-        title: config.title,
+        title: "导出引文图谱数据",
         defaultPath: join(
           app.getPath("documents"),
-          `PaperXcel-引文图谱-${date}.${config.extension}`,
+          `PaperXcel-引文图谱-${date}.json`,
         ),
-        filters: [{ name: config.name, extensions: [config.extension] }],
+        filters: [{ name: "JSON 数据", extensions: ["json"] }],
       });
       if (selected.canceled || !selected.filePath) return false;
-      const outputPath = selected.filePath
-        .toLocaleLowerCase()
-        .endsWith(`.${config.extension}`)
+      const outputPath = selected.filePath.toLocaleLowerCase().endsWith(".json")
         ? selected.filePath
-        : `${selected.filePath}.${config.extension}`;
-      if (input.format === "json") {
-        let document: unknown;
-        try {
-          document = JSON.parse(input.content);
-        } catch {
-          throw new Error("生成的引文图谱 JSON 文件无效。");
-        }
-        if (
-          !document ||
-          typeof document !== "object" ||
-          (document as { schemaVersion?: unknown }).schemaVersion !== 1 ||
-          !Array.isArray((document as { nodes?: unknown }).nodes) ||
-          !Array.isArray((document as { edges?: unknown }).edges)
-        ) {
-          throw new Error("生成的引文图谱 JSON 数据结构无效。");
-        }
-        await writeFile(outputPath, input.content, "utf8");
-      } else {
-        if (
-          !input.content
-            .trimStart()
-            .toLocaleLowerCase()
-            .startsWith("<!doctype html>")
-        ) {
-          throw new Error("生成的交互式图谱文件无效。");
-        }
-        await writeFile(outputPath, input.content, "utf8");
+        : `${selected.filePath}.json`;
+      let document: unknown;
+      try {
+        document = JSON.parse(input.content);
+      } catch {
+        throw new Error("生成的引文图谱 JSON 文件无效。");
       }
+      if (
+        !document ||
+        typeof document !== "object" ||
+        (document as { schemaVersion?: unknown }).schemaVersion !== 1 ||
+        !Array.isArray((document as { nodes?: unknown }).nodes) ||
+        !Array.isArray((document as { edges?: unknown }).edges)
+      ) {
+        throw new Error("生成的引文图谱 JSON 数据结构无效。");
+      }
+      await writeFile(outputPath, input.content, "utf8");
       return true;
     },
   );
@@ -1103,18 +1037,30 @@ function registerIpc(): void {
         runPaperChat(input, run, {
           getPaper: (paperId) => store.getPaper(paperId),
           getProvider: () => store.getActiveProvider(),
-          askPaper,
+          createAgentSession: createPaperAgentSession,
           compactConversation: compactPaperConversation,
-          planResearch: planPaperResearch,
           resolveAttachments: resolveRequestedChatAttachments,
-          includePaperPdf: includeCurrentPaperPdf,
           searchEvidence: searchPaperEvidence,
+          readPaperPages: readPaperPagesForAgent,
           hydrateImages: hydrateSelectionImages,
-          ensureMarkdown: ensurePaperMarkdownArtifact,
-          repairMarkdown: runPaperMarkdownRepair,
+          repairMarkdown: (paperId, requestId, signal, onEvent) =>
+            runPaperMarkdownRepair(
+              paperId,
+              requestId,
+              signal,
+              onEvent,
+              (content, _done, update) =>
+                run.progress({
+                  phase: "answering",
+                  answerContent: content,
+                  detail: update?.detail ?? "正在逐页重建正文",
+                }),
+              (progress) =>
+                run.progress({ phase: "preparing", detail: progress.detail }),
+            ),
         }),
       input.task === "repair-markdown"
-        ? "Markdown 修复完成"
+        ? "Markdown 重建完成"
         : input.task === "compact"
           ? "上下文压缩完成"
           : "文献回答完成",
@@ -1131,6 +1077,12 @@ function registerIpc(): void {
   ipcMain.handle(
     "notes:save",
     async (_event, paperId: string, content: string) => {
+      if (
+        [...noteGenerationOwners.values()].some(
+          (owner) => owner.paperId === paperId,
+        )
+      )
+        throw new Error("请先停止笔记生成，再保存编辑。");
       const paper = store.getPaper(paperId);
       if (!paper) throw new Error("文献不存在。");
       const note = store.savePaperNote(paperId, content);
@@ -1139,136 +1091,115 @@ function registerIpc(): void {
         paper,
         note,
       );
+      await removePaperTextDraft(
+        resolvePaperArtifactDirectory(paperId),
+        "note",
+      );
       return note;
     },
+  );
+  ipcMain.handle("notes:get-draft", (_event, paperId: string) =>
+    readNoteGenerationDraft(paperId),
   );
   ipcMain.handle(
     "notes:generate",
     async (event, paperId: string, requestedId?: string) => {
-      const requestId = requestedId || crypto.randomUUID();
+      const requestId = requestedId?.trim() || crypto.randomUUID();
+      if (
+        noteGenerationOwners.has(requestId) ||
+        [...noteGenerationOwners.values()].some(
+          (owner) => owner.paperId === paperId,
+        )
+      )
+        throw new Error("这篇论文的笔记正在生成，请先停止或等待完成。");
+      const paper = store.getPaper(paperId);
+      if (!paper) throw new Error("文献不存在。");
+      const pdfPath = store.resolvePaperPath(paperId);
+      if (!pdfPath) throw new Error("论文 PDF 文件不存在。");
+      const provider = store.getActiveProvider();
+      const directory = resolvePaperArtifactDirectory(paperId);
       const controller = new AbortController();
+      const owner = { senderId: event.sender.id, paperId, committing: false };
+      noteGenerationOwners.set(requestId, owner);
       noteGenerationAbortControllers.set(requestId, controller);
+      const onDestroyed = () => {
+        if (!owner.committing) controller.abort();
+      };
+      event.sender.once("destroyed", onDestroyed);
       let sequence = 0;
+      let agentSequence = 0;
+      let savedNote: PaperNote | undefined;
       const emit = (
-        value: Omit<AgentEvent, "requestId" | "sequence" | "timestamp">,
-      ): void => {
+        type: AgentEvent["type"],
+        title: string,
+        detail?: string,
+      ) => {
         if (event.sender.isDestroyed()) return;
         event.sender.send("notes:agent-event", {
           requestId,
-          sequence: ++sequence,
+          sequence: ++agentSequence,
           timestamp: new Date().toISOString(),
-          ...value,
+          type,
+          title,
+          detail,
         } satisfies AgentEvent);
       };
       try {
-        const paper = store.getPaper(paperId);
-        if (!paper) throw new Error("文献不存在。");
-        const pdfPath = store.resolvePaperPath(paperId);
-        if (!pdfPath) throw new Error("论文 PDF 文件不存在。");
-        emit({
-          type: "run.started",
-          title: "开始生成阅读笔记",
-          detail: paper.title,
-          status: "running",
-        });
-        emit({
-          type: "plan.created",
-          title: "执行计划",
-          detail: "准备全文 → 分批提取带页码证据 → 综合阅读笔记 → 保存并验证",
-          status: "completed",
-        });
-        emit({
-          type: "tool.started",
-          title: "准备论文全文",
-          detail: "检查 PDF.js 转换结果和本地全文缓存",
-          tool: "prepare_paper_markdown",
-          stepId: "prepare-markdown",
-          status: "running",
-        });
-        const markdownPath = await ensurePaperMarkdownArtifact(paperId).catch(
-          () => undefined,
-        );
-        if (controller.signal.aborted) {
-          throw new DOMException("The operation was aborted.", "AbortError");
-        }
-        emit({
-          type: "tool.completed",
-          title: "论文全文已准备",
-          detail: markdownPath ? "使用本地 full.md" : "使用原始 PDF",
-          tool: "prepare_paper_markdown",
-          stepId: "prepare-markdown",
-          status: "completed",
-        });
-        emit({
-          type: "step.started",
-          title: "提取分批证据并生成总结",
-          detail: "长论文按页面分批处理，再执行 Map-Reduce 综合",
-          stepId: "summarize-paper",
-          status: "running",
-        });
-        const result = await generatePaperNote(
-          store.getActiveProvider(),
-          { paper, pdfPath, markdownPath },
-          {
-            signal: controller.signal,
-            checkpoint: createPaperAgentBatchCheckpoint(
-              resolvePaperArtifactDirectory(paperId),
-            ),
-            onProgress: (progress) => {
-              const contentSnapshot = progress.answerContent;
-              emit({
-                type:
-                  contentSnapshot !== undefined
-                    ? "content.snapshot"
-                    : progress.answerDelta
-                      ? "content.delta"
-                      : "progress.updated",
-                title: progress.detail || "正在生成阅读笔记",
-                detail: progress.answerDelta ? undefined : progress.detail,
-                delta: progress.answerDelta,
-                stepId: "summarize-paper",
-                status: "running",
-                metadata:
-                  contentSnapshot !== undefined
-                    ? { content: contentSnapshot }
-                    : undefined,
-              });
-            },
+        emit("run.started", "正在准备阅读笔记", paper.title);
+        const result = await runPaperTextTask({
+          paperId,
+          pdfPath,
+          directory,
+          model: provider.model,
+          pageCount: paper.pageCount ?? 0,
+          kind: "note",
+          signal: controller.signal,
+          onCommit: () => {
+            owner.committing = true;
           },
-        );
-        emit({
-          type: "step.completed",
-          title: "论文总结已生成",
-          stepId: "summarize-paper",
-          status: "completed",
-          metadata: { source: result.source, model: result.model },
+          onUpdate: (update, status) => {
+            if (!event.sender.isDestroyed())
+              event.sender.send("notes:progress", {
+                ...update,
+                requestId,
+                paperId,
+                sequence: ++sequence,
+                done: Boolean(status),
+                status,
+              } satisfies PaperNoteStream);
+          },
+          operation: async (onTextUpdate) => {
+            const pages = await readPaperPagesForAgent(
+              paperId,
+              controller.signal,
+            );
+            controller.signal.throwIfAborted();
+            return generatePaperNote(
+              provider,
+              { paper, pdfPath, pages },
+              {
+                signal: controller.signal,
+                checkpoint: createAgentBatchCheckpoint(directory),
+                onTextUpdate,
+                onProgress: (progress) => {
+                  if (
+                    !controller.signal.aborted &&
+                    progress.answerContent === undefined &&
+                    !progress.answerDelta
+                  )
+                    emit("progress.updated", progress.detail);
+                },
+              },
+            );
+          },
+          commit: async (result) => {
+            savedNote = store.savePaperNote(paperId, result.content);
+            await writePaperNoteArtifact(directory, paper, savedNote);
+          },
         });
-        emit({
-          type: "verification.started",
-          title: "保存并验证阅读笔记",
-          tool: "save_paper_note",
-          status: "running",
-        });
-        const note = store.savePaperNote(paperId, result.content);
-        await writePaperNoteArtifact(
-          resolvePaperArtifactDirectory(paperId),
-          paper,
-          note,
-        );
-        emit({
-          type: "verification.completed",
-          title: "阅读笔记已保存",
-          detail: "已写入本地笔记与 Markdown 工件",
-          tool: "save_paper_note",
-          status: "completed",
-        });
-        emit({
-          type: "run.completed",
-          title: "文献总结完成",
-          status: "completed",
-        });
+        emit("run.completed", "阅读笔记已保存");
         return {
-          note,
+          note: savedNote!,
           protocol: result.protocol,
           model: result.model,
           source: result.source,
@@ -1276,31 +1207,31 @@ function registerIpc(): void {
         };
       } catch (error) {
         if (controller.signal.aborted || isAbortError(error)) {
-          emit({
-            type: "run.cancelled",
-            title: "阅读笔记生成已停止",
-            detail: "已完成的证据批次会在下次继续生成时复用",
-            status: "failed",
-          });
-          return { cancelled: true as const };
+          emit("run.cancelled", "笔记生成已停止", "已收到的内容保留为草稿");
+          return {
+            cancelled: true as const,
+            note: (await readNoteGenerationDraft(paperId)) ?? undefined,
+          };
         }
-        emit({
-          type: "run.failed",
-          title: "阅读笔记生成失败",
-          detail: error instanceof Error ? error.message : String(error),
-          status: "failed",
-        });
+        emit(
+          "run.failed",
+          "笔记生成失败",
+          error instanceof Error ? error.message : String(error),
+        );
         throw error;
       } finally {
         noteGenerationAbortControllers.delete(requestId);
+        noteGenerationOwners.delete(requestId);
+        event.sender.removeListener("destroyed", onDestroyed);
       }
     },
   );
-  ipcMain.handle("notes:cancel", (_event, requestId: string) => {
+  ipcMain.handle("notes:cancel", (event, requestId: string) => {
+    const owner = noteGenerationOwners.get(requestId);
     const controller = noteGenerationAbortControllers.get(requestId);
-    if (!controller) return false;
+    if (!controller || owner?.senderId !== event.sender.id || owner.committing)
+      return false;
     controller.abort();
-    noteGenerationAbortControllers.delete(requestId);
     return true;
   });
   ipcMain.handle("notes:export-markdown", async (_event, paperId: string) => {
@@ -1501,82 +1432,74 @@ function registerIpc(): void {
 
   ipcMain.handle(
     "knowledge-base:preview-markdown",
-    async (_event, paperId: string, version?: "ai" | "original") => {
-      const paper = store.listPapers().find((item) => item.id === paperId);
+    async (_event, paperId: string) => {
+      const paper = store.getPaper(paperId);
       if (!paper) throw new Error("论文不存在。");
       const pdfPath = store.resolvePaperPath(paperId);
       if (!pdfPath) throw new Error("论文 PDF 文件不存在。");
-      const directory = resolvePaperArtifactDirectory(paperId);
+      const draft = await readRepairDraftPreview(paperId);
+      if (draft) return draft;
       const cached = await readKnowledgeMarkdownRepairCache(
-        directory,
+        resolvePaperArtifactDirectory(paperId),
         paperId,
         pdfPath,
         legacyKnowledgeMarkdownCacheRoot(),
       );
-      if (cached && version !== "original") {
-        await writePaperTextArtifacts(directory, paper, { repair: cached });
-        await reindexPaperMarkdown(paperId);
-        const originalMarkdown = await readFile(
-          join(directory, "full.raw.md"),
-          "utf8",
-        ).catch(() => "");
+      if (cached?.sourceMode === "pdf-rebuild")
         return {
           paperId,
           markdown: cached.markdown,
           pageCount: cached.pageCount,
-          generatedAt: new Date().toISOString(),
+          generatedAt: cached.repairedAt,
           aiRepaired: true,
-          hasAiRepairedVersion: true,
           model: cached.model,
+          protocol: cached.protocol,
           repairedAt: cached.repairedAt,
-          warnings: cached.warnings,
-          repairReport: cached.repairReport,
-          comparison: originalMarkdown
-            ? compareMarkdownVersions(originalMarkdown, cached.markdown)
-            : undefined,
         };
-      }
-      const rawMarkdown = await readFile(
-        join(directory, "full.raw.md"),
-        "utf8",
-      ).catch(() => "");
-      const pages = rawMarkdown
-        ? []
-        : await documentEngine.request<DocumentPageText[]>(
-            "document_text",
-            {
-              paper_id: paperId,
-              index_dir: join(app.getPath("userData"), "indexes"),
-            },
-            60_000,
-          );
-      if (!rawMarkdown && !pages.length) {
-        throw new Error("没有可读取的 PDF.js 页面文本。");
-      }
-      if (!rawMarkdown)
-        await writePaperTextArtifacts(directory, paper, { rawPages: pages });
+      // No extracted-text preview. The PDF is the source; Markdown starts blank.
       return {
         paperId,
-        markdown: rawMarkdown || buildPaperFullTextMarkdown(paper, pages),
-        pageCount: rawMarkdown ? (paper.pageCount ?? 0) : pages.length,
+        markdown: "",
+        pageCount: paper.pageCount ?? 0,
         generatedAt: new Date().toISOString(),
         aiRepaired: false,
-        hasAiRepairedVersion: Boolean(cached),
       };
     },
   );
 
   ipcMain.handle(
     "knowledge-base:repair-markdown",
-    async (event, paperId: string, requestedRequestId?: string) => {
+    async (
+      event,
+      paperId: string,
+      requestedRequestId?: string,
+      mode: "restart" | "retry" = "restart",
+    ) => {
       const requestId = requestedRequestId?.trim() || crypto.randomUUID();
+      if (
+        markdownRepairOwners.has(requestId) ||
+        [...markdownRepairOwners.values()].some(
+          (owner) => owner.paperId === paperId,
+        )
+      )
+        throw new Error("这篇论文正在生成 Markdown，请先停止或等待完成。");
       const controller = new AbortController();
+      const owner = { senderId: event.sender.id, paperId, committing: false };
+      markdownRepairOwners.set(requestId, owner);
+      knowledgeMarkdownRepairAbortControllers.set(requestId, controller);
+      const onDestroyed = () => {
+        if (!owner.committing) controller.abort();
+      };
+      event.sender.once("destroyed", onDestroyed);
       let agentSequence = 0;
+      let streamSequence = 0;
+      const send = (channel: string, value: unknown) => {
+        if (!event.sender.isDestroyed()) event.sender.send(channel, value);
+      };
       const sendAgentEvent = (
         value: Omit<AgentEvent, "requestId" | "sequence" | "timestamp">,
-      ): void => {
-        if (event.sender.isDestroyed()) return;
-        event.sender.send("knowledge-base:agent-event", {
+      ) => {
+        send("knowledge-base:agent-event", {
           requestId,
           sequence: ++agentSequence,
           timestamp: new Date().toISOString(),
@@ -1585,49 +1508,42 @@ function registerIpc(): void {
       };
       let timedOut = false;
       const timeout = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
+        if (!owner.committing) {
+          timedOut = true;
+          controller.abort();
+        }
       }, MARKDOWN_REPAIR_TIMEOUT_MS);
-      knowledgeMarkdownRepairAbortControllers.set(requestId, controller);
-
+      timeout.unref?.();
       try {
         sendAgentEvent({
           type: "run.started",
-          title: "启动 Markdown 修复 Agent",
-          detail: "将先检查本地提取质量，再只修复异常批次",
+          title: "开始逐页读取 PDF 并生成 Markdown",
           status: "running",
-        });
-        sendAgentEvent({
-          type: "plan.created",
-          title: "执行计划",
-          detail:
-            "读取 PDF.js 原文 → 分批质量诊断 → 修复异常批次 → 完整性校验 → 写回缓存与索引",
-          status: "completed",
         });
         const result = await runPaperMarkdownRepair(
           paperId,
           requestId,
           controller.signal,
-          undefined,
           sendAgentEvent,
-          (content, done) => {
-            mainWindow?.webContents.send("knowledge-base:markdown-preview", {
+          (content, done, update, status) =>
+            send("knowledge-base:markdown-preview", {
+              ...update,
               requestId,
               paperId,
               content,
               characters: content.length,
               done,
-              previewOnly: !done,
+              status,
+              sequence: ++streamSequence,
+              previewOnly: status !== "complete",
               generatedAt: new Date().toISOString(),
-            } satisfies KnowledgeBaseMarkdownStream);
-          },
+            } satisfies KnowledgeBaseMarkdownStream),
+          (progress) => send("knowledge-base:progress", progress),
+          mode === "retry" ? "retry" : "restart",
         );
         sendAgentEvent({
           type: "run.completed",
-          title: "Markdown 修复 Agent 完成",
-          detail: result.repairReport
-            ? `共 ${result.repairReport.batchCount} 批，修复 ${result.repairReport.repairedBatchCount} 批，保留 ${result.repairReport.preservedBatchCount} 批`
-            : `已完成 ${result.pageCount} 页处理`,
+          title: "新生成的 Markdown 已保存",
           status: "completed",
         });
         return result;
@@ -1635,38 +1551,33 @@ function registerIpc(): void {
         if (controller.signal.aborted || isAbortError(error)) {
           sendAgentEvent({
             type: "run.cancelled",
-            title: timedOut ? "修复任务超时" : "修复任务已停止",
+            title: timedOut ? "生成超时，草稿已保留" : "生成已停止，草稿已保留",
             status: "failed",
           });
-          if (timedOut) {
-            throw new Error("AI 文件修复超过 20 分钟，已自动停止。", {
-              cause: error,
-            });
-          }
-          mainWindow?.webContents.send("knowledge-base:progress", {
-            requestId,
-            phase: "cancelled",
-            completed: 0,
-            total: 1,
-            paperId,
-            detail: "文件修复已停止",
-          } satisfies KnowledgeBaseRepairProgress);
-          return { cancelled: true as const };
+          if (timedOut)
+            throw new Error(
+              "Markdown 生成达到运行时限，已生成文字保留为草稿。",
+              {
+                cause: error,
+              },
+            );
+          return {
+            cancelled: true as const,
+            preview: (await readRepairDraftPreview(paperId)) ?? undefined,
+          };
         }
         sendAgentEvent({
           type: "run.failed",
-          title: "Markdown 修复失败",
+          title: "Markdown 生成未完成，草稿已保留",
           detail: error instanceof Error ? error.message : String(error),
           status: "failed",
         });
         throw error;
       } finally {
         clearTimeout(timeout);
-        if (
-          knowledgeMarkdownRepairAbortControllers.get(requestId) === controller
-        ) {
-          knowledgeMarkdownRepairAbortControllers.delete(requestId);
-        }
+        knowledgeMarkdownRepairAbortControllers.delete(requestId);
+        markdownRepairOwners.delete(requestId);
+        event.sender.removeListener("destroyed", onDestroyed);
       }
     },
   );
@@ -1771,6 +1682,7 @@ function registerIpc(): void {
                     pdfPath,
                     {
                       markdown: repairResult.markdown,
+                      sourceMode: repairResult.sourceMode,
                       pageCount: repairResult.pageCount,
                       model: repairResult.model,
                       protocol: repairResult.textProtocol,
@@ -1803,7 +1715,7 @@ function registerIpc(): void {
                     {
                       signal: controller.signal,
                       cachedMarkdown,
-                      checkpoint: createPaperAgentBatchCheckpoint(
+                      checkpoint: createAgentBatchCheckpoint(
                         resolvePaperArtifactDirectory(input.paper.id),
                       ),
                     },
@@ -1830,14 +1742,16 @@ function registerIpc(): void {
       }
     },
   );
-  ipcMain.handle("knowledge-base:cancel", (_event, requestId: string) => {
+  ipcMain.handle("knowledge-base:cancel", (event, requestId: string) => {
+    const owner = markdownRepairOwners.get(requestId);
+    if (owner && (owner.senderId !== event.sender.id || owner.committing))
+      return false;
     const controller =
       knowledgeExportAbortControllers.get(requestId) ??
       knowledgeMarkdownRepairAbortControllers.get(requestId);
     if (!controller) return false;
     controller.abort();
     knowledgeExportAbortControllers.delete(requestId);
-    knowledgeMarkdownRepairAbortControllers.delete(requestId);
     return true;
   });
 
@@ -1864,477 +1778,82 @@ function registerIpc(): void {
   ipcMain.handle(
     "search:ask-library",
     async (event, input: LibraryAskInput): Promise<LibraryAskResult> => {
-      const requestId = input.requestId || crypto.randomUUID();
-      const controller = new AbortController();
-      let sequence = 0;
-      let lastActivityAt = Date.now();
-      const emitAgent = (
-        value: Omit<AgentEvent, "requestId" | "sequence" | "timestamp">,
-      ): void => {
-        if (event.sender.isDestroyed()) return;
-        event.sender.send("search:agent-event", {
-          requestId,
-          sequence: ++sequence,
-          timestamp: new Date().toISOString(),
-          ...value,
-        } satisfies AgentEvent);
-      };
-      const emitProgress = (
-        progress: Omit<ChatProgress, "requestId">,
-      ): void => {
-        if (event.sender.isDestroyed()) return;
-        lastActivityAt = Date.now();
-        const publicProgress = toPublicChatProgress(progress);
-        event.sender.send("search:progress", {
-          requestId,
-          ...publicProgress,
-        } satisfies ChatProgress);
-        if (progress.answerDelta) {
-          emitAgent({
-            type: "content.delta",
-            title: "正在生成全库回答",
-            delta: progress.answerDelta,
-            status: "running",
-          });
-        } else if (progress.answerContent !== undefined) {
-          emitAgent({
-            type: "content.snapshot",
-            title: "正在生成全库回答",
-            detail: progress.detail || "已收到回答快照",
-            metadata: { content: progress.answerContent },
-            status: "running",
-          });
-        } else if (progress.phase === "thinking") {
-          emitAgent({
-            type: "progress.updated",
-            title: progress.detail || "正在分析证据",
-            detail: "正在执行当前公开研究阶段；模型私有推理不会发送到界面。",
-            status: "running",
-          });
-        }
-      };
-      libraryAskAbortControllers.set(requestId, controller);
-      const progressHeartbeat = setInterval(() => {
-        const silentForMs = Date.now() - lastActivityAt;
-        if (silentForMs < 5_000 || event.sender.isDestroyed()) return;
-        emitAgent({
-          type: "progress.updated",
-          title: "等待当前研究步骤返回",
-          detail: `已连续 ${Math.floor(
-            silentForMs / 1_000,
-          )}s 未收到新的检索或模型事件`,
-          status: "running",
-        });
-      }, 2_000);
-      progressHeartbeat.unref();
-      const totalTimeout = setTimeout(
-        () => controller.abort(),
-        LIBRARY_ASK_TIMEOUT_MS,
+      const query = input.query.trim();
+      if (!query) throw new Error("请输入全库研究问题。");
+      const credentials = store.getActiveProvider();
+      let answer: LibraryAskResult | undefined;
+      const response = await libraryChatRuns.execute(
+        {
+          id: event.sender.id,
+          isDestroyed: () => event.sender.isDestroyed(),
+          once: (name, listener) => event.sender.once(name, listener),
+          removeListener: (name, listener) =>
+            event.sender.removeListener(name, listener),
+          send: (channel, payload) =>
+            event.sender.send(
+              channel === "chat:progress"
+                ? "search:progress"
+                : "search:agent-event",
+              payload,
+            ),
+        },
+        { requestId: input.requestId, paperId: "__library__" },
+        async (run) => {
+          answer = await runLibraryAgent(
+            credentials,
+            { ...input, query },
+            run,
+            {
+              papers: store.listPapers(),
+              search: async (text, limit) =>
+                (
+                  await withTimeout(
+                    searchLibraryIndex(text, limit),
+                    LIBRARY_SEARCH_TIMEOUT_MS,
+                    "文献库检索超时。",
+                  )
+                ).map((hit) => ({
+                  paperId: hit.paper_id,
+                  chunkId: hit.chunk_id,
+                  page: hit.page,
+                  text: hit.text,
+                  score: hit.score,
+                })),
+              readPages: readPaperPagesForAgent,
+              createSession: createLibraryAgentSession,
+            },
+          );
+          return {
+            message: {
+              id: crypto.randomUUID(),
+              role: "assistant",
+              content: answer.content,
+              createdAt: new Date().toISOString(),
+              contextUsage: answer.contextUsage,
+            },
+            protocol: answer.protocol,
+            model: answer.model,
+          };
+        },
+        "全库研究完成",
       );
-      totalTimeout.unref();
-      emitAgent({
-        type: "run.started",
-        title: "开始全库研究",
-        detail: input.query.trim(),
-        status: "running",
-      });
-      try {
-        const query = input.query.trim();
-        if (!query) throw new Error("请输入全库研究问题。");
-        if (query.length > 500) {
-          throw new Error("全库研究问题不能超过 500 个字符。");
-        }
-        const paperById = new Map(
-          store.listPapers().map((paper) => [paper.id, paper]),
-        );
-        const seenHits = new Set<string>();
-        const requestedHits = input.selectedHits ?? [];
-        const selectedHits = requestedHits
-          .slice(0, 30)
-          .flatMap((hit): LibraryIndexHit[] => {
-            const paperId = hit.paperId.trim();
-            const chunkId = hit.chunkId.trim();
-            const text = hit.text.trim().slice(0, 12_000);
-            const page = Math.max(1, Math.trunc(hit.page));
-            const key = `${paperId}:${chunkId}`;
-            if (
-              !paperId ||
-              !chunkId ||
-              !text ||
-              !paperById.has(paperId) ||
-              seenHits.has(key)
-            ) {
-              return [];
-            }
-            seenHits.add(key);
-            return [
-              {
-                paper_id: paperId,
-                chunk_id: chunkId,
-                page,
-                text,
-                score: Number.isFinite(hit.score) ? hit.score : 0,
-              },
-            ];
-          });
-        const sourceMode = selectedHits.length ? "selected" : "retrieved";
-        let researchQueries = [query];
-        if (sourceMode === "retrieved") {
-          emitAgent({
-            type: "step.started",
-            title: "制定研究检索计划",
-            detail: "模型正在把问题拆成可执行的证据检索任务",
-            stepId: "plan-research",
-            status: "running",
-          });
-          try {
-            const plan = await planLibraryResearch(
-              store.getActiveProvider(),
-              {
-                question: query,
-                history: (input.history ?? []).slice(-8),
-                reasoningEffort: input.reasoningEffort,
-              },
-              { signal: controller.signal },
-            );
-            researchQueries = plan.queries;
-            emitAgent({
-              type: "plan.created",
-              title: "研究计划已生成",
-              detail: plan.rationale,
-              stepId: "plan-research",
-              status: "completed",
-              metadata: {
-                queries: plan.queries,
-                expectedEvidence: plan.expectedEvidence,
-              },
-            });
-          } catch (error) {
-            if (controller.signal.aborted || isAbortError(error)) throw error;
-            emitAgent({
-              type: "plan.created",
-              title: "使用保底检索计划",
-              detail:
-                error instanceof Error
-                  ? `规划模型未返回有效计划，直接检索原问题：${error.message}`
-                  : "规划模型未返回有效计划，直接检索原问题。",
-              stepId: "plan-research",
-              status: "completed",
-              metadata: { queries: researchQueries, fallback: true },
-            });
-          }
-        }
-        let rawHits: LibraryIndexHit[];
-        if (selectedHits.length) {
-          emitAgent({
-            type: "tool.started",
-            title: "读取选中证据",
-            detail: `${selectedHits.length} 个用户选中片段`,
-            tool: "library-search",
-            status: "running",
-          });
-          rawHits = selectedHits;
-          emitAgent({
-            type: "tool.completed",
-            title: "选中证据已读取",
-            detail: `${selectedHits.length} 个有效片段`,
-            tool: "library-search",
-            status: "completed",
-          });
-        } else {
-          if (requestedHits.length) {
-            emitAgent({
-              type: "progress.updated",
-              title: "选中证据已失效",
-              detail: "固定片段不再存在，已自动切换为全文检索。",
-              status: "completed",
-            });
-          }
-          const queryHits = await Promise.all(
-            researchQueries.map(async (researchQuery, queryIndex) => {
-              if (controller.signal.aborted) {
-                throw new DOMException(
-                  "The operation was aborted.",
-                  "AbortError",
-                );
-              }
-              emitAgent({
-                type: "tool.started",
-                title: `检索文献库 ${queryIndex + 1}/${researchQueries.length}`,
-                detail: researchQuery,
-                tool: "library-search",
-                status: "running",
-                metadata: { query: researchQuery, queryIndex },
-              });
-              const result = await withTimeout(
-                searchLibraryIndex(researchQuery, 30),
-                LIBRARY_SEARCH_TIMEOUT_MS,
-                `文献库检索超时：${researchQuery}`,
-              );
-              if (controller.signal.aborted) {
-                throw new DOMException(
-                  "The operation was aborted.",
-                  "AbortError",
-                );
-              }
-              emitAgent({
-                type: "tool.completed",
-                title: `文献库检索完成 ${queryIndex + 1}/${researchQueries.length}`,
-                detail: `${researchQuery}：${result.length} 个候选片段`,
-                tool: "library-search",
-                status: "completed",
-                metadata: {
-                  query: researchQuery,
-                  queryIndex,
-                  evidenceCount: result.length,
-                },
-              });
-              return result;
-            }),
-          );
-          rawHits = queryHits.flat();
-        }
-        emitAgent({
-          type: "step.completed",
-          title: "证据检索全部完成",
-          detail: `${rawHits.length} 个候选片段`,
-          stepId: "retrieve-evidence",
-          status: "completed",
-        });
-        const hits = rawHits
-          .sort((left, right) => right.score - left.score)
-          .filter((hit, index, all) => {
-            const key = `${hit.paper_id}:${hit.chunk_id}`;
-            return (
-              all.findIndex(
-                (candidate) =>
-                  `${candidate.paper_id}:${candidate.chunk_id}` === key,
-              ) === index
-            );
-          })
-          .slice(0, 80);
-        if (!hits.length) {
-          throw new Error("尚未检索到可用论文内容，请等待文献解析完成。");
-        }
-        emitAgent({
-          type: "step.completed",
-          title: "论文证据已准备",
-          detail: `${hits.length} 个去重片段，来自 ${researchQueries.length} 路检索`,
-          stepId: "prepare-evidence",
-          status: "completed",
-          metadata: {
-            queryCount: researchQueries.length,
-            evidenceCount: hits.length,
-          },
-        });
-        const paperIds = [...new Set(hits.map((hit) => hit.paper_id))].filter(
-          (paperId) => paperById.has(paperId),
-        );
-        const labelByPaperId = new Map(
-          paperIds.map((paperId, index) => [paperId, `P${index + 1}`]),
-        );
-        const sources = hits.flatMap((hit) => {
-          const paperLabel = labelByPaperId.get(hit.paper_id);
-          if (!paperLabel) return [];
-          return [
-            {
-              paperId: hit.paper_id,
-              paperLabel,
-              chunk_id: hit.chunk_id,
-              page: hit.page,
-              text: hit.text,
-            },
-          ];
-        });
-        const history = (input.history ?? []).slice(-12).flatMap((message) => {
-          const content = message.content.trim().slice(0, 12_000);
-          if (
-            !content ||
-            (message.role !== "user" && message.role !== "assistant")
-          ) {
-            return [];
-          }
-          return [{ role: message.role, content }];
-        });
-        emitAgent({
-          type: "step.started",
-          title: "综合多篇论文证据",
-          detail: `覆盖 ${paperIds.length} 篇论文`,
-          stepId: "synthesize",
-          status: "running",
-        });
-        let result = await answerLibraryQuestion(
-          store.getActiveProvider(),
-          {
-            question: query,
-            reasoningEffort: input.reasoningEffort,
-            papers: paperIds.map((paperId) => ({
-              id: paperId,
-              label: labelByPaperId.get(paperId)!,
-              title: paperById.get(paperId)!.title,
-            })),
-            sources,
-            history,
-            sourceMode,
-          },
-          {
-            signal: controller.signal,
-            onProgress: emitProgress,
-          },
-        );
-        if (result.citations.length === 0 && sourceMode === "retrieved") {
-          emitAgent({
-            type: "verification.started",
-            title: "证据不足，扩大检索范围",
-            detail: "从 30 个候选片段扩大到 80 个，并重新筛选论文证据。",
-            status: "running",
-          });
-          const expandedHits = (
-            await Promise.all(
-              researchQueries.map(async (researchQuery, queryIndex) => {
-                if (controller.signal.aborted) {
-                  throw new DOMException(
-                    "The operation was aborted.",
-                    "AbortError",
-                  );
-                }
-                emitAgent({
-                  type: "tool.started",
-                  title: `扩大文献库检索 ${queryIndex + 1}/${researchQueries.length}`,
-                  detail: researchQuery,
-                  tool: "library-search-expanded",
-                  status: "running",
-                });
-                const queryResult = await withTimeout(
-                  searchLibraryIndex(researchQuery, 80),
-                  LIBRARY_SEARCH_TIMEOUT_MS,
-                  `扩展文献库检索超时：${researchQuery}`,
-                );
-                emitAgent({
-                  type: "tool.completed",
-                  title: `扩大检索完成 ${queryIndex + 1}/${researchQueries.length}`,
-                  detail: `${queryResult.length} 个候选片段`,
-                  tool: "library-search-expanded",
-                  status: "completed",
-                });
-                return queryResult;
-              }),
-            )
-          )
-            .flat()
-            .sort((left, right) => right.score - left.score)
-            .filter((hit, index, all) => {
-              const key = `${hit.paper_id}:${hit.chunk_id}`;
-              return (
-                all.findIndex(
-                  (candidate) =>
-                    `${candidate.paper_id}:${candidate.chunk_id}` === key,
-                ) === index
-              );
-            })
-            .slice(0, 120);
-          const expandedPaperIds = [
-            ...new Set(expandedHits.map((hit) => hit.paper_id)),
-          ].filter((paperId) => paperById.has(paperId));
-          const expandedLabelByPaperId = new Map(
-            expandedPaperIds.map((paperId, index) => [
-              paperId,
-              `P${index + 1}`,
-            ]),
-          );
-          const expandedSources = expandedHits.flatMap((hit) => {
-            const paperLabel = expandedLabelByPaperId.get(hit.paper_id);
-            return paperLabel
-              ? [
-                  {
-                    paperId: hit.paper_id,
-                    paperLabel,
-                    chunk_id: hit.chunk_id,
-                    page: hit.page,
-                    text: hit.text,
-                  },
-                ]
-              : [];
-          });
-          result = await answerLibraryQuestion(
-            store.getActiveProvider(),
-            {
-              question: query,
-              reasoningEffort: input.reasoningEffort,
-              papers: expandedPaperIds.map((paperId) => ({
-                id: paperId,
-                label: expandedLabelByPaperId.get(paperId)!,
-                title: paperById.get(paperId)!.title,
-              })),
-              sources: expandedSources,
-              history,
-              sourceMode: "retrieved",
-            },
-            {
-              signal: controller.signal,
-              onProgress: emitProgress,
-            },
-          );
-        }
-        result.citationVerification =
-          result.citations.length > 0
-            ? {
-                status: "verified",
-                detail: `已定位 ${result.citations.length} 条跨文献引用。`,
-              }
-            : {
-                status: "unverified",
-                detail:
-                  "扩大检索并重新生成后仍未获得可定位引用，请把当前回答视为未验证结果。",
-              };
-        emitAgent({
-          type: "verification.completed",
-          title:
-            result.citationVerification.status === "verified"
-              ? "引用定位已完成"
-              : "引用验证未通过",
-          detail: result.citationVerification.detail,
-          status:
-            result.citationVerification.status === "verified"
-              ? "completed"
-              : "failed",
-        });
-        emitAgent({
-          type: "run.completed",
-          title: "全库研究完成",
-          status: "completed",
-        });
-        return result;
-      } catch (error) {
-        if (controller.signal.aborted || isAbortError(error)) {
-          emitAgent({
-            type: "run.cancelled",
-            title: "全库研究已取消",
-            status: "completed",
-          });
-          throw new Error("全库研究已取消。", { cause: error });
-        }
-        emitAgent({
-          type: "run.failed",
-          title: "全库研究失败",
-          detail: error instanceof Error ? error.message : String(error),
-          status: "failed",
-        });
-        throw error;
-      } finally {
-        clearInterval(progressHeartbeat);
-        clearTimeout(totalTimeout);
-        libraryAskAbortControllers.delete(requestId);
-      }
+      if ("cancelled" in response)
+        return {
+          cancelled: true,
+          content: response.answerContent ?? "",
+          citations: [],
+          protocol:
+            credentials.protocol === "chat-completions"
+              ? "chat-completions"
+              : "responses",
+          model: credentials.model,
+        };
+      return answer!;
     },
   );
-  ipcMain.handle("search:cancel-ask-library", (_event, requestId: string) => {
-    const controller = libraryAskAbortControllers.get(requestId);
-    if (!controller) return false;
-    controller.abort();
-    libraryAskAbortControllers.delete(requestId);
-    return true;
-  });
+  ipcMain.handle("search:cancel-ask-library", (event, requestId: string) =>
+    libraryChatRuns.cancel(event.sender.id, requestId),
+  );
 
   // 保留既有 IPC 名称，避免破坏 preload 与已发布版本的前端契约。
   ipcMain.handle("worker:status", () => documentEngine.status());
@@ -2404,36 +1923,65 @@ async function searchPaperEvidence(
   query: string,
   limit = 6,
 ): Promise<PaperEvidenceCandidate[]> {
-  try {
-    const hits = await documentEngine.request<
-      Array<{ page: number; text: string; score: number }>
-    >(
-      "search",
-      {
-        paper_id: paperId,
-        query: query.trim(),
-        index_dir: join(app.getPath("userData"), "indexes"),
-        limit: Math.max(1, Math.min(limit, 30)),
-      },
-      120_000,
-    );
-    return hits
-      .filter((hit) => Number.isInteger(hit.page) && hit.text?.trim())
-      .sort((left, right) => right.score - left.score)
-      .slice(0, Math.max(1, Math.min(limit, 24)))
-      .map((hit) => ({
-        page: hit.page,
-        text: hit.text.slice(0, 6_000),
-        score: hit.score,
-        query,
-      }));
-  } catch {
-    // The PDF index may still be processing. Full-document context remains
-    // available, so a missing local search index must not fail the question.
-    return [];
-  }
+  const hits = await documentEngine.request<
+    Array<{ page: number; text: string; score: number }>
+  >(
+    "search",
+    {
+      paper_id: paperId,
+      query: query.trim(),
+      index_dir: join(app.getPath("userData"), "indexes"),
+      limit: Math.max(1, Math.min(limit, 24)),
+    },
+    120_000,
+  );
+  return hits
+    .filter(
+      (hit) => Number.isInteger(hit.page) && hit.page > 0 && hit.text?.trim(),
+    )
+    .sort((left, right) => right.score - left.score)
+    .slice(0, Math.max(1, Math.min(limit, 24)))
+    .map((hit) => ({ ...hit, query }));
 }
 
+/** Reads the existing index, or the original PDF when an index is unavailable. */
+async function readPaperPagesForAgent(
+  paperId: string,
+  signal: AbortSignal,
+): Promise<DocumentPageText[]> {
+  signal.throwIfAborted();
+  try {
+    const pages = await waitForAbort(
+      documentEngine.request<DocumentPageText[]>(
+        "document_text",
+        {
+          paper_id: paperId,
+          index_dir: join(app.getPath("userData"), "indexes"),
+        },
+        60_000,
+      ),
+      signal,
+    );
+    signal.throwIfAborted();
+    if (pages.some((page) => page.text.trim())) return pages;
+  } catch {
+    signal.throwIfAborted();
+    // A missing index does not prevent a model-requested read of the PDF.
+  }
+  const pdfPath = store.resolvePaperPath(paperId);
+  if (!pdfPath)
+    throw new Error("当前论文 PDF 文件不存在，且索引没有可读取的页面文本。");
+  const pages = await waitForAbort(
+    documentEngine.request<DocumentPageText[]>(
+      "document_text",
+      { paper_id: paperId, pdf_path: pdfPath },
+      60_000,
+    ),
+    signal,
+  );
+  signal.throwIfAborted();
+  return pages;
+}
 function buildLibraryReviewCitationContext(
   snapshot: CitationGraphSnapshot,
   papers: Paper[],
@@ -2539,87 +2087,6 @@ async function resolveRequestedChatAttachments(
       resolveChatAttachment(app.getPath("userData"), attachment),
     ),
   );
-}
-
-async function includeCurrentPaperPdf(
-  paperId: string,
-  attachments: ResolvedChatAttachment[],
-  signal?: AbortSignal,
-): Promise<ResolvedChatAttachment[]> {
-  signal?.throwIfAborted();
-  if (
-    attachments.some(
-      ({ attachment }) =>
-        attachment.kind === "pdf" &&
-        attachment.source === "library" &&
-        attachment.paperId === paperId,
-    )
-  ) {
-    return attachments;
-  }
-
-  const paper = store.getPaper(paperId);
-  if (!paper) throw new Error("文献不存在。");
-  const filePath = store.resolvePaperPath(paperId);
-  if (!filePath) throw new Error("当前论文 PDF 文件不存在。");
-  const info = await stat(filePath);
-  signal?.throwIfAborted();
-  if (!info.isFile() || info.size <= 0) {
-    throw new Error("当前论文 PDF 文件无效。");
-  }
-  if (info.size > MAX_CHAT_ATTACHMENT_FILE_BYTES) {
-    throw new Error("当前论文 PDF 超过 50 MB，无法直接提交给模型。");
-  }
-  const totalBytes =
-    info.size +
-    attachments.reduce((sum, resolved) => sum + resolved.attachment.size, 0);
-  if (totalBytes > MAX_CHAT_ATTACHMENT_TOTAL_BYTES) {
-    throw new Error("当前论文 PDF 与本轮附件总大小不能超过 80 MB。");
-  }
-  const textFallbackPath = await getRepairedMarkdownFallback(paperId, signal);
-  signal?.throwIfAborted();
-
-  return [
-    {
-      attachment: {
-        id: crypto.randomUUID(),
-        fileName: paper.fileName || "source.pdf",
-        mimeType: "application/pdf",
-        size: info.size,
-        kind: "pdf",
-        source: "library",
-        paperId,
-        pageCount: paper.pageCount,
-      },
-      filePath,
-      textFallbackPath,
-    },
-    ...attachments,
-  ];
-}
-
-async function getRepairedMarkdownFallback(
-  paperId: string,
-  signal?: AbortSignal,
-): Promise<string | undefined> {
-  signal?.throwIfAborted();
-  const paper = store.getPaper(paperId);
-  if (!paper) return undefined;
-  const pdfPath = store.resolvePaperPath(paperId);
-  if (!pdfPath) return undefined;
-  const directory = resolvePaperArtifactDirectory(paperId);
-  const cached = await readKnowledgeMarkdownRepairCache(
-    directory,
-    paperId,
-    pdfPath,
-    legacyKnowledgeMarkdownCacheRoot(),
-    signal,
-  ).catch(() => null);
-  signal?.throwIfAborted();
-  if (!cached) return undefined;
-  await writePaperTextArtifacts(directory, paper, { repair: cached, signal });
-  signal?.throwIfAborted();
-  return join(directory, "full.md");
 }
 
 async function migrateLegacySelectionImages(): Promise<void> {
@@ -4003,12 +3470,15 @@ async function ensurePaperMarkdownArtifact(
   signal?: AbortSignal,
 ): Promise<string> {
   signal?.throwIfAborted();
-  const paper = store.getPaper(paperId);
-  if (!paper) throw new Error("论文不存在。");
+  const preview = await readRepairDraftPreview(paperId);
+  const directory = resolvePaperArtifactDirectory(paperId);
+  if (preview) {
+    if (!preview.markdown.trim())
+      throw new Error("Markdown 正在生成，尚未收到正文。");
+    return join(directory, "full.md");
+  }
   const pdfPath = store.resolvePaperPath(paperId);
   if (!pdfPath) throw new Error("论文 PDF 文件不存在。");
-
-  const directory = resolvePaperArtifactDirectory(paperId);
   const cached = await readKnowledgeMarkdownRepairCache(
     directory,
     paperId,
@@ -4017,37 +3487,9 @@ async function ensurePaperMarkdownArtifact(
     signal,
   );
   signal?.throwIfAborted();
-  if (cached) {
-    await writePaperTextArtifacts(directory, paper, { repair: cached, signal });
-    signal?.throwIfAborted();
-    await reindexPaperMarkdown(paperId);
-    signal?.throwIfAborted();
-    return join(directory, "full.md");
-  }
-
-  const markdownPath = join(directory, "full.md");
-  try {
-    const info = await stat(markdownPath);
-    signal?.throwIfAborted();
-    if (info.isFile() && info.size > 0) return markdownPath;
-  } catch {
-    // Generate the local Markdown below when the artifact does not exist yet.
-  }
-  signal?.throwIfAborted();
-
-  const pages = await documentEngine.request<DocumentPageText[]>(
-    "document_text",
-    {
-      paper_id: paperId,
-      index_dir: join(app.getPath("userData"), "indexes"),
-    },
-    60_000,
-  );
-  signal?.throwIfAborted();
-  if (!pages.length) throw new Error("尚未提取到可用的论文正文。");
-  await writePaperTextArtifacts(directory, paper, { rawPages: pages, signal });
-  signal?.throwIfAborted();
-  return markdownPath;
+  if (!cached || cached.sourceMode !== "pdf-rebuild")
+    throw new Error("尚未生成 Markdown，请先从原始 PDF 重建正文。");
+  return join(directory, "full.md");
 }
 
 async function synchronizeStoredPaperArtifacts(): Promise<void> {
@@ -4133,225 +3575,240 @@ function queuePaperArtifactSync(paper: Paper): void {
     });
 }
 
+async function readNoteGenerationDraft(
+  paperId: string,
+): Promise<PaperNote | null> {
+  const pdfPath = store.resolvePaperPath(paperId);
+  if (!pdfPath) return null;
+  const draft = await readPaperTextDraft(
+    resolvePaperArtifactDirectory(paperId),
+    "note",
+    paperId,
+    pdfPath,
+  );
+  if (!draft?.update.content.trim()) return null;
+  return {
+    paperId,
+    content: draft.update.content,
+    updatedAt: draft.updatedAt,
+    generationStatus: draft.status === "error" ? "error" : "interrupted",
+  };
+}
+
+async function readRepairDraftPreview(
+  paperId: string,
+): Promise<KnowledgeBaseMarkdownPreview | null> {
+  const pdfPath = store.resolvePaperPath(paperId);
+  if (!pdfPath) return null;
+  const draft = await readPaperTextDraft(
+    resolvePaperArtifactDirectory(paperId),
+    "repair",
+    paperId,
+    pdfPath,
+    { persistContentCleanup: !activeMarkdownPaperIds.has(paperId) },
+  );
+  if (!draft || draft.update.mode !== "pdf-rebuild") return null;
+  const { update } = draft;
+  return {
+    paperId,
+    markdown: update.content,
+    pageCount: draft.pageCount,
+    generatedAt: draft.updatedAt,
+    aiRepaired: true,
+    model: draft.model,
+    draft: {
+      mode: update.mode,
+      unit: update.unit,
+      currentPage: update.currentPage,
+      batchStartPage: update.batchStartPage,
+      batchEndPage: update.batchEndPage,
+      reportingSummaryActive: update.reportingSummaryActive,
+      reportingSummaryLevel: update.reportingSummaryLevel,
+      skippedPages: update.skippedPages,
+      status: draft.status === "running" ? "interrupted" : draft.status,
+      completed: update.completed,
+      total: update.total,
+      detail: update.detail,
+      change: update.change,
+      skipped: update.skipped,
+    },
+  };
+}
+
+const activeMarkdownPaperIds = new Set<string>();
 async function runPaperMarkdownRepair(
   paperId: string,
   requestId: string,
   signal: AbortSignal,
-  markdownPathOverride?: string,
   onAgentEvent?: (
     event: Omit<AgentEvent, "requestId" | "sequence" | "timestamp">,
   ) => void,
-  onMarkdownPreview?: (content: string, done: boolean) => void,
+  onMarkdownPreview?: (
+    content: string,
+    done: boolean,
+    update?: PaperTextUpdate,
+    status?: "complete" | "interrupted" | "error",
+  ) => void,
+  onProgress?: (progress: KnowledgeBaseRepairProgress) => void,
+  mode: "restart" | "retry" = "restart",
 ): Promise<KnowledgeBaseMarkdownPreview> {
   signal.throwIfAborted();
-  const sendProgress = (
-    phase: KnowledgeBaseRepairProgress["phase"],
-    detail: string,
-  ): void => {
-    if (signal.aborted || mainWindow?.webContents.isDestroyed()) return;
-    mainWindow?.webContents.send("knowledge-base:progress", {
-      requestId,
-      phase,
-      completed: 0,
-      total: 1,
-      paperId,
-      detail,
-    } satisfies KnowledgeBaseRepairProgress);
-  };
-
-  const paper = store.getPaper(paperId);
-  if (!paper) throw new Error("论文不存在。");
-  if (paper.status !== "ready" && !markdownPathOverride) {
-    throw new Error("请等待论文解析完成后再进行文件修复。");
-  }
-  const canonicalPdfPath = store.resolvePaperPath(paperId);
-  if (!canonicalPdfPath) throw new Error("论文 PDF 文件不存在。");
-
-  const directory = resolvePaperArtifactDirectory(paperId);
-  const streamingMarkdownPath = join(directory, "full.streaming.md");
-  let lastStreamingWrite = Promise.resolve();
-  const emitMarkdownPreview = (content: string, done: boolean): void => {
-    if (signal.aborted) return;
-    lastStreamingWrite = lastStreamingWrite.then(async () => {
+  if (activeMarkdownPaperIds.has(paperId))
+    throw new Error("这篇论文正在生成 Markdown，请先停止或等待完成。");
+  activeMarkdownPaperIds.add(paperId);
+  try {
+    const paper = store.getPaper(paperId);
+    if (!paper) throw new Error("论文不存在。");
+    const pdfPath = store.resolvePaperPath(paperId);
+    if (!pdfPath) throw new Error("论文 PDF 文件不存在。");
+    const directory = resolvePaperArtifactDirectory(paperId);
+    const provider = store.getActiveProvider();
+    let preview: KnowledgeBaseMarkdownPreview | undefined;
+    let lastProgressKey = "";
+    const progress = (
+      phase: KnowledgeBaseRepairProgress["phase"],
+      detail: string,
+      completed = 0,
+      total = 1,
+    ) => {
+      const key = `${phase}:${completed}:${total}:${detail}`;
+      if (lastProgressKey === key) return;
+      lastProgressKey = key;
       if (!signal.aborted)
-        await writeFile(streamingMarkdownPath, content, "utf8");
+        onProgress?.({
+          requestId,
+          paperId,
+          paperTitle: paper.title,
+          phase,
+          detail,
+          completed,
+          total,
+        });
+    };
+    const initialUpdate = await readPaperMarkdownRebuildStart({
+      directory,
+      paperId,
+      pdfPath,
+      model: provider.model,
+      pageCount: paper.pageCount ?? 0,
+      mode,
     });
-    onMarkdownPreview?.(content, done);
-  };
-  const markdownPath =
-    markdownPathOverride ||
-    (await ensurePaperMarkdownArtifact(paperId, signal));
-  signal.throwIfAborted();
-  onAgentEvent?.({
-    type: "tool.started",
-    title: "读取本地论文正文",
-    tool: "document_text",
-    detail: "正在读取 PDF.js 页面文本与 Markdown 工件",
-    status: "running",
-  });
-  sendProgress("extracting", "正在准备论文全文文件与本地页面信息");
-  const pages = await waitForAbort(
-    documentEngine.request<DocumentPageText[]>(
-      "document_text",
-      {
-        paper_id: paperId,
-        index_dir: join(app.getPath("userData"), "indexes"),
-        pdf_path: canonicalPdfPath,
-      },
-      60_000,
-    ),
-    signal,
-  );
-  if (!pages.length) throw new Error("尚未提取到可修复的论文正文。");
-  onAgentEvent?.({
-    type: "tool.completed",
-    title: "本地论文正文读取完成",
-    tool: "document_text",
-    detail: `已读取 ${pages.length} 页`,
-    status: "completed",
-  });
-
-  onAgentEvent?.({
-    type: "step.started",
-    stepId: "quality-repair",
-    title: "从原始 PDF 重新生成 Markdown",
-    detail: "必须提交原始 PDF；不使用已有 Markdown",
-    status: "running",
-  });
-  onAgentEvent?.({
-    type: "tool.started",
-    title: "上传原始 PDF",
-    tool: "responses_file_input",
-    detail: "正在将原始 PDF 上传给支持文件输入的 Responses API",
-    status: "running",
-  });
-  sendProgress("repairing-text", "正在提交原始 PDF，等待 Responses API 接收");
-  const repairResult = await repairKnowledgePaperExport(
-    store.getActiveProvider(),
-    {
-      paper,
-      pdfPath: canonicalPdfPath,
-      markdownPath,
-      pages,
-      citationNodes: [],
-      citationEdges: [],
-    },
-    (phase, detail) => sendProgress(phase, detail),
-    {
+    progress("extracting", "正在打开原始 PDF");
+    await runPaperTextTask({
+      initialUpdate,
+      onStart: () =>
+        clearPaperMarkdownRebuildArtifacts(
+          directory,
+          paperId,
+          legacyKnowledgeMarkdownCacheRoot(),
+        ),
+      paperId,
+      pdfPath,
+      directory,
+      model: provider.model,
+      pageCount: paper.pageCount ?? 0,
+      kind: "repair",
       signal,
-      checkpoint: createPaperAgentBatchCheckpoint(directory),
-      onMarkdownPreview: (content) => emitMarkdownPreview(content, false),
-    },
-  );
-  signal.throwIfAborted();
-  onAgentEvent?.({
-    type: "tool.completed",
-    title: "原始 PDF 已提交",
-    tool: "responses_file_input",
-    detail: "已收到模型响应，正在等待首个 Markdown 正文片段",
-    status: "completed",
-  });
-  if (!repairResult.textProtocol) {
-    throw new Error(repairResult.textWarnings[0] || "AI 未能完成文件修复。");
+      onCommit: () => {
+        const owner = markdownRepairOwners.get(requestId);
+        if (owner) owner.committing = true;
+      },
+      onUpdate: (update, status) => {
+        onMarkdownPreview?.(update.content, Boolean(status), update, status);
+        progress(
+          status === "complete" ? "complete" : "repairing-text",
+          update.detail ?? "正在从 PDF 生成正文",
+          update.completed,
+          update.total,
+        );
+      },
+      operation: async (onTextUpdate) => {
+        await paperMarkdownIndexSyncs.get(paperId);
+        await reindexPaperMarkdown(paperId);
+        signal.throwIfAborted();
+        onAgentEvent?.({
+          type: "tool.started",
+          title: "每批 10 页原始 PDF",
+          tool: "read_pdf_pages",
+          status: "running",
+        });
+        return repairKnowledgePaperExport(
+          provider,
+          {
+            paper,
+            pdfPath,
+            markdownPath: join(directory, "full.md"),
+            pages: [],
+            citationNodes: [],
+            citationEdges: [],
+          },
+          (phase, detail) => progress(phase, detail),
+          {
+            signal,
+            repairCitations: false,
+            resume:
+              mode === "retry" && initialUpdate.completed > 0
+                ? {
+                    content: initialUpdate.committedContent ?? "",
+                    completed: initialUpdate.completed,
+                    total: initialUpdate.total,
+                    skippedPages: initialUpdate.skippedPages,
+                    reportingSummaryActive:
+                      initialUpdate.reportingSummaryActive,
+                    reportingSummaryLevel: initialUpdate.reportingSummaryLevel,
+                  }
+                : undefined,
+            onTextUpdate,
+          },
+        );
+      },
+      commit: async (result) => {
+        progress("writing", "PDF 正文生成完成，正在保存并更新索引");
+        const commitSignal = new AbortController().signal;
+        const cached = await writeKnowledgeMarkdownRepairCache(
+          directory,
+          paperId,
+          pdfPath,
+          {
+            markdown: result.markdown,
+            sourceMode: "pdf-rebuild",
+            pageCount: result.pageCount,
+            model: result.model,
+            protocol: result.textProtocol,
+            warnings: result.textWarnings,
+            repairReport: {
+              batchCount: result.batchCount ?? 0,
+              repairedBatchCount: result.repairedBatchCount ?? 0,
+              preservedBatchCount: result.preservedBatchCount ?? 0,
+              detectedIssues: result.detectedIssues ?? [],
+            },
+          },
+          commitSignal,
+        );
+        await writePaperTextArtifacts(directory, paper, {
+          repair: cached,
+          signal: commitSignal,
+        });
+        await reindexPaperMarkdown(paperId);
+        preview = {
+          paperId,
+          markdown: cached.markdown,
+          pageCount: cached.pageCount,
+          generatedAt: new Date().toISOString(),
+          aiRepaired: true,
+          hasAiRepairedVersion: true,
+          model: cached.model,
+          protocol: cached.protocol,
+          repairedAt: cached.repairedAt,
+          warnings: cached.warnings,
+          repairReport: cached.repairReport,
+        };
+      },
+    });
+    return preview!;
+  } finally {
+    activeMarkdownPaperIds.delete(paperId);
   }
-  await lastStreamingWrite;
-  signal.throwIfAborted();
-  emitMarkdownPreview(repairResult.markdown, true);
-  await lastStreamingWrite;
-  signal.throwIfAborted();
-  await rm(streamingMarkdownPath, { force: true });
-  signal.throwIfAborted();
-  onAgentEvent?.({
-    type: "step.completed",
-    stepId: "quality-repair",
-    title: "Markdown 批次处理完成",
-    detail:
-      repairResult.batchCount !== undefined
-        ? `共 ${repairResult.batchCount} 批，修复 ${repairResult.repairedBatchCount ?? 0} 批，保留 ${repairResult.preservedBatchCount ?? 0} 批`
-        : `已处理 ${repairResult.pageCount} 页`,
-    status: "completed",
-    metadata: {
-      batchCount: repairResult.batchCount,
-      repairedBatchCount: repairResult.repairedBatchCount,
-      preservedBatchCount: repairResult.preservedBatchCount,
-      detectedIssues: repairResult.detectedIssues,
-    },
-  });
-
-  onAgentEvent?.({
-    type: "tool.started",
-    title: "写入修复缓存",
-    tool: "write_markdown_cache",
-    status: "running",
-  });
-  const cached = await writeKnowledgeMarkdownRepairCache(
-    directory,
-    paperId,
-    canonicalPdfPath,
-    {
-      markdown: repairResult.markdown,
-      pageCount: repairResult.pageCount,
-      model: repairResult.model,
-      protocol: repairResult.textProtocol,
-      warnings: repairResult.textWarnings,
-      repairReport:
-        repairResult.batchCount !== undefined
-          ? {
-              batchCount: repairResult.batchCount,
-              repairedBatchCount: repairResult.repairedBatchCount ?? 0,
-              preservedBatchCount: repairResult.preservedBatchCount ?? 0,
-              detectedIssues: repairResult.detectedIssues ?? [],
-            }
-          : undefined,
-    },
-    signal,
-  );
-  signal.throwIfAborted();
-  await writePaperTextArtifacts(directory, paper, {
-    rawPages: pages,
-    repair: cached,
-    signal,
-  });
-  signal.throwIfAborted();
-  onAgentEvent?.({
-    type: "tool.completed",
-    title: "修复缓存写入完成",
-    tool: "write_markdown_cache",
-    status: "completed",
-  });
-  onAgentEvent?.({
-    type: "verification.started",
-    stepId: "reindex",
-    title: "验证全文索引",
-    detail: "正在用修复后的 Markdown 重建本地检索索引",
-    status: "running",
-  });
-  sendProgress("writing", "正在重建全文检索索引");
-  await waitForAbort(reindexPaperMarkdown(paperId), signal);
-  onAgentEvent?.({
-    type: "verification.completed",
-    stepId: "reindex",
-    title: "全文索引验证完成",
-    detail: "修复后的正文已可用于本地检索和文献问答",
-    status: "completed",
-  });
-  sendProgress("complete", "文件修复与缓存写入完成");
-  return {
-    paperId,
-    markdown: cached.markdown,
-    pageCount: cached.pageCount,
-    generatedAt: new Date().toISOString(),
-    aiRepaired: true,
-    model: cached.model,
-    protocol: cached.protocol,
-    repairedAt: cached.repairedAt,
-    warnings: cached.warnings,
-    repairReport: cached.repairReport,
-    comparison: compareMarkdownVersions(
-      buildPaperFullTextMarkdown(paper, pages),
-      cached.markdown,
-    ),
-  };
 }
 
 function reindexPaperMarkdown(paperId: string): Promise<MarkdownReindexResult> {
@@ -4364,6 +3821,7 @@ function reindexPaperMarkdown(paperId: string): Promise<MarkdownReindexResult> {
     {
       paper_id: paperId,
       markdown_path: join(resolvePaperArtifactDirectory(paperId), "full.md"),
+      allow_empty: true,
       index_dir: join(app.getPath("userData"), "indexes"),
     },
     900_000,

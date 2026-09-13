@@ -1,4 +1,5 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import type {
   ProviderBatchCheckpoint,
@@ -20,19 +21,24 @@ interface StoredCheckpointFile {
 }
 
 const CHECKPOINT_FILE_NAME = "agent-checkpoints.json";
+const checkpointQueues = new Map<string, Promise<void>>();
 
 export function createAgentBatchCheckpoint(
   directory: string,
 ): ProviderBatchCheckpoint {
   const filePath = join(directory, CHECKPOINT_FILE_NAME);
-  let queue = Promise.resolve();
-
   const transact = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const queue = checkpointQueues.get(filePath) ?? Promise.resolve();
     const current = queue.then(operation, operation);
-    queue = current.then(
+    const settled = current.then(
       () => undefined,
       () => undefined,
     );
+    checkpointQueues.set(filePath, settled);
+    void settled.then(() => {
+      if (checkpointQueues.get(filePath) === settled)
+        checkpointQueues.delete(filePath);
+    });
     return current;
   };
 
@@ -64,8 +70,6 @@ export function createAgentBatchCheckpoint(
   };
 }
 
-export const createPaperAgentBatchCheckpoint = createAgentBatchCheckpoint;
-
 async function readCheckpointFile(
   filePath: string,
 ): Promise<StoredCheckpointFile> {
@@ -91,7 +95,7 @@ async function writeCheckpointFile(
   value: StoredCheckpointFile,
 ): Promise<void> {
   await mkdir(dirname(filePath), { recursive: true });
-  const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
   await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
   await rename(temporaryPath, filePath);
 }

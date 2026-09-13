@@ -82,7 +82,6 @@ interface StoreSchema {
 }
 
 const DEFAULT_PROVIDER_ID = "openai";
-const MAX_CHAT_MESSAGES = 200;
 const MAX_NOTE_LENGTH = 200_000;
 const MAX_LIBRARY_REVIEWS = 30;
 
@@ -348,10 +347,7 @@ export class AppStore {
 
   appendChatMessage(paperId: string, message: ChatMessage): ChatMessage[] {
     if (!this.getPaper(paperId)) throw new Error("文献不存在。");
-    const next = [
-      ...this.listChatMessages(paperId),
-      cloneChatMessage(message),
-    ].slice(-MAX_CHAT_MESSAGES);
+    const next = [...this.listChatMessages(paperId), cloneChatMessage(message)];
     this.persistChatMessages(paperId, next);
     return next.map(cloneChatMessage);
   }
@@ -362,7 +358,7 @@ export class AppStore {
 
   replaceChatMessages(paperId: string, messages: ChatMessage[]): ChatMessage[] {
     if (!this.getPaper(paperId)) throw new Error("Paper does not exist.");
-    const next = messages.map(cloneChatMessage).slice(-MAX_CHAT_MESSAGES);
+    const next = messages.map(cloneChatMessage);
     this.persistChatMessages(paperId, next);
     return next.map(cloneChatMessage);
   }

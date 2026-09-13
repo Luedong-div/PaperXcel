@@ -1,4 +1,23 @@
 import {
+  scopeCitationSnapshot,
+  markLibraryNodes,
+  formatCitationTitle,
+} from "./citationGraphModel";
+import {
+  nodeTypes,
+  edgeTypes,
+  buildFlowGraph,
+  type CitationFlowNode,
+  type CitationNodeData,
+} from "./CitationGraphElements";
+import {
+  DetailOverview,
+  DetailTabButton,
+  DetailTextState,
+  formatCitedByCount,
+} from "./CitationGraphDetails";
+import { CitationPaperSelector } from "./CitationPaperSelector";
+import {
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -8,40 +27,38 @@ import {
   type KeyboardEvent,
   type PointerEvent,
 } from "react";
-import dagre from "@dagrejs/dagre";
+import {
+  CITATION_NODE_COLORS,
+  citationNodeDiameter,
+  citationNodeTone,
+  citationRelationLabel,
+  layoutCitationGraph,
+} from "./citationGraphLayout";
 import {
   Background,
+  type NodeChange,
   Controls,
-  Handle,
-  MarkerType,
   MiniMap,
-  Position,
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
-  type Edge,
-  type Node,
-  type NodeProps,
   type Viewport,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import "./citationWorkspace.css";
+import { useCitationGraphPhysics } from "./useCitationGraphPhysics";
 import {
-  ArrowDownLeft,
-  ArrowUpRight,
+  ArrowRightFromLine,
+  ArrowRightToLine,
   BookOpen,
-  Check,
   ChevronDown,
-  ChevronRight,
   ChevronUp,
   CircleHelp,
-  Copy,
-  Braces,
   ChartNetwork,
   Compass,
   Database,
   Download,
   ExternalLink,
-  FileCode2,
   FileText,
   Filter,
   FolderOpen,
@@ -52,18 +69,17 @@ import {
   Network,
   RefreshCw,
   Search,
-  Settings2,
+  Square,
   X,
 } from "lucide-react";
 import type {
   CitationDiscoveryMode,
+  CitationDiscoveryFilters,
+  CitationDiscoveryInput,
   CitationDiscoveryResult,
   CitationGraphNode,
   CitationGraphSnapshot,
-  CitationGraphExportFormat,
-  CitationMatchStatus,
-  CitationMetadataSource,
-  CitationNetworkAnalysis,
+  ModelReasoningEffort,
   LibraryFolder,
   Paper,
 } from "../../shared/contracts";
@@ -79,11 +95,14 @@ import {
   CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES,
 } from "../../shared/citationDiscovery";
 import { CitationAnalysisPanel } from "./CitationAnalysisPanel";
+import { useCitationAnalysis } from "./useCitationAnalysis";
+import { useResearchConversation } from "./useResearchConversation";
+import { ResearchConversationBar } from "./ResearchConversationBar";
+import { DiscoveryAgentPanel } from "./DiscoveryAgentPanel";
 import { CitationDiscoveryPanel } from "./CitationDiscoveryPanel";
+import { CitationReferencesPanel } from "./CitationReferencesPanel";
 import {
   buildCitationGraphExportDocument,
-  buildCitationGraphExportScene,
-  buildCitationGraphInteractiveHtml,
   serializeCitationGraphExportDocument,
 } from "./citationGraphExport";
 
@@ -96,17 +115,11 @@ interface CitationGraphWorkspaceProps {
   onSidebarResizePointerDown: (event: PointerEvent<HTMLDivElement>) => void;
   onSidebarResizeKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
   onOpenPaper: (paperId: string) => void;
-  onOpenSettings: () => void;
   onError: (message: string) => void;
+  analysisModel?: string;
+  reasoningEffort?: ModelReasoningEffort;
 }
-
-interface CitationNodeData extends Record<string, unknown> {
-  citation: CitationGraphNode;
-  dimmed: boolean;
-}
-
-type CitationFlowNode = Node<CitationNodeData, "citation">;
-type DetailTab = "details" | "abstract" | "notes" | "relations";
+type DetailTab = "details" | "abstract" | "references";
 type CitationWorkspaceView = "graph" | "discovery" | "analysis";
 
 interface DetailPanelPosition {
@@ -123,10 +136,6 @@ interface ExternalNodeLimits {
   references: number;
   citing: number;
 }
-
-const nodeTypes = { citation: CitationNode };
-const nodeWidth = 184;
-const nodeHeight = 42;
 const detailPanelWidth = 380;
 const detailPanelMinHeight = 320;
 
@@ -161,8 +170,9 @@ function CitationGraphWorkspaceContent({
   onSidebarResizePointerDown,
   onSidebarResizeKeyDown,
   onOpenPaper,
-  onOpenSettings,
   onError,
+  analysisModel,
+  reasoningEffort,
 }: CitationGraphWorkspaceProps): React.JSX.Element {
   const { fitView, getViewport, setViewport } = useReactFlow();
   const [snapshot, setSnapshot] = useState<CitationGraphSnapshot>({
@@ -172,25 +182,51 @@ function CitationGraphWorkspaceContent({
   });
   const [viewMode, setViewMode] = useState<CitationWorkspaceView>("graph");
   const [graphDepth, setGraphDepth] = useState<1 | 2>(1);
+  const [layoutRevision, setLayoutRevision] = useState(0);
   const [expandingTwoHop, setExpandingTwoHop] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [discovering, setDiscovering] = useState(false);
-  const [analyzing, setAnalyzing] = useState(false);
+  const [searching, setDiscovering] = useState(false);
+  const [historicalSnapshot, setHistoricalSnapshot] =
+    useState<CitationGraphSnapshot>();
+  const [analysisRunSnapshot, setAnalysisRunSnapshot] =
+    useState<CitationGraphSnapshot>();
+  const discoveryAgent = useResearchConversation("discovery");
+  const discovering = searching || discoveryAgent.running;
+  const [analysisQuestion, setAnalysisQuestion] = useState("");
   const [discoveryQuery, setDiscoveryQuery] = useState("");
+  const [discoveryFilters, setDiscoveryFilters] =
+    useState<CitationDiscoveryFilters>({
+      sort: "relevance",
+      sources: ["openalex", "crossref", "europe-pmc"],
+    });
+  const discoveryRequestRef = useRef<
+    | {
+        id: string;
+        scope: string;
+        mode: CitationDiscoveryMode;
+        sequence: number;
+      }
+    | undefined
+  >(undefined);
+  const [lastDiscoveryInput, setLastDiscoveryInput] =
+    useState<CitationDiscoveryInput>();
+
   const [discoveryMode, setDiscoveryMode] =
     useState<CitationDiscoveryMode>("contextual");
-  const [discoveryResult, setDiscoveryResult] =
+  const [searchResult, setDiscoveryResult] =
     useState<CitationDiscoveryResult>();
+  const discoveryResult =
+    discoveryMode === "contextual"
+      ? discoveryAgent.state.discovery?.result
+      : searchResult;
   const [pureSearchLimit, setPureSearchLimit] = useState(
     CITATION_DISCOVERY_PURE_SEARCH_DEFAULT_CANDIDATES,
   );
-  const [analysis, setAnalysis] = useState<CitationNetworkAnalysis>();
   const [analysisFocusIds, setAnalysisFocusIds] = useState<Set<string>>(
     () => new Set(),
   );
-  const [exporting, setExporting] = useState<CitationGraphExportFormat>();
-  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [query, setQuery] = useState("");
   const [localPickerOpen, setLocalPickerOpen] = useState(true);
   const [selectedPaperIds, setSelectedPaperIds] = useState<Set<string>>(
@@ -202,8 +238,8 @@ function CitationGraphWorkspaceContent({
   const [showCiting, setShowCiting] = useState(true);
   const [externalNodeLimits, setExternalNodeLimits] =
     useState<ExternalNodeLimits>({
-      references: CITATION_GRAPH_EXTERNAL_NODE_MAX,
-      citing: CITATION_GRAPH_EXTERNAL_NODE_MAX,
+      references: 36,
+      citing: 36,
     });
   const [selectedYearRange, setSelectedYearRange] =
     useState<[number, number]>();
@@ -219,7 +255,13 @@ function CitationGraphWorkspaceContent({
     }),
     [externalNodeLimits, externalNodeMax],
   );
+  const [hoveredNode, setHoveredNode] = useState<{
+    node: CitationGraphNode;
+    x: number;
+    y: number;
+  }>();
   const [selectedId, setSelectedId] = useState<string>();
+  const [referenceDetail, setReferenceDetail] = useState<CitationGraphNode>();
   const [detailMinimized, setDetailMinimized] = useState(false);
   const [detailPosition, setDetailPosition] = useState<DetailPanelPosition>(
     () =>
@@ -230,10 +272,8 @@ function CitationGraphWorkspaceContent({
   );
   const [copied, setCopied] = useState(false);
   const [activeTab, setActiveTab] = useState<DetailTab>("details");
-  const [noteContent, setNoteContent] = useState("");
-  const [noteLoading, setNoteLoading] = useState(false);
-  const exportMenuRef = useRef<HTMLDivElement>(null);
   const fittedLayoutKeyRef = useRef<string | undefined>(undefined);
+  const initialFitKeyRef = useRef<string | undefined>(undefined);
   const savedGraphViewportRef = useRef<SavedGraphViewport | undefined>(
     undefined,
   );
@@ -251,7 +291,6 @@ function CitationGraphWorkspaceContent({
       setSnapshot({ nodes: [], edges: [], errors: [] });
       setGraphDepth(1);
       setDiscoveryResult(undefined);
-      setAnalysis(undefined);
       setAnalysisFocusIds(new Set());
       setSelectedId(undefined);
       setDetailMinimized(false);
@@ -276,6 +315,9 @@ function CitationGraphWorkspaceContent({
     [papers, selectedPaperIds],
   );
   const selectionScopeKey = selectedPaperIdList.join("\u0000");
+  const analysisAgent = useCitationAnalysis();
+  const analysis = analysisAgent.state;
+  const analyzing = analysisAgent.running;
   const selectionScopeRef = useRef(selectionScopeKey);
 
   useEffect(() => {
@@ -316,8 +358,15 @@ function CitationGraphWorkspaceContent({
     void loadSnapshot();
   }, [loadSnapshot]);
 
+  const regroupGraph = (): void => {
+    setHistoricalSnapshot(undefined);
+    savedGraphViewportRef.current = undefined;
+    setLayoutRevision((current) => current + 1);
+  };
+
   const refresh = async (force = false): Promise<void> => {
     if (refreshing) return;
+    regroupGraph();
     const requestedScope = selectionScopeKey;
     setRefreshing(true);
     try {
@@ -327,7 +376,6 @@ function CitationGraphWorkspaceContent({
       );
       if (selectionScopeRef.current !== requestedScope) return;
       setSnapshot(result.snapshot);
-      setAnalysis(undefined);
       if (result.failedPapers > 0) {
         onError(`图谱已更新，但有 ${result.failedPapers} 篇论文同步失败。`);
       }
@@ -347,6 +395,7 @@ function CitationGraphWorkspaceContent({
       }
       return;
     }
+    regroupGraph();
     setExpandingTwoHop(true);
     try {
       const result = await window.paperxcel.citationGraph.expand(
@@ -356,7 +405,6 @@ function CitationGraphWorkspaceContent({
       if (selectionScopeRef.current !== selectionScopeKey) return;
       setSnapshot(result.snapshot);
       setGraphDepth(2);
-      setAnalysis(undefined);
       setAnalysisFocusIds(new Set());
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
@@ -373,188 +421,154 @@ function CitationGraphWorkspaceContent({
     }
     setGraphDepth(1);
     setSnapshot({ nodes: [], edges: [], errors: [] });
-    setAnalysis(undefined);
     setAnalysisFocusIds(new Set());
     void loadSnapshot();
   };
 
+  useEffect(() => {
+    const unsubscribe = window.paperxcel.citationGraph.onDiscoveryProgress?.(
+      (progress) => {
+        const active = discoveryRequestRef.current;
+        if (
+          !active ||
+          active.id !== progress.requestId ||
+          progress.sequence <= active.sequence
+        )
+          return;
+        if (
+          active.mode !== "pure-search" &&
+          active.scope !== selectionScopeRef.current
+        )
+          return;
+        active.sequence = progress.sequence;
+        setDiscoveryResult(progress.result);
+      },
+    );
+    return () => {
+      unsubscribe?.();
+      if (discoveryRequestRef.current)
+        void window.paperxcel.citationGraph.cancelDiscovery(
+          discoveryRequestRef.current.id,
+        );
+    };
+  }, []);
+
+  const stopDiscovery = (): void => {
+    if (discoveryAgent.running) {
+      discoveryAgent.stop();
+      return;
+    }
+    const active = discoveryRequestRef.current;
+    if (active)
+      void window.paperxcel.citationGraph
+        .cancelDiscovery(active.id)
+        .catch((error) => onError(String(error)));
+  };
   const discover = async (
     mode: CitationDiscoveryMode = discoveryMode,
-    requestedPureSearchLimit = CITATION_DISCOVERY_PURE_SEARCH_DEFAULT_CANDIDATES,
+    requestedLimit = CITATION_DISCOVERY_PURE_SEARCH_DEFAULT_CANDIDATES,
+    cursor?: string,
   ): Promise<void> => {
-    if (discovering) return;
+    if (discovering || discoveryAgent.managing) return;
     if (mode === "pure-search" && !discoveryQuery.trim()) {
-      onError("纯搜索需要输入主题关键词。");
+      onError("请输入研究问题、论文标题或 DOI。");
       return;
     }
-    if (mode === "contextual" && selectedPaperIdList.length === 0) return;
-    const requestedScope = selectionScopeKey;
-    setDiscoveryMode(mode);
-    setDiscovering(true);
-    try {
-      const result = await window.paperxcel.citationGraph.discover({
-        paperIds: mode === "pure-search" ? [] : selectedPaperIdList,
-        query: discoveryQuery,
-        limit:
-          mode === "pure-search"
-            ? Math.min(
-                CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES,
-                requestedPureSearchLimit,
-              )
-            : CITATION_DISCOVERY_MAX_CANDIDATES,
-        mode,
-      });
-      if (
-        mode === "pure-search" ||
-        selectionScopeRef.current === requestedScope
-      ) {
-        setDiscoveryResult(result);
-        if (mode === "pure-search") {
-          setPureSearchLimit(
-            Math.min(
-              CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES,
-              requestedPureSearchLimit,
-            ),
-          );
-        }
-      }
-    } catch (error) {
-      if (
-        mode === "pure-search" ||
-        selectionScopeRef.current === requestedScope
-      ) {
-        onError(error instanceof Error ? error.message : String(error));
-      }
-    } finally {
-      setDiscovering(false);
-    }
-  };
-
-  const loadMorePureSearch = (amount: 50 | 100): void => {
-    const nextLimit = Math.min(
-      CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES,
-      pureSearchLimit + amount,
-    );
-    if (nextLimit <= pureSearchLimit) return;
-    void discover("pure-search", nextLimit);
-  };
-
-  const openGoogleScholar = async (): Promise<void> => {
-    const scholarQuery = discoveryResult?.query.trim() || discoveryQuery.trim();
-    if (!scholarQuery) {
-      onError("请先输入主题关键词，再采集 Google Scholar。");
+    if (mode === "contextual" && !selectedPaperIdList.length) {
+      onError("请先选择推荐起点。");
       return;
     }
-    if (discovering) return;
-    setDiscovering(true);
-    try {
-      const scholarResult =
-        await window.paperxcel.citationGraph.searchGoogleScholar({
-          paperIds: discoveryMode === "pure-search" ? [] : selectedPaperIdList,
-          query: scholarQuery,
-          limit:
-            discoveryMode === "pure-search"
-              ? pureSearchLimit
-              : CITATION_DISCOVERY_MAX_CANDIDATES,
-          mode: discoveryMode,
-        });
-      setDiscoveryResult((current) =>
-        mergeDiscoveryResults(current, scholarResult),
-      );
-    } catch (error) {
-      onError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setDiscovering(false);
-    }
-  };
-
-  const importGoogleScholar = async (): Promise<void> => {
-    const scholarQuery = discoveryResult?.query.trim() || discoveryQuery.trim();
-    if (!scholarQuery) {
-      onError("请先输入主题关键词，再导入 Google Scholar 标题。");
+    if (discoveryFilters.sources?.length === 0) {
+      onError("请至少选择一个搜索来源。");
       return;
     }
-    if (discovering) return;
-    const text = await window.paperxcel.clipboard.readText();
-    if (!text.trim()) {
-      onError("剪贴板为空。请先在 Google Scholar 结果页按 Ctrl+A、Ctrl+C。");
-      return;
-    }
-    setDiscovering(true);
-    try {
-      const scholarResult =
-        await window.paperxcel.citationGraph.importGoogleScholarText({
-          text,
-          paperIds: discoveryMode === "pure-search" ? [] : selectedPaperIdList,
-          query: scholarQuery,
-          limit:
-            discoveryMode === "pure-search"
-              ? pureSearchLimit
-              : CITATION_DISCOVERY_MAX_CANDIDATES,
-          mode: discoveryMode,
-        });
-      setDiscoveryResult((current) =>
-        mergeDiscoveryResults(current, scholarResult),
-      );
-    } catch (error) {
-      onError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setDiscovering(false);
-    }
-  };
-
-  const analyze = useCallback(async (): Promise<void> => {
-    if (analyzing || selectedPaperIdList.length === 0) return;
-    const requestedScope = selectionScopeKey;
-    setAnalyzing(true);
-    try {
-      const result = await window.paperxcel.citationGraph.analyze(
-        selectedPaperIdList,
-        {
-          mode: graphDepth === 2 ? "focused-two-hop" : "standard",
-          externalLimits: activeExternalNodeLimits,
-        },
-      );
-      if (selectionScopeRef.current === requestedScope) {
-        setAnalysis(result);
-      }
-    } catch (error) {
-      if (selectionScopeRef.current === requestedScope) {
-        onError(error instanceof Error ? error.message : String(error));
-      }
-    } finally {
-      setAnalyzing(false);
-    }
-  }, [
-    analyzing,
-    activeExternalNodeLimits,
-    graphDepth,
-    onError,
-    selectedPaperIdList,
-    selectionScopeKey,
-  ]);
-
-  useEffect(() => {
     if (
-      viewMode === "analysis" &&
-      selectedPaperIdList.length > 0 &&
-      !analysis &&
-      !analyzing
+      discoveryFilters.yearFrom &&
+      discoveryFilters.yearTo &&
+      discoveryFilters.yearFrom > discoveryFilters.yearTo
     ) {
-      void analyze();
+      onError("起始年份不能晚于结束年份。");
+      return;
     }
-  }, [analysis, analyze, analyzing, selectedPaperIdList.length, viewMode]);
+    setDiscoveryMode(mode);
+    if (mode === "contextual") {
+      setLastDiscoveryInput({
+        query: discoveryQuery.trim(),
+        filters: discoveryFilters,
+      });
+      await discoveryAgent.start({
+        paperIds: selectedPaperIdList,
+        question: discoveryQuery,
+        filters: discoveryFilters,
+        reasoningEffort,
+      });
+      return;
+    }
+    const id = crypto.randomUUID();
+    discoveryRequestRef.current = {
+      id,
+      scope: selectionScopeKey,
+      mode,
+      sequence: 0,
+    };
+    const input: CitationDiscoveryInput = {
+      requestId: id,
+      cursor,
+      paperIds: [],
+      query: discoveryQuery.trim(),
+      limit: Math.min(
+        CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES,
+        requestedLimit,
+      ),
+      mode,
+      filters: discoveryFilters,
+    };
+    setLastDiscoveryInput(input);
+    setDiscovering(true);
+    setPureSearchLimit(input.limit!);
+    if (!cursor) {
+      setDiscoveryResult(undefined);
+      setSelectedId(undefined);
+    }
+    try {
+      const result = await window.paperxcel.citationGraph.discover(input);
+      if (discoveryRequestRef.current?.id === id) setDiscoveryResult(result);
+    } catch (error) {
+      if (discoveryRequestRef.current?.id === id)
+        onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (discoveryRequestRef.current?.id === id) {
+        discoveryRequestRef.current = undefined;
+        setDiscovering(false);
+      }
+    }
+  };
+  const discoveryFiltersDirty = Boolean(
+    lastDiscoveryInput &&
+    (lastDiscoveryInput.query !== discoveryQuery.trim() ||
+      JSON.stringify(lastDiscoveryInput.filters) !==
+        JSON.stringify(discoveryFilters)),
+  );
+  const loadMorePureSearch = (amount: 50 | 100): void => {
+    if (discovering || discoveryFiltersDirty) return;
+    void discover(
+      discoveryMode,
+      pureSearchLimit + amount,
+      discoveryResult?.cursor,
+    );
+  };
 
   const updateSelectedPaperIds = (next: Set<string>): void => {
+    setHistoricalSnapshot(undefined);
     selectionScopeRef.current = papers
       .filter((paper) => next.has(paper.id))
       .map((paper) => paper.id)
       .join("\u0000");
+    if (discoveryRequestRef.current?.mode === "contextual") stopDiscovery();
     setSelectedPaperIds(next);
     setGraphDepth(1);
     setSnapshot({ nodes: [], edges: [], errors: [] });
     setDiscoveryResult(undefined);
-    setAnalysis(undefined);
     setAnalysisFocusIds(new Set());
     setLoading(true);
     setSelectedId(undefined);
@@ -583,12 +597,7 @@ function CitationGraphWorkspaceContent({
     updateSelectedPaperIds(next);
   };
 
-  const selectedScopeLabel =
-    selectedPaperIdList.length > 0
-      ? `已选 ${selectedPaperIdList.length} 篇本地论文`
-      : "尚未选择本地论文";
-
-  const scopedSnapshot = useMemo(
+  const currentScopedSnapshot = useMemo(
     () =>
       markLibraryNodes(
         snapshot.graphMode === "focused-two-hop"
@@ -599,9 +608,33 @@ function CitationGraphWorkspaceContent({
     [papers, selectedPaperIds, snapshot],
   );
 
+  const scopedSnapshot = historicalSnapshot ?? currentScopedSnapshot;
+
+  const runAnalysis = (question: string, scopeTurnId?: string): void => {
+    if (
+      analyzing ||
+      analysisAgent.managing ||
+      analysisAgent.loadingHistory ||
+      (!scopeTurnId && (loading || !selectedPaperIdList.length))
+    )
+      return;
+    setAnalysisRunSnapshot(
+      scopeTurnId ? analysisAgent.turn?.scope.snapshot : currentScopedSnapshot,
+    );
+    void analysisAgent.start({
+      paperIds: selectedPaperIdList,
+      mode: graphDepth === 2 ? "focused-two-hop" : "standard",
+      question,
+      scopeTurnId,
+      reasoningEffort,
+    });
+  };
+  const analyze = (): void => runAnalysis(analysisQuestion);
+
   useEffect(() => {
     if (
       selectedId &&
+      referenceDetail?.id !== selectedId &&
       !scopedSnapshot.nodes.some((node) => node.id === selectedId) &&
       !discoveryResult?.candidates.some(
         (candidate) => candidate.work.id === selectedId,
@@ -610,13 +643,14 @@ function CitationGraphWorkspaceContent({
       setSelectedId(undefined);
       setDetailMinimized(false);
     }
-  }, [discoveryResult, scopedSnapshot.nodes, selectedId]);
+  }, [discoveryResult, scopedSnapshot.nodes, selectedId, referenceDetail]);
 
   const selected =
     scopedSnapshot.nodes.find((node) => node.id === selectedId) ??
     discoveryResult?.candidates.find(
       (candidate) => candidate.work.id === selectedId,
-    )?.work;
+    )?.work ??
+    (referenceDetail?.id === selectedId ? referenceDetail : undefined);
   const selectedPaper = useMemo(() => {
     if (!selected) return undefined;
     if (selected.paperId) {
@@ -634,7 +668,6 @@ function CitationGraphWorkspaceContent({
 
   useEffect(() => {
     setActiveTab("details");
-    setNoteContent("");
   }, [selectedId]);
 
   useEffect(() => {
@@ -644,28 +677,6 @@ function CitationGraphWorkspaceContent({
     window.addEventListener("resize", keepPanelInViewport);
     return () => window.removeEventListener("resize", keepPanelInViewport);
   }, []);
-
-  useEffect(() => {
-    if (activeTab !== "notes" || !selectedPaper) return;
-    let cancelled = false;
-    setNoteLoading(true);
-    void window.paperxcel.notes
-      .get(selectedPaper.id)
-      .then((note) => {
-        if (!cancelled) setNoteContent(note?.content ?? "");
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) {
-          onError(error instanceof Error ? error.message : String(error));
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setNoteLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [activeTab, onError, selectedPaper]);
 
   const timeline = useMemo(() => {
     const years = Array.from(
@@ -710,8 +721,7 @@ function CitationGraphWorkspaceContent({
       if (current[side] === value) return current;
       return { ...current, [side]: value };
     });
-    // 外部节点数量会改变分析输入，旧分析结果不能继续复用。
-    setAnalysis(undefined);
+    // Circle limits affect the drawing; AI analysis reads the complete corpus.
     setAnalysisFocusIds(new Set());
   };
 
@@ -743,12 +753,29 @@ function CitationGraphWorkspaceContent({
         (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
       ),
     };
-    return limitCitationGraphExternalNodes(
+    const limited = limitCitationGraphExternalNodes(
       filteredSnapshot,
       activeExternalNodeLimits,
       externalNodeMax,
     );
+    if (!analysisFocusIds.size) return limited;
+    const retained = new Set([
+      ...limited.nodes.map((node) => node.id),
+      ...analysisFocusIds,
+    ]);
+    // Findings can cite papers outside the circle limit. Include their real parents too.
+    const byId = new Map(filteredSnapshot.nodes.map((node) => [node.id, node]));
+    for (const id of retained)
+      for (const parent of byId.get(id)?.parentIds ?? []) retained.add(parent);
+    return {
+      ...filteredSnapshot,
+      nodes: filteredSnapshot.nodes.filter((node) => retained.has(node.id)),
+      edges: filteredSnapshot.edges.filter(
+        (edge) => retained.has(edge.source) && retained.has(edge.target),
+      ),
+    };
   }, [
+    analysisFocusIds,
     activeExternalNodeLimits,
     externalNodeMax,
     selectedYearRange,
@@ -759,16 +786,23 @@ function CitationGraphWorkspaceContent({
     scopedSnapshot,
   ]);
 
-  const analysisSnapshot = useMemo(
-    () =>
-      limitCitationGraphExternalNodes(
-        scopedSnapshot,
-        activeExternalNodeLimits,
-        externalNodeMax,
-      ),
-    [activeExternalNodeLimits, externalNodeMax, scopedSnapshot],
-  );
+  const analysisSnapshot =
+    analysisAgent.turn?.scope.snapshot ??
+    analysisRunSnapshot ??
+    currentScopedSnapshot;
 
+  const graphLayout = useMemo(
+    () => layoutCitationGraph(visibleSnapshot.nodes, visibleSnapshot.edges),
+    [visibleSnapshot.nodes, visibleSnapshot.edges],
+  );
+  const positionScope = `${selectionScopeKey}:${graphDepth}:${layoutRevision}`;
+  const physics = useCitationGraphPhysics(
+    visibleSnapshot.nodes,
+    visibleSnapshot.edges,
+    graphLayout,
+    positionScope,
+    viewMode === "graph" && !loading,
+  );
   const flow = useMemo(
     () =>
       buildFlowGraph(
@@ -776,67 +810,127 @@ function CitationGraphWorkspaceContent({
         visibleSnapshot.edges,
         query,
         analysisFocusIds,
+        graphLayout,
       ),
-    [analysisFocusIds, query, visibleSnapshot.edges, visibleSnapshot.nodes],
+    [
+      analysisFocusIds,
+      query,
+      visibleSnapshot.edges,
+      visibleSnapshot.nodes,
+      graphLayout,
+    ],
   );
+  const layoutViewKey = `${positionScope}:${flow.layoutKey}`;
+
+  const renderedNodes = useMemo(
+    () =>
+      flow.nodes.map((node) => ({
+        ...node,
+        position: physics.positions.get(node.id) ?? node.position,
+        selected: node.id === selectedId,
+        data: {
+          ...node.data,
+          highlighted:
+            analysisFocusIds.has(node.id) || node.id === hoveredNode?.node.id,
+        },
+      })),
+    [
+      flow.nodes,
+      physics.positions,
+      selectedId,
+      analysisFocusIds,
+      hoveredNode?.node.id,
+    ],
+  );
+  const hoveredNeighbors = useMemo(() => {
+    if (!hoveredNode) return new Set<string>();
+    return new Set(
+      visibleSnapshot.edges
+        .filter(
+          (edge) =>
+            edge.source === hoveredNode.node.id ||
+            edge.target === hoveredNode.node.id,
+        )
+        .map((edge) => edge.id),
+    );
+  }, [hoveredNode, visibleSnapshot.edges]);
+  const renderedEdges = useMemo(
+    () =>
+      flow.edges.map((edge) => ({
+        ...edge,
+        style: {
+          ...edge.style,
+          opacity: hoveredNode
+            ? hoveredNeighbors.has(edge.id)
+              ? 1
+              : 0.12
+            : edge.style?.opacity,
+          strokeWidth: hoveredNeighbors.has(edge.id)
+            ? 2
+            : edge.style?.strokeWidth,
+        },
+        zIndex: hoveredNeighbors.has(edge.id) ? 2 : 0,
+      })),
+    [flow.edges, hoveredNode, hoveredNeighbors],
+  );
+  const handleNodesChange = (changes: NodeChange<CitationFlowNode>[]): void => {
+    for (const change of changes)
+      if (change.type === "position" && change.position) {
+        if (change.dragging) fittedLayoutKeyRef.current = layoutViewKey;
+        physics.move(change.id, change.position);
+        if (change.dragging !== true) physics.release(change.id);
+      }
+  };
 
   useLayoutEffect(() => {
     if (viewMode !== "graph") return;
     const saved = savedGraphViewportRef.current;
-    if (!saved || saved.layoutKey !== flow.layoutKey) return;
+    if (!saved || saved.layoutKey !== layoutViewKey) return;
+    fittedLayoutKeyRef.current = layoutViewKey;
     const frame = window.requestAnimationFrame(() => {
       void setViewport(saved.viewport, { duration: 0 });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [flow.layoutKey, setViewport, viewMode]);
-
-  useEffect(() => {
-    if (!exportMenuOpen) return;
-    const closeOnPointerDown = (event: globalThis.PointerEvent): void => {
-      if (
-        event.target instanceof Node &&
-        exportMenuRef.current?.contains(event.target)
-      ) {
-        return;
-      }
-      setExportMenuOpen(false);
-    };
-    const closeOnEscape = (event: globalThis.KeyboardEvent): void => {
-      if (event.key === "Escape") setExportMenuOpen(false);
-    };
-    document.addEventListener("pointerdown", closeOnPointerDown);
-    document.addEventListener("keydown", closeOnEscape);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnPointerDown);
-      document.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [exportMenuOpen]);
+  }, [layoutViewKey, setViewport, viewMode]);
 
   useEffect(() => {
     if (
       viewMode !== "graph" ||
+      loading ||
       !flow.nodes.length ||
-      fittedLayoutKeyRef.current === flow.layoutKey
+      fittedLayoutKeyRef.current === layoutViewKey ||
+      (!physics.settled && initialFitKeyRef.current === layoutViewKey)
     ) {
       return;
     }
-    fittedLayoutKeyRef.current = flow.layoutKey;
     let secondFrame: number | undefined;
     const fit = (): void => {
-      void fitView({ padding: 0.16, duration: 0 });
+      if (fittedLayoutKeyRef.current === layoutViewKey) return;
+      initialFitKeyRef.current = layoutViewKey;
+      if (physics.settled) fittedLayoutKeyRef.current = layoutViewKey;
+      void fitView({
+        padding: 0.16,
+        maxZoom: 1.8,
+        duration: physics.settled ? 240 : 0,
+      });
     };
     const frame = window.requestAnimationFrame(() => {
       secondFrame = window.requestAnimationFrame(fit);
     });
-    const retry = window.setTimeout(fit, 180);
     return () => {
       window.cancelAnimationFrame(frame);
       if (secondFrame !== undefined) {
         window.cancelAnimationFrame(secondFrame);
       }
-      window.clearTimeout(retry);
     };
-  }, [fitView, flow.layoutKey, flow.nodes.length, viewMode]);
+  }, [
+    fitView,
+    layoutViewKey,
+    flow.nodes.length,
+    viewMode,
+    loading,
+    physics.settled,
+  ]);
 
   useEffect(() => {
     let timeout: number | undefined;
@@ -861,14 +955,13 @@ function CitationGraphWorkspaceContent({
     window.setTimeout(() => setCopied(false), 1400);
   };
 
-  const exportGraph = async (
-    format: CitationGraphExportFormat,
-  ): Promise<void> => {
+  const exportGraph = async (): Promise<void> => {
     if (exporting || !flow.nodes.length) return;
-    setExportMenuOpen(false);
-    setExporting(format);
+    setExporting(true);
     try {
       const exportedAt = new Date();
+      const selectedScopeLabel =
+        "已选 " + selectedPaperIdList.length + " 篇本地论文";
       const filterLabels = [
         selectedScopeLabel,
         selectedYearLabel ? `年份 ${selectedYearLabel}` : undefined,
@@ -892,28 +985,26 @@ function CitationGraphWorkspaceContent({
           showReferences,
           showCiting,
         },
-        nodes: flow.nodes.map((node) => ({
+        nodes: renderedNodes.map((node) => ({
           id: node.id,
           x: node.position.x,
           y: node.position.y,
-          width: nodeWidth,
-          height: nodeHeight,
+          width: citationNodeDiameter(node.data.citation),
+          height: citationNodeDiameter(node.data.citation),
           citation: node.data.citation,
           dimmed: node.data.dimmed,
         })),
         edges: visibleSnapshot.edges,
         errors: snapshot.errors,
       });
-      const scene = buildCitationGraphExportScene(document);
-      const content =
-        format === "json"
-          ? serializeCitationGraphExportDocument(document)
-          : buildCitationGraphInteractiveHtml(document, scene);
-      await window.paperxcel.citationGraph.export({ format, content });
+      await window.paperxcel.citationGraph.export({
+        format: "json",
+        content: serializeCitationGraphExportDocument(document),
+      });
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
     } finally {
-      setExporting(undefined);
+      setExporting(false);
     }
   };
 
@@ -930,11 +1021,21 @@ function CitationGraphWorkspaceContent({
   };
 
   const openDetails = (nodeId: string): void => {
+    setActiveTab("details");
+    setReferenceDetail(undefined);
     setSelectedId(nodeId);
     setDetailMinimized(false);
   };
 
+  const openReferenceDetails = (node: CitationGraphNode): void => {
+    setActiveTab("details");
+    setReferenceDetail(node);
+    setSelectedId(node.id);
+    setDetailMinimized(false);
+  };
+
   const closeDetails = (): void => {
+    setReferenceDetail(undefined);
     setSelectedId(undefined);
     setDetailMinimized(false);
   };
@@ -942,7 +1043,7 @@ function CitationGraphWorkspaceContent({
   const changeViewMode = (nextViewMode: CitationWorkspaceView): void => {
     if (viewMode === "graph" && nextViewMode !== "graph") {
       savedGraphViewportRef.current = {
-        layoutKey: flow.layoutKey,
+        layoutKey: layoutViewKey,
         viewport: getViewport(),
       };
     }
@@ -950,6 +1051,7 @@ function CitationGraphWorkspaceContent({
   };
 
   const focusGraphNodes = (nodeIds: string[]): void => {
+    setHistoricalSnapshot(analysisSnapshot);
     setAnalysisFocusIds(new Set(nodeIds));
     setShowLocal(true);
     setShowExternal(true);
@@ -960,6 +1062,7 @@ function CitationGraphWorkspaceContent({
   };
 
   const selectAnalysisNode = (nodeId: string): void => {
+    setActiveTab("details");
     focusGraphNodes([nodeId]);
     setSelectedId(nodeId);
     setDetailMinimized(false);
@@ -1008,10 +1111,6 @@ function CitationGraphWorkspaceContent({
   const citingCount = scopedSnapshot.nodes.filter(
     (node) => node.citesLibrary,
   ).length;
-  const relatedNodes = selected
-    ? getRelatedNodes(selected, scopedSnapshot)
-    : [];
-  const paperGroups = buildPaperGroups(papers, folders);
 
   return (
     <section className="citation-browser">
@@ -1022,14 +1121,6 @@ function CitationGraphWorkspaceContent({
           </span>
           <div>
             <h2>引文图谱</h2>
-            <p title={selectedScopeLabel}>
-              {selectedScopeLabel} ·{" "}
-              {viewMode === "graph"
-                ? "OpenAlex / Crossref 引文网络"
-                : viewMode === "discovery"
-                  ? "外部论文发现"
-                  : "引文网络分析"}
-            </p>
           </div>
         </div>
         <div className="citation-browser-center">
@@ -1074,7 +1165,7 @@ function CitationGraphWorkspaceContent({
                   viewMode === "graph"
                     ? "搜索标题、作者、DOI 等"
                     : discoveryMode === "pure-search"
-                      ? "输入主题关键词，空格或英文逗号分隔"
+                      ? "研究问题、论文标题或 DOI"
                       : "输入主题关键词，可留空使用选中文献"
                 }
                 aria-label={
@@ -1112,78 +1203,51 @@ function CitationGraphWorkspaceContent({
         </div>
         <div className="citation-browser-header-actions">
           {viewMode === "graph" && (
-            <div className="citation-graph-export" ref={exportMenuRef}>
+            <div className="citation-graph-export">
               <button
                 className="citation-browser-export-trigger"
                 type="button"
                 title="导出当前图谱"
-                aria-haspopup="menu"
-                aria-expanded={exportMenuOpen}
                 disabled={Boolean(exporting) || flow.nodes.length === 0}
-                onClick={() => setExportMenuOpen((open) => !open)}
+                onClick={() => void exportGraph()}
               >
                 {exporting ? (
                   <LoaderCircle className="spin" size={15} />
                 ) : (
                   <Download size={15} />
                 )}
-                导出
-                <ChevronDown size={13} />
+                导出 JSON
               </button>
-              {exportMenuOpen && (
-                <div className="citation-graph-export-menu" role="menu">
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => void exportGraph("json")}
-                  >
-                    <Braces size={16} />
-                    JSON 数据
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => void exportGraph("html")}
-                  >
-                    <FileCode2 size={16} />
-                    交互式 HTML
-                  </button>
-                </div>
-              )}
             </div>
           )}
-          <button
-            className="citation-browser-icon-control"
-            type="button"
-            title="OpenAlex 设置"
-            onClick={onOpenSettings}
-          >
-            <Settings2 size={17} />
-          </button>
           <button
             className="citation-browser-refresh"
             type="button"
             disabled={
-              (viewMode === "discovery"
-                ? selectedPaperIdList.length === 0
-                : selectedPaperIdList.length === 0) ||
+              (selectedPaperIdList.length === 0 &&
+                !(viewMode === "analysis" && analyzing)) ||
               (viewMode === "graph"
                 ? refreshing || expandingTwoHop
                 : viewMode === "discovery"
-                  ? discovering
-                  : analyzing)
+                  ? discovering || discoveryAgent.managing
+                  : analysisAgent.managing ||
+                    analysis.status === "stopping" ||
+                    (!analyzing && (loading || analysisAgent.loadingHistory)))
             }
             onClick={() => {
               if (viewMode === "graph") {
                 if (graphDepth === 2) void expandFocusedTwoHop(true);
                 else void refresh(false);
               } else if (viewMode === "discovery") void discover("contextual");
-              else void analyze();
+              else if (analyzing) analysisAgent.stop();
+              else analyze();
             }}
           >
-            {(viewMode === "graph" && (refreshing || expandingTwoHop)) ||
-            (viewMode === "discovery" && discovering) ||
-            (viewMode === "analysis" && analyzing) ? (
+            {viewMode === "analysis" && analyzing ? (
+              <Square size={14} />
+            ) : (viewMode === "graph" && (refreshing || expandingTwoHop)) ||
+              (viewMode === "discovery" && discovering) ||
+              (viewMode === "analysis" && analyzing) ? (
               <LoaderCircle className="spin" size={15} />
             ) : viewMode === "discovery" ? (
               <Compass size={15} />
@@ -1196,18 +1260,24 @@ function CitationGraphWorkspaceContent({
               ? "刷新"
               : viewMode === "discovery"
                 ? "发现论文"
-                : "重新分析"}
+                : analyzing
+                  ? "停止分析"
+                  : analysis.status === "idle"
+                    ? "开始 AI 分析"
+                    : "重新分析"}
           </button>
           {viewMode === "discovery" && (
             <button
               className="citation-browser-pure-search"
               type="button"
-              disabled={discovering || !discoveryQuery.trim()}
-              title="只按主题关键词搜索，不读取本地论文和图谱缓存"
+              disabled={
+                discovering || discoveryAgent.managing || !discoveryQuery.trim()
+              }
+              title="搜索研究问题、标题或 DOI"
               onClick={() => void discover("pure-search")}
             >
               <Search size={15} />
-              纯搜索
+              论文搜索
             </button>
           )}
         </div>
@@ -1237,7 +1307,6 @@ function CitationGraphWorkspaceContent({
               <CircleHelp size={14} />
             </span>
           </div>
-          <h2 title={selectedScopeLabel}>{selectedScopeLabel}</h2>
           <section className="citation-local-picker-section">
             <button
               className="citation-local-picker-heading"
@@ -1270,20 +1339,13 @@ function CitationGraphWorkspaceContent({
                   </button>
                 </div>
                 <div className="citation-local-picker-tree">
-                  {paperGroups.map((group) => (
-                    <PaperSelectionGroup
-                      key={group.id}
-                      group={group}
-                      selectedPaperIds={selectedPaperIds}
-                      onTogglePaper={togglePaper}
-                      onToggleGroup={toggleFolder}
-                    />
-                  ))}
-                  {papers.length === 0 && (
-                    <span className="citation-local-picker-empty">
-                      本地资料库暂无论文
-                    </span>
-                  )}
+                  <CitationPaperSelector
+                    papers={papers}
+                    folders={folders}
+                    selectedPaperIds={selectedPaperIds}
+                    onTogglePaper={togglePaper}
+                    onToggleGroup={toggleFolder}
+                  />
                 </div>
               </div>
             )}
@@ -1383,7 +1445,7 @@ function CitationGraphWorkspaceContent({
                       setShowReferences(event.target.checked)
                     }
                   />
-                  <ArrowDownLeft size={14} />
+                  <ArrowRightToLine size={14} />
                   参考文献
                   <small className="citation-reference-count">
                     {referenceCount}
@@ -1395,7 +1457,7 @@ function CitationGraphWorkspaceContent({
                     checked={showCiting}
                     onChange={(event) => setShowCiting(event.target.checked)}
                   />
-                  <ArrowUpRight size={14} />
+                  <ArrowRightFromLine size={14} />
                   引用本文
                   <small className="citation-citing-count">{citingCount}</small>
                 </label>
@@ -1585,23 +1647,31 @@ function CitationGraphWorkspaceContent({
 
           {viewMode === "analysis" && (
             <>
-              <p>网络结构分析</p>
+              <p>AI 全局研究</p>
               <section className="citation-filter-section citation-research-sidebar">
                 <span className="citation-filter-label">分析结果</span>
                 <div>
                   <ChartNetwork size={14} />
-                  <span>研究社区</span>
-                  <small>{analysis?.metrics.communityCount ?? 0}</small>
+                  <span>研究主题</span>
+                  <small>
+                    {analysis.research?.findings.filter(
+                      (item) => item.kind === "theme",
+                    ).length ?? 0}
+                  </small>
                 </div>
                 <div>
                   <Link2 size={14} />
-                  <span>文献耦合</span>
-                  <small>{analysis?.bibliographicCoupling.length ?? 0}</small>
+                  <span>已读文献</span>
+                  <small>{analysis.research?.coverage.read ?? 0}</small>
                 </div>
                 <div>
                   <Network size={14} />
-                  <span>关键路径</span>
-                  <small>{analysis?.keyPaths.length ?? 0}</small>
+                  <span>演进路径</span>
+                  <small>
+                    {analysis.research?.findings.filter(
+                      (item) => item.kind === "path",
+                    ).length ?? 0}
+                  </small>
                 </div>
               </section>
             </>
@@ -1609,8 +1679,7 @@ function CitationGraphWorkspaceContent({
 
           <div className="citation-filter-footer">
             <Database size={14} />
-            OpenAlex / Crossref / Europe PMC / arXiv
-            <span>{snapshot.updatedAt ? "已缓存" : "待刷新"}</span>
+            OpenAlex / Crossref / Europe PMC
           </div>
         </aside>
 
@@ -1646,6 +1715,18 @@ function CitationGraphWorkspaceContent({
                     onClick={() => setSelectedYearRange(undefined)}
                   >
                     {selectedYearLabel} <X size={13} />
+                  </button>
+                )}
+                {historicalSnapshot && (
+                  <button
+                    type="button"
+                    className="citation-ai-focus"
+                    onClick={() => {
+                      setHistoricalSnapshot(undefined);
+                      setAnalysisFocusIds(new Set());
+                    }}
+                  >
+                    正在查看本轮分析图谱 · 返回当前范围
                   </button>
                 )}
                 {analysisFocusIds.size > 0 && (
@@ -1711,42 +1792,117 @@ function CitationGraphWorkspaceContent({
                 />
               ) : (
                 <ReactFlow
-                  nodes={flow.nodes}
-                  edges={flow.edges}
+                  data-layout-settled={physics.settled}
+                  nodes={renderedNodes}
+                  edges={renderedEdges}
+                  edgeTypes={edgeTypes}
+                  onNodesChange={handleNodesChange}
+                  onNodeMouseEnter={(event, node) =>
+                    setHoveredNode({
+                      node: node.data.citation,
+                      x: event.clientX,
+                      y: event.clientY,
+                    })
+                  }
+                  onNodeMouseMove={(event, node) =>
+                    setHoveredNode({
+                      node: node.data.citation,
+                      x: event.clientX,
+                      y: event.clientY,
+                    })
+                  }
+                  onNodeMouseLeave={() => setHoveredNode(undefined)}
+                  onNodeDragStart={(_event, node) => {
+                    setHoveredNode(undefined);
+                    physics.move(node.id, node.position);
+                  }}
+                  onNodeDragStop={(_event, node) => physics.release(node.id)}
+                  onMoveStart={(event) => {
+                    setHoveredNode(undefined);
+                    if (event) fittedLayoutKeyRef.current = layoutViewKey;
+                  }}
                   nodeTypes={nodeTypes}
-                  minZoom={0.2}
-                  maxZoom={1.8}
+                  minZoom={0.08}
+                  maxZoom={3}
                   nodesDraggable
                   nodesConnectable={false}
                   elementsSelectable
                   onMoveEnd={(_event, viewport) => {
                     savedGraphViewportRef.current = {
-                      layoutKey: flow.layoutKey,
+                      layoutKey: layoutViewKey,
                       viewport,
                     };
                   }}
-                  onNodeClick={(_event, node) => openDetails(node.id)}
+                  onNodeClick={(_event, node) => {
+                    setHoveredNode(undefined);
+                    openDetails(node.id);
+                  }}
                   onPaneClick={closeDetails}
                 >
                   <Background color="#dfe5e3" gap={26} size={1} />
-                  <Controls showInteractive={false} />
+                  <Controls
+                    showInteractive={false}
+                    onZoomIn={() => {
+                      fittedLayoutKeyRef.current = layoutViewKey;
+                    }}
+                    onZoomOut={() => {
+                      fittedLayoutKeyRef.current = layoutViewKey;
+                    }}
+                    onFitView={() => {
+                      fittedLayoutKeyRef.current = layoutViewKey;
+                    }}
+                  />
                   <MiniMap
                     className="citation-graph-minimap"
                     nodeColor={(node) =>
-                      (node.data as CitationNodeData).citation.kind ===
-                      "library"
-                        ? "#247c70"
-                        : "#5aa59e"
+                      CITATION_NODE_COLORS[
+                        citationNodeTone(
+                          (node.data as CitationNodeData).citation,
+                        )
+                      ]
                     }
                     maskColor="rgba(233, 239, 237, 0.68)"
                   />
                 </ReactFlow>
               )}
 
+              {hoveredNode && (
+                <div
+                  className="citation-node-tooltip"
+                  role="tooltip"
+                  style={{
+                    left: Math.max(
+                      12,
+                      Math.min(hoveredNode.x + 18, window.innerWidth - 372),
+                    ),
+                    top: Math.max(
+                      12,
+                      Math.min(hoveredNode.y + 18, window.innerHeight - 224),
+                    ),
+                  }}
+                >
+                  <span
+                    className={`citation-tooltip-relation ${citationNodeTone(hoveredNode.node)}`}
+                  >
+                    {citationRelationLabel(hoveredNode.node)}
+                  </span>
+                  <strong>{formatCitationTitle(hoveredNode.node.title)}</strong>
+                  <p>
+                    {hoveredNode.node.authors.slice(0, 4).join(", ") ||
+                      "作者未知"}
+                  </p>
+                  <small>
+                    {hoveredNode.node.year ?? "年份未知"} ·{" "}
+                    {hoveredNode.node.journal ?? "来源未知"} · 被引{" "}
+                    {formatCitedByCount(hoveredNode.node.citedByCount)}
+                  </small>
+                  <footer>点击查看摘要和参考文件 · 拖拽调整位置</footer>
+                </div>
+              )}
               <div className="citation-canvas-key" aria-label="图例">
                 <span>
                   <i className="local" />
-                  本地资料库
+                  目标论文
                 </span>
                 <span>
                   <i className="reference" />
@@ -1754,31 +1910,148 @@ function CitationGraphWorkspaceContent({
                 </span>
                 <span>
                   <i className="citing" />
-                  引用本文
+                  后续引用
+                </span>
+                <span>
+                  <i className="both" />
+                  双向关联
+                </span>
+                <span>
+                  <i className="edge-solid" />
+                  一阶
+                </span>
+                <span>
+                  <i className="edge-dashed" />
+                  二阶
+                </span>
+                <span className="citation-key-note">
+                  箭头：被引用文献 → 引用它的论文
                 </span>
               </div>
             </>
           ) : viewMode === "discovery" ? (
             <CitationDiscoveryPanel
               result={discoveryResult}
+              agentPanel={
+                discoveryMode === "contextual" ? (
+                  <DiscoveryAgentPanel
+                    state={discoveryAgent.state}
+                    onSelect={(work) => {
+                      setReferenceDetail(work);
+                      openDetails(work.id);
+                    }}
+                    controls={
+                      <ResearchConversationBar
+                        key={discoveryAgent.conversation?.id ?? "new-discovery"}
+                        conversation={discoveryAgent.conversation}
+                        sessions={discoveryAgent.sessions}
+                        turn={discoveryAgent.turn}
+                        running={discoveryAgent.running}
+                        loading={discoveryAgent.loadingHistory}
+                        managing={discoveryAgent.managing}
+                        onOpen={(id) => void discoveryAgent.open(id)}
+                        onNew={() => {
+                          discoveryAgent.newConversation();
+                          setDiscoveryQuery("");
+                        }}
+                        onTurn={discoveryAgent.selectTurn}
+                        onRename={discoveryAgent.rename}
+                        onDelete={async () => {
+                          await discoveryAgent.deleteConversation();
+                          setDiscoveryQuery("");
+                          closeDetails();
+                        }}
+                        onDeleteTurn={async (turnId) => {
+                          await discoveryAgent.deleteTurn(turnId);
+                          closeDetails();
+                        }}
+                      />
+                    }
+                  />
+                ) : undefined
+              }
               mode={discoveryMode}
               loading={discovering}
               selectedPaperCount={selectedPaperIdList.length}
-              onOpenDetails={(work) => openDetails(work.id)}
+              onOpenDetails={(work) => {
+                setReferenceDetail(work);
+                openDetails(work.id);
+              }}
               onOpenSource={(sourceUrl) => window.open(sourceUrl, "_blank")}
-              onOpenGoogleScholar={openGoogleScholar}
-              onImportGoogleScholar={() => void importGoogleScholar()}
-              onLoadMore={loadMorePureSearch}
+              onLoadMore={
+                discoveryMode === "pure-search" ? loadMorePureSearch : undefined
+              }
               resultLimit={pureSearchLimit}
-              maxResultLimit={CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES}
+              maxResultLimit={
+                discoveryMode === "pure-search"
+                  ? CITATION_DISCOVERY_PURE_SEARCH_MAX_CANDIDATES
+                  : CITATION_DISCOVERY_MAX_CANDIDATES
+              }
+              filters={discoveryFilters}
+              onFiltersChange={setDiscoveryFilters}
+              filtersDirty={discoveryFiltersDirty}
+              onApplyFilters={() => void discover()}
+              onStop={stopDiscovery}
+              onAddToLibrary={async (work) => {
+                if (!work.doi) return;
+                await window.paperxcel.papers.addFromIdentifier(work.doi);
+              }}
+              libraryDois={
+                new Set(
+                  papers
+                    .map((paper) => normalizeCitationDoi(paper.doi))
+                    .filter((doi): doi is string => Boolean(doi)),
+                )
+              }
             />
           ) : (
             <div className="citation-analysis-workspace">
               <CitationAnalysisPanel
-                analysis={analysis}
+                state={analysis}
                 snapshot={analysisSnapshot}
-                loading={analyzing}
+                model={analysisModel}
+                question={analysisQuestion}
+                onQuestionChange={setAnalysisQuestion}
+                onStart={analyze}
                 selectedPaperCount={selectedPaperIdList.length}
+                conversationControls={
+                  <ResearchConversationBar
+                    key={analysisAgent.conversation?.id ?? "new-analysis"}
+                    conversation={analysisAgent.conversation}
+                    sessions={analysisAgent.sessions}
+                    turn={analysisAgent.turn}
+                    running={analyzing}
+                    loading={analysisAgent.loadingHistory}
+                    managing={analysisAgent.managing}
+                    onOpen={(id) => void analysisAgent.open(id)}
+                    onNew={() => {
+                      analysisAgent.newConversation();
+                      setAnalysisQuestion("");
+                      setAnalysisRunSnapshot(undefined);
+                    }}
+                    onTurn={analysisAgent.selectTurn}
+                    onRename={analysisAgent.rename}
+                    onDelete={async () => {
+                      await analysisAgent.deleteConversation();
+                      setAnalysisQuestion("");
+                      setAnalysisRunSnapshot(undefined);
+                    }}
+                    onDeleteTurn={async (turnId) => {
+                      await analysisAgent.deleteTurn(turnId);
+                      setAnalysisRunSnapshot(undefined);
+                    }}
+                    followUp={{
+                      currentPaperCount: selectedPaperIdList.length,
+                      canFollowUp: Boolean(analysisQuestion.trim()),
+                      onFollowUp: () =>
+                        runAnalysis(analysisQuestion, analysisAgent.turn?.id),
+                      onReapply: () =>
+                        runAnalysis(
+                          analysisAgent.turn?.question ?? analysisQuestion,
+                        ),
+                    }}
+                  />
+                }
                 onFocusNodes={focusGraphNodes}
                 onSelectNode={selectAnalysisNode}
               />
@@ -1865,14 +2138,9 @@ function CitationGraphWorkspaceContent({
               onClick={() => setActiveTab("abstract")}
             />
             <DetailTabButton
-              active={activeTab === "notes"}
-              label="笔记"
-              onClick={() => setActiveTab("notes")}
-            />
-            <DetailTabButton
-              active={activeTab === "relations"}
-              label="关系"
-              onClick={() => setActiveTab("relations")}
+              active={activeTab === "references"}
+              label="参考文件"
+              onClick={() => setActiveTab("references")}
             />
           </div>
 
@@ -1895,18 +2163,11 @@ function CitationGraphWorkspaceContent({
                 }
               />
             )}
-            {activeTab === "notes" && (
-              <DetailNotes
-                content={noteContent}
-                loading={noteLoading}
-                enabled={Boolean(selectedPaper)}
-              />
-            )}
-            {activeTab === "relations" && (
-              <RelatedPapers
+            {activeTab === "references" && (
+              <CitationReferencesPanel
+                key={selected.id}
                 selected={selected}
-                relatedNodes={relatedNodes}
-                onSelect={openDetails}
+                onSelect={openReferenceDetails}
               />
             )}
           </div>
@@ -1957,587 +2218,6 @@ function CitationGraphWorkspaceContent({
   );
 }
 
-function mergeDiscoveryResults(
-  current: CitationDiscoveryResult | undefined,
-  incoming: CitationDiscoveryResult,
-): CitationDiscoveryResult {
-  if (!current || current.query !== incoming.query) return incoming;
-  const candidates = new Map(
-    current.candidates.map((candidate) => [
-      discoveryCandidateKey(candidate.work),
-      candidate,
-    ]),
-  );
-  for (const candidate of incoming.candidates) {
-    const key = discoveryCandidateKey(candidate.work);
-    const previous = candidates.get(key);
-    candidates.set(
-      key,
-      previous && previous.score >= candidate.score ? previous : candidate,
-    );
-  }
-  return {
-    ...incoming,
-    candidates: [...candidates.values()].sort(
-      (first, second) =>
-        second.score - first.score ||
-        (second.work.citedByCount ?? -1) - (first.work.citedByCount ?? -1),
-    ),
-    terms: [...new Set([...current.terms, ...incoming.terms])],
-    warnings: [...new Set([...current.warnings, ...incoming.warnings])],
-  };
-}
-
-function discoveryCandidateKey(work: CitationGraphNode): string {
-  return (
-    work.doi?.toLocaleLowerCase() ||
-    work.openAlexId ||
-    work.title.normalize("NFKC").toLocaleLowerCase()
-  );
-}
-
-function DetailTabButton({
-  active,
-  label,
-  onClick,
-}: {
-  active: boolean;
-  label: string;
-  onClick: () => void;
-}): React.JSX.Element {
-  return (
-    <button
-      className={active ? "active" : ""}
-      type="button"
-      role="tab"
-      aria-selected={active}
-      onClick={onClick}
-    >
-      {label}
-    </button>
-  );
-}
-
-function DetailOverview({
-  selected,
-  copied,
-  onCopyDoi,
-}: {
-  selected: CitationGraphNode;
-  copied: boolean;
-  onCopyDoi: () => void;
-}): React.JSX.Element {
-  return (
-    <>
-      <dl className="citation-detail-metadata">
-        <div>
-          <dt>年份</dt>
-          <dd>{selected.year ?? "未知"}</dd>
-        </div>
-        <div>
-          <dt>期刊</dt>
-          <dd>{selected.journal ?? "未知"}</dd>
-        </div>
-        {(selected.volume || selected.issue || selected.pages) && (
-          <div>
-            <dt>卷期页</dt>
-            <dd>
-              {[
-                selected.volume ? `卷 ${selected.volume}` : undefined,
-                selected.issue ? `期 ${selected.issue}` : undefined,
-                selected.pages ? `页 ${selected.pages}` : undefined,
-              ]
-                .filter(Boolean)
-                .join(" · ")}
-            </dd>
-          </div>
-        )}
-        {selected.issn && selected.issn.length > 0 && (
-          <div>
-            <dt>ISSN</dt>
-            <dd>{selected.issn.join(" / ")}</dd>
-          </div>
-        )}
-        <div>
-          <dt>被引次数</dt>
-          <dd>{formatCitedByCount(selected.citedByCount)}</dd>
-        </div>
-        {selected.depth !== undefined && (
-          <div>
-            <dt>图谱层级</dt>
-            <dd>{formatCitationGraphLayer(selected)}</dd>
-          </div>
-        )}
-        {selected.parentIds && selected.parentIds.length > 0 && (
-          <div>
-            <dt>关系路径</dt>
-            <dd>
-              {selected.depth === 2
-                ? selected.direction === "references"
-                  ? "目标论文 → 一阶参考 → 当前论文"
-                  : "目标论文 → 一阶引用 → 当前论文"
-                : selected.direction === "references"
-                  ? "目标论文 → 当前参考论文"
-                  : selected.direction === "citing"
-                    ? "当前论文 → 目标论文"
-                    : "当前目标论文"}
-            </dd>
-          </div>
-        )}
-        {selected.openAlexId && (
-          <div>
-            <dt>OpenAlex</dt>
-            <dd>{selected.openAlexId}</dd>
-          </div>
-        )}
-        {selected.matchStatus && (
-          <div>
-            <dt>匹配状态</dt>
-            <dd>
-              <span className={`citation-match-state ${selected.matchStatus}`}>
-                {formatMatchStatus(selected.matchStatus)}
-              </span>
-            </dd>
-          </div>
-        )}
-        {typeof selected.matchConfidence === "number" && (
-          <div>
-            <dt>匹配置信度</dt>
-            <dd>{Math.round(selected.matchConfidence)}%</dd>
-          </div>
-        )}
-        {selected.metadataSources && selected.metadataSources.length > 0 && (
-          <div>
-            <dt>元数据来源</dt>
-            <dd>{formatMetadataSources(selected.metadataSources)}</dd>
-          </div>
-        )}
-        {selected.textQuality === "degraded" && (
-          <div>
-            <dt>PDF 文本</dt>
-            <dd>存在乱码；匹配时未依赖缺失字符</dd>
-          </div>
-        )}
-      </dl>
-      {selected.rawCitation && (
-        <article className="citation-raw-reference">
-          <span>PDF 原始书目</span>
-          <p>{selected.rawCitation}</p>
-        </article>
-      )}
-      {selected.doi && (
-        <button
-          className="citation-detail-doi"
-          type="button"
-          title="复制 DOI"
-          onClick={onCopyDoi}
-        >
-          <span>
-            <small>DOI</small>
-            {selected.doi}
-          </span>
-          {copied ? <Check size={15} /> : <Copy size={15} />}
-        </button>
-      )}
-      <div className="citation-detail-relation-pills">
-        {selected.referencedByLibrary && (
-          <span className="reference">
-            <ArrowDownLeft size={13} />
-            被库内论文参考
-          </span>
-        )}
-        {selected.citesLibrary && (
-          <span className="citing">
-            <ArrowUpRight size={13} />
-            引用库内论文
-          </span>
-        )}
-      </div>
-    </>
-  );
-}
-
-function DetailTextState({
-  title,
-  content,
-  empty,
-}: {
-  title: string;
-  content?: string;
-  empty: string;
-}): React.JSX.Element {
-  return content?.trim() ? (
-    <article className="citation-detail-prose">
-      <span>{title}</span>
-      <p>{content}</p>
-    </article>
-  ) : (
-    <div className="citation-detail-tab-empty">
-      <FileText size={20} />
-      <p>{empty}</p>
-    </div>
-  );
-}
-
-function DetailNotes({
-  content,
-  loading,
-  enabled,
-}: {
-  content: string;
-  loading: boolean;
-  enabled: boolean;
-}): React.JSX.Element {
-  if (!enabled) {
-    return (
-      <div className="citation-detail-tab-empty">
-        <BookOpen size={20} />
-        <p>导入这篇论文后，可以在此查看资料库笔记。</p>
-      </div>
-    );
-  }
-  if (loading) {
-    return (
-      <div className="citation-detail-tab-empty">
-        <LoaderCircle className="spin" size={20} />
-        <p>正在读取笔记。</p>
-      </div>
-    );
-  }
-  return (
-    <DetailTextState
-      title="研究笔记"
-      content={content}
-      empty="这篇论文还没有笔记。"
-    />
-  );
-}
-
-function RelatedPapers({
-  selected,
-  relatedNodes,
-  onSelect,
-}: {
-  selected: CitationGraphNode;
-  relatedNodes: Array<{
-    node: CitationGraphNode;
-    relation: "references" | "citedBy";
-  }>;
-  onSelect: (nodeId: string) => void;
-}): React.JSX.Element {
-  if (!relatedNodes.length) {
-    return (
-      <div className="citation-detail-tab-empty">
-        <Link2 size={20} />
-        <p>当前筛选范围内没有与此论文相连的节点。</p>
-      </div>
-    );
-  }
-  return (
-    <div className="citation-related-list">
-      {relatedNodes.map(({ node, relation }) => (
-        <button
-          key={node.id}
-          type="button"
-          onClick={() => onSelect(node.id)}
-          title={`查看 ${node.title}`}
-        >
-          {relation === "references" ? (
-            <ArrowDownLeft size={14} />
-          ) : (
-            <ArrowUpRight size={14} />
-          )}
-          <span>
-            <strong>{node.title}</strong>
-            <small>
-              {relation === "references"
-                ? `${selected.title} 参考了此论文`
-                : `此论文引用了 ${selected.title}`}
-            </small>
-          </span>
-        </button>
-      ))}
-    </div>
-  );
-}
-
-export function scopeCitationSnapshot(
-  snapshot: CitationGraphSnapshot,
-  selectedPaperIds: ReadonlySet<string>,
-): CitationGraphSnapshot {
-  if (selectedPaperIds.size === 0) {
-    return {
-      nodes: [],
-      edges: [],
-      updatedAt: snapshot.updatedAt,
-      errors: [...snapshot.errors],
-    };
-  }
-
-  const selectedNodeIds = new Set(
-    [...selectedPaperIds].map((paperId) => `paper:${paperId}`),
-  );
-  const edges = snapshot.edges.filter(
-    (edge) =>
-      selectedNodeIds.has(edge.source) || selectedNodeIds.has(edge.target),
-  );
-  const visibleNodeIds = new Set(selectedNodeIds);
-  const relations = new Map<
-    string,
-    { referencedByLibrary: boolean; citesLibrary: boolean }
-  >();
-
-  for (const edge of edges) {
-    visibleNodeIds.add(edge.source);
-    visibleNodeIds.add(edge.target);
-    if (selectedNodeIds.has(edge.source) && !selectedNodeIds.has(edge.target)) {
-      const relation = relations.get(edge.target) ?? {
-        referencedByLibrary: false,
-        citesLibrary: false,
-      };
-      relation.referencedByLibrary = true;
-      relations.set(edge.target, relation);
-    }
-    if (selectedNodeIds.has(edge.target) && !selectedNodeIds.has(edge.source)) {
-      const relation = relations.get(edge.source) ?? {
-        referencedByLibrary: false,
-        citesLibrary: false,
-      };
-      relation.citesLibrary = true;
-      relations.set(edge.source, relation);
-    }
-  }
-
-  const nodes = snapshot.nodes
-    .filter((node) => visibleNodeIds.has(node.id))
-    .map((node): CitationGraphNode => {
-      if (selectedNodeIds.has(node.id)) {
-        return {
-          ...node,
-          kind: "library",
-          referencedByLibrary: false,
-          citesLibrary: false,
-        };
-      }
-      const relation = relations.get(node.id);
-      return {
-        ...node,
-        referencedByLibrary: relation?.referencedByLibrary ?? false,
-        citesLibrary: relation?.citesLibrary ?? false,
-      };
-    });
-
-  return {
-    nodes,
-    edges,
-    updatedAt: snapshot.updatedAt,
-    errors: [...snapshot.errors],
-  };
-}
-
-export function markLibraryNodes(
-  snapshot: CitationGraphSnapshot,
-  papers: Paper[],
-): CitationGraphSnapshot {
-  const papersById = new Map(papers.map((paper) => [paper.id, paper]));
-  const papersByDoi = new Map<string, Paper>();
-  const papersByTitle = new Map<string, Paper[]>();
-
-  for (const paper of papers) {
-    const doi = normalizeCitationDoi(paper.doi);
-    if (doi) papersByDoi.set(doi, paper);
-    const title = normalizeLibraryTitle(paper.title);
-    if (!title) continue;
-    const matches = papersByTitle.get(title) ?? [];
-    matches.push(paper);
-    papersByTitle.set(title, matches);
-  }
-
-  return {
-    ...snapshot,
-    nodes: snapshot.nodes.map((node) => {
-      const doi = normalizeCitationDoi(node.doi);
-      const titleMatches = papersByTitle.get(normalizeLibraryTitle(node.title));
-      const titleMatch =
-        titleMatches?.length === 1 &&
-        (!node.year ||
-          !titleMatches[0].year ||
-          node.year === titleMatches[0].year)
-          ? titleMatches[0]
-          : undefined;
-      const paper =
-        (node.paperId ? papersById.get(node.paperId) : undefined) ??
-        (doi ? papersByDoi.get(doi) : undefined) ??
-        titleMatch;
-      if (!paper) return node;
-      return {
-        ...node,
-        kind: "library",
-        paperId: paper.id,
-        sourceUrl: paper.sourceUrl ?? node.sourceUrl,
-      };
-    }),
-  };
-}
-
-function normalizeLibraryTitle(value: string): string {
-  return formatCitationTitle(value)
-    .normalize("NFKC")
-    .toLocaleLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim();
-}
-
-function formatCitationTitle(value: string): string {
-  return value
-    .replace(/<[^>]*>/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-interface PaperSelectionGroup {
-  id: string;
-  name: string;
-  papers: Paper[];
-  children: PaperSelectionGroup[];
-}
-
-function buildPaperGroups(
-  papers: Paper[],
-  folders: LibraryFolder[],
-): PaperSelectionGroup[] {
-  const papersByFolder = new Map<string | undefined, Paper[]>();
-  for (const paper of papers) {
-    const group = papersByFolder.get(paper.folderId) ?? [];
-    group.push(paper);
-    papersByFolder.set(paper.folderId, group);
-  }
-  const foldersByParent = new Map<string | undefined, LibraryFolder[]>();
-  for (const folder of folders) {
-    const group = foldersByParent.get(folder.parentId) ?? [];
-    group.push(folder);
-    foldersByParent.set(folder.parentId, group);
-  }
-
-  const buildFolder = (folder: LibraryFolder): PaperSelectionGroup => ({
-    id: `folder:${folder.id}`,
-    name: folder.name,
-    papers: (papersByFolder.get(folder.id) ?? []).sort((first, second) =>
-      first.title.localeCompare(second.title),
-    ),
-    children: (foldersByParent.get(folder.id) ?? [])
-      .map(buildFolder)
-      .filter((group) => group.papers.length > 0 || group.children.length > 0)
-      .sort((first, second) => first.name.localeCompare(second.name)),
-  });
-
-  const groups: PaperSelectionGroup[] = [];
-  const folderIds = new Set(folders.map((folder) => folder.id));
-  const unfiled = papers
-    .filter((paper) => !paper.folderId || !folderIds.has(paper.folderId))
-    .sort((first, second) => first.title.localeCompare(second.title));
-  if (unfiled.length) {
-    groups.push({
-      id: "folder:unfiled",
-      name: "未分类",
-      papers: unfiled,
-      children: [],
-    });
-  }
-  groups.push(
-    ...(foldersByParent.get(undefined) ?? [])
-      .map(buildFolder)
-      .filter((group) => group.papers.length > 0 || group.children.length > 0)
-      .sort((first, second) => first.name.localeCompare(second.name)),
-  );
-  return groups;
-}
-
-function PaperSelectionGroup({
-  group,
-  selectedPaperIds,
-  onTogglePaper,
-  onToggleGroup,
-  depth = 0,
-}: {
-  group: PaperSelectionGroup;
-  selectedPaperIds: Set<string>;
-  onTogglePaper: (paperId: string) => void;
-  onToggleGroup: (paperIds: string[]) => void;
-  depth?: number;
-}): React.JSX.Element {
-  const [open, setOpen] = useState(depth < 1);
-  const paperIds = [
-    ...group.papers.map((paper) => paper.id),
-    ...group.children.flatMap((child) => getGroupPaperIds(child)),
-  ];
-  const allSelected =
-    paperIds.length > 0 &&
-    paperIds.every((paperId) => selectedPaperIds.has(paperId));
-  const selectedCount = paperIds.filter((paperId) =>
-    selectedPaperIds.has(paperId),
-  ).length;
-
-  return (
-    <div className="citation-paper-group" style={{ paddingLeft: depth * 9 }}>
-      <div className="citation-paper-group-row">
-        <button
-          className="citation-paper-group-expand"
-          type="button"
-          onClick={() => setOpen((current) => !current)}
-          aria-label={open ? "折叠文件夹" : "展开文件夹"}
-        >
-          {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-        </button>
-        <input
-          type="checkbox"
-          checked={allSelected}
-          disabled={!paperIds.length}
-          onChange={() => onToggleGroup(paperIds)}
-          aria-label={`选择文件夹 ${group.name}`}
-        />
-        <FolderOpen size={14} />
-        <span title={group.name}>{group.name}</span>
-        <small>
-          {selectedCount}/{paperIds.length}
-        </small>
-      </div>
-      {open && (
-        <div className="citation-paper-group-contents">
-          {group.papers.map((paper) => (
-            <label className="citation-paper-selection" key={paper.id}>
-              <input
-                type="checkbox"
-                checked={selectedPaperIds.has(paper.id)}
-                onChange={() => onTogglePaper(paper.id)}
-              />
-              <FileText size={12} />
-              <span title={paper.title}>{paper.title}</span>
-            </label>
-          ))}
-          {group.children.map((child) => (
-            <PaperSelectionGroup
-              key={child.id}
-              group={child}
-              selectedPaperIds={selectedPaperIds}
-              onTogglePaper={onTogglePaper}
-              onToggleGroup={onToggleGroup}
-              depth={depth + 1}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function getGroupPaperIds(group: PaperSelectionGroup): string[] {
-  return [
-    ...group.papers.map((paper) => paper.id),
-    ...group.children.flatMap((child) => getGroupPaperIds(child)),
-  ];
-}
-
 function EmptyGraphState({
   icon,
   title,
@@ -2557,341 +2237,6 @@ function EmptyGraphState({
       {action}
     </div>
   );
-}
-
-function CitationNode({
-  data,
-  selected,
-}: NodeProps<CitationFlowNode>): React.JSX.Element {
-  const node = data.citation;
-  const relationClass =
-    node.direction === "both"
-      ? "both"
-      : node.kind === "library"
-        ? "library"
-        : node.referencedByLibrary && node.citesLibrary
-          ? "both"
-          : node.referencedByLibrary
-            ? "reference"
-            : "citing";
-  return (
-    <div
-      className={`citation-flow-node ${relationClass} ${
-        selected ? "selected" : ""
-      } ${data.dimmed ? "dimmed" : ""} ${
-        node.matchStatus ? `match-${node.matchStatus}` : ""
-      } ${node.depth === 2 ? "focused-depth-2" : ""}`}
-    >
-      <Handle type="target" position={Position.Left} />
-      <strong title={formatCitationTitle(node.title)}>
-        {formatCitationTitle(node.title)}
-      </strong>
-      <div className="citation-flow-node-meta">
-        <span>{node.year ?? "年份未知"}</span>
-        <span>被引 {formatCitedByCount(node.citedByCount)}</span>
-        <span className="citation-flow-node-author">
-          {node.depth !== undefined
-            ? formatCitationGraphLayer(node)
-            : (node.authors[0] ?? node.journal ?? "作者未知")}
-        </span>
-      </div>
-      <Handle type="source" position={Position.Right} />
-    </div>
-  );
-}
-
-function formatCitedByCount(value?: number): string {
-  return typeof value === "number" ? value.toLocaleString() : "未知";
-}
-
-function formatCitationGraphLayer(node: CitationGraphNode): string {
-  if (node.depth === 0 || node.direction === "root") return "目标论文";
-  if (node.depth === 1 && node.direction === "references") return "一阶参考";
-  if (node.depth === 2 && node.direction === "references") return "二阶参考";
-  if (node.depth === 1 && node.direction === "citing") return "一阶引用";
-  if (node.depth === 2 && node.direction === "citing") return "二阶引用";
-  return "双向关联";
-}
-
-function formatMatchStatus(status: CitationMatchStatus): string {
-  const labels: Record<CitationMatchStatus, string> = {
-    verified: "已确认",
-    probable: "可能匹配",
-    ambiguous: "匹配存疑",
-    unresolved: "未解析",
-  };
-  return labels[status];
-}
-
-function formatMetadataSources(sources: CitationMetadataSource[]): string {
-  const labels: Record<CitationMetadataSource, string> = {
-    library: "文献库",
-    pdf: "PDF",
-    crossref: "Crossref",
-    openalex: "OpenAlex",
-    "europe-pmc": "Europe PMC",
-    arxiv: "arXiv",
-    "google-scholar": "Google Scholar",
-    "ai-assisted": "AI 辅助",
-  };
-  return [...new Set(sources)].map((source) => labels[source]).join(" / ");
-}
-
-function buildFlowGraph(
-  citationNodes: CitationGraphNode[],
-  citationEdges: CitationGraphSnapshot["edges"],
-  query: string,
-  focusedNodeIds: ReadonlySet<string> = new Set(),
-): { nodes: CitationFlowNode[]; edges: Edge[]; layoutKey: string } {
-  if (citationNodes.some((node) => node.depth !== undefined)) {
-    return buildFocusedFlowGraph(
-      citationNodes,
-      citationEdges,
-      query,
-      focusedNodeIds,
-    );
-  }
-  const graph = new dagre.graphlib.Graph();
-  graph.setDefaultEdgeLabel(() => ({}));
-  graph.setGraph({
-    rankdir: "LR",
-    nodesep: 12,
-    ranksep: 50,
-    marginx: 18,
-    marginy: 18,
-  });
-  for (const node of citationNodes) {
-    graph.setNode(node.id, { width: nodeWidth, height: nodeHeight });
-  }
-  for (const edge of citationEdges) graph.setEdge(edge.source, edge.target);
-  dagre.layout(graph);
-
-  const normalizedQuery = query.trim().toLocaleLowerCase();
-  const nodeById = new Map(citationNodes.map((node) => [node.id, node]));
-  return {
-    nodes: citationNodes.map((citation) => {
-      const position = graph.node(citation.id);
-      const haystack = [
-        citation.title,
-        citation.doi,
-        citation.journal,
-        ...citation.authors,
-      ]
-        .filter(Boolean)
-        .join(" ")
-        .toLocaleLowerCase();
-      return {
-        id: citation.id,
-        type: "citation",
-        position: {
-          x: position.x - nodeWidth / 2,
-          y: position.y - nodeHeight / 2,
-        },
-        data: {
-          citation,
-          dimmed: Boolean(
-            (normalizedQuery && !haystack.includes(normalizedQuery)) ||
-            (focusedNodeIds.size > 0 && !focusedNodeIds.has(citation.id)),
-          ),
-        },
-      };
-    }),
-    edges: citationEdges.map((edge) => {
-      const source = nodeById.get(edge.source);
-      const target = nodeById.get(edge.target);
-      const color =
-        source?.kind === "library" && target?.kind === "external"
-          ? "#d19732"
-          : source?.kind === "external" && target?.kind === "library"
-            ? "#388d87"
-            : "#7f8b85";
-      return {
-        ...edge,
-        type: "smoothstep",
-        markerEnd: {
-          type: MarkerType.ArrowClosed,
-          width: 14,
-          height: 14,
-          color,
-        },
-        style: { stroke: color, strokeWidth: 1.35 },
-      };
-    }),
-    // 高亮只改变节点明暗，不改变 dagre 布局。不要把 focusedNodeIds 写入
-    // layoutKey，否则从“分析”返回图谱时会误触发 fitView 并重置用户缩放。
-    layoutKey: `${citationNodes.map((node) => node.id).join("|")}:${citationEdges
-      .map((edge) => edge.id)
-      .join("|")}`,
-  };
-}
-
-function buildFocusedFlowGraph(
-  citationNodes: CitationGraphNode[],
-  citationEdges: CitationGraphSnapshot["edges"],
-  query: string,
-  focusedNodeIds: ReadonlySet<string>,
-): { nodes: CitationFlowNode[]; edges: Edge[]; layoutKey: string } {
-  const columnGap = 88;
-  const rowGap = 18;
-  const columns = new Map<number, CitationGraphNode[]>();
-
-  const getColumn = (node: CitationGraphNode): number => {
-    if (node.depth === 0 || node.direction === "root") return 0;
-    if (node.direction === "references") return -(node.depth ?? 1);
-    if (node.direction === "citing") return node.depth ?? 1;
-    const relation = citationEdges.find(
-      (edge) =>
-        (edge.source === node.id || edge.target === node.id) && edge.relation,
-    )?.relation;
-    return relation === "reference" ? -(node.depth ?? 1) : (node.depth ?? 1);
-  };
-
-  for (const node of citationNodes) {
-    const column = getColumn(node);
-    const group = columns.get(column) ?? [];
-    group.push(node);
-    columns.set(column, group);
-  }
-
-  const score = (node: CitationGraphNode): string =>
-    `${String(node.year ?? 0).padStart(5, "0")}:${node.title}`;
-  for (const group of columns.values()) {
-    group.sort((first, second) => score(first).localeCompare(score(second)));
-  }
-
-  const positions = new Map<string, { x: number; y: number }>();
-  const columnHeights = new Map<number, number>();
-  for (const [column, group] of columns) {
-    columnHeights.set(
-      column,
-      Math.max(
-        0,
-        group.length * nodeHeight + Math.max(0, group.length - 1) * rowGap,
-      ),
-    );
-  }
-  const maxHeight = Math.max(...columnHeights.values(), nodeHeight);
-  for (const [column, group] of columns) {
-    const height = columnHeights.get(column) ?? nodeHeight;
-    const startY = (maxHeight - height) / 2;
-    const x = column * (nodeWidth + columnGap);
-    group.forEach((node, index) => {
-      positions.set(node.id, {
-        x,
-        y: startY + index * (nodeHeight + rowGap),
-      });
-    });
-  }
-
-  const normalizedQuery = query.trim().toLocaleLowerCase();
-  const nodeById = new Map(citationNodes.map((node) => [node.id, node]));
-  const flowNodes = citationNodes.map((citation) => {
-    const position = positions.get(citation.id) ?? { x: 0, y: 0 };
-    const haystack = [
-      citation.title,
-      citation.doi,
-      citation.journal,
-      ...citation.authors,
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLocaleLowerCase();
-    return {
-      id: citation.id,
-      type: "citation" as const,
-      position,
-      data: {
-        citation,
-        dimmed: Boolean(
-          (normalizedQuery && !haystack.includes(normalizedQuery)) ||
-          (focusedNodeIds.size > 0 && !focusedNodeIds.has(citation.id)),
-        ),
-      },
-    };
-  });
-
-  const flowEdges = citationEdges.map((edge) => {
-    const source = nodeById.get(edge.source);
-    const target = nodeById.get(edge.target);
-    const color =
-      edge.relation === "reference"
-        ? "#d19732"
-        : edge.relation === "citing"
-          ? "#388d87"
-          : source?.kind === "library" && target?.kind === "external"
-            ? "#d19732"
-            : source?.kind === "external" && target?.kind === "library"
-              ? "#388d87"
-              : "#7f8b85";
-    return {
-      ...edge,
-      type: "smoothstep",
-      markerEnd: {
-        type: MarkerType.ArrowClosed,
-        width: 14,
-        height: 14,
-        color,
-      },
-      style: {
-        stroke: color,
-        strokeWidth: edge.depth === 2 ? 1.1 : 1.45,
-        strokeDasharray: edge.depth === 2 ? "5 4" : undefined,
-      },
-    };
-  });
-
-  return {
-    nodes: flowNodes,
-    edges: flowEdges,
-    layoutKey: `focused:${citationNodes
-      .map((node) => `${node.id}:${node.depth}:${node.direction}`)
-      .join("|")}:${citationEdges.map((edge) => edge.id).join("|")}`,
-  };
-}
-
-function getRelatedNodes(
-  selected: CitationGraphNode,
-  snapshot: CitationGraphSnapshot,
-): Array<{
-  node: CitationGraphNode;
-  relation: "references" | "citedBy";
-}> {
-  const byId = new Map(snapshot.nodes.map((node) => [node.id, node]));
-  const related: Array<{
-    node: CitationGraphNode;
-    relation: "references" | "citedBy";
-  }> = [];
-  for (const edge of snapshot.edges) {
-    if (edge.relation === "reference") {
-      if (edge.target === selected.id) {
-        const node = byId.get(edge.source);
-        if (node) related.push({ node, relation: "references" });
-      } else if (edge.source === selected.id) {
-        const node = byId.get(edge.target);
-        if (node) related.push({ node, relation: "citedBy" });
-      }
-      continue;
-    }
-    if (edge.relation === "citing") {
-      if (edge.source === selected.id) {
-        const node = byId.get(edge.target);
-        if (node) related.push({ node, relation: "citedBy" });
-      } else if (edge.target === selected.id) {
-        const node = byId.get(edge.source);
-        if (node) related.push({ node, relation: "references" });
-      }
-      continue;
-    }
-    if (edge.source === selected.id) {
-      const node = byId.get(edge.target);
-      if (node) related.push({ node, relation: "references" });
-    }
-    if (edge.target === selected.id) {
-      const node = byId.get(edge.source);
-      if (node) related.push({ node, relation: "citedBy" });
-    }
-  }
-  return related;
 }
 
 function CircleErrorText({ errors }: { errors: string[] }): React.JSX.Element {

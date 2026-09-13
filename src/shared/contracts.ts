@@ -1,3 +1,21 @@
+import type {
+  PaperNoteStream,
+  PaperTextDraftState,
+  PaperTextUpdate,
+} from "./paperText";
+import type {
+  CitationAnalysisInput,
+  CitationAnalysisResult,
+} from "./citationAnalysisAgent";
+export type { PaperNoteStream } from "./paperText";
+import type {
+  DiscoveryAgentInput,
+  ResearchConversation,
+  ResearchConversationSummary,
+  ResearchKind,
+  ResearchRunResult,
+} from "./researchConversation";
+
 export type PaperStatus =
   | "needs_file"
   | "queued"
@@ -171,6 +189,8 @@ export interface ChatMessage {
   citationVerification?: CitationVerification;
   agentTrace?: AgentTraceEvent[];
   tokenUsage?: TokenUsage;
+  contextCheckpoint?: string;
+  contextUsage?: import("./assistantContext").AssistantContextUsage;
   createdAt: string;
 }
 
@@ -178,6 +198,7 @@ export interface PaperNote {
   paperId: string;
   content: string;
   updatedAt: string;
+  generationStatus?: "complete" | "interrupted" | "error";
 }
 
 export interface AskPaperInput {
@@ -229,10 +250,12 @@ export interface ChatProgress {
   reasoningDelta?: string;
   answerContent?: string;
   answerDelta?: string;
+  contextUsage?: import("./assistantContext").AssistantContextUsage;
 }
 
 export type AgentEventType =
   | "run.started"
+  | "assistant.message"
   | "plan.created"
   | "step.started"
   | "step.completed"
@@ -281,6 +304,7 @@ export interface GeneratePaperNoteResult {
 
 export interface GeneratePaperNoteCancelled {
   cancelled: true;
+  note?: PaperNote;
 }
 
 export interface LibraryReview {
@@ -330,6 +354,7 @@ export interface KnowledgeBaseMarkdownPreview {
   generatedAt: string;
   aiRepaired: boolean;
   hasAiRepairedVersion?: boolean;
+  draft?: PaperTextDraftState;
   model?: string;
   protocol?: Exclude<ProviderProtocol, "auto">;
   repairedAt?: string;
@@ -340,17 +365,11 @@ export interface KnowledgeBaseMarkdownPreview {
     preservedBatchCount: number;
     detectedIssues: string[];
   };
-  comparison?: {
-    originalCharacters: number;
-    repairedCharacters: number;
-    originalLines: number;
-    repairedLines: number;
-    changedLineEstimate: number;
-  };
 }
 
 export interface KnowledgeBaseMarkdownRepairCancelled {
   cancelled: true;
+  preview?: KnowledgeBaseMarkdownPreview;
 }
 
 export type KnowledgeBaseMarkdownRepairResult =
@@ -389,7 +408,7 @@ export interface KnowledgeBaseRepairProgress {
   detail: string;
 }
 
-export interface KnowledgeBaseMarkdownStream {
+export interface KnowledgeBaseMarkdownStream extends Partial<PaperTextUpdate> {
   requestId: string;
   paperId: string;
   content: string;
@@ -397,6 +416,8 @@ export interface KnowledgeBaseMarkdownStream {
   done: boolean;
   generatedAt: string;
   previewOnly?: boolean;
+  sequence?: number;
+  status?: "complete" | "interrupted" | "error";
 }
 
 export interface DocumentPageText {
@@ -428,6 +449,8 @@ export interface LibrarySearchHit {
 export interface LibraryAskHistoryMessage {
   role: "user" | "assistant";
   content: string;
+  contextCheckpoint?: string;
+  citations?: LibraryCitation[];
 }
 
 export interface LibraryAskInput {
@@ -444,6 +467,10 @@ export interface LibraryAskResult {
   citationVerification?: CitationVerification;
   protocol: Exclude<ProviderProtocol, "auto">;
   model: string;
+  contextCheckpoint?: string;
+  contextUsage?: import("./assistantContext").AssistantContextUsage;
+  tokenUsage?: TokenUsage;
+  cancelled?: boolean;
 }
 
 export interface CitationVerification {
@@ -537,6 +564,22 @@ export interface CitationGraphEdge {
   depth?: 1 | 2;
 }
 
+export interface CitationReferencesInput {
+  nodeId?: string;
+  paperId?: string;
+  openAlexId?: string;
+  doi?: string;
+  offset?: number;
+  limit?: number;
+}
+
+export interface CitationReferencesResult {
+  items: CitationGraphNode[];
+  total: number;
+  nextOffset?: number;
+  warnings: string[];
+}
+
 export interface CitationGraphSnapshot {
   nodes: CitationGraphNode[];
   edges: CitationGraphEdge[];
@@ -562,16 +605,6 @@ export interface CitationGraphExpansionResult {
   cached: boolean;
 }
 
-export interface CitationGraphExternalNodeLimits {
-  references: number;
-  citing: number;
-}
-
-export interface CitationGraphAnalysisOptions {
-  mode?: "standard" | "focused-two-hop";
-  externalLimits?: CitationGraphExternalNodeLimits;
-}
-
 export interface CitationGraphRefreshResult {
   snapshot: CitationGraphSnapshot;
   updatedPapers: number;
@@ -586,15 +619,38 @@ export type CitationDiscoveryReason =
 
 export type CitationContentMatchPriority = "low" | "standard" | "high";
 export type CitationDiscoveryMode = "contextual" | "pure-search";
+export type CitationSearchSource = "openalex" | "crossref" | "europe-pmc";
+export type CitationSearchSort = "relevance" | "newest" | "citations";
+
+export interface CitationDiscoveryFilters {
+  yearFrom?: number;
+  yearTo?: number;
+  sort?: CitationSearchSort;
+  sources?: CitationSearchSource[];
+}
 
 export interface CitationDiscoveryInput {
   paperIds?: string[];
   query?: string;
   limit?: number;
   mode?: CitationDiscoveryMode;
+  requestId?: string;
+  cursor?: string;
+  filters?: CitationDiscoveryFilters;
 }
 
 export interface CitationDiscoveryCandidate {
+  aiRecommendation?: {
+    label: string;
+    reason: string;
+    evidence: Array<{
+      paperId: string;
+      paperTitle: string;
+      pages: number[];
+      connection: string;
+    }>;
+    caveat: string;
+  };
   work: CitationGraphNode;
   score: number;
   relevanceScore: number;
@@ -612,6 +668,26 @@ export interface CitationDiscoveryResult {
   searchedAt: string;
   warnings: string[];
   mode?: CitationDiscoveryMode;
+  originalQuery?: string;
+  queries?: string[];
+  cursor?: string;
+  hasMore?: boolean;
+  cancelled?: boolean;
+  fetchedCount?: number;
+  excludedCount?: number;
+  sources?: Array<{
+    id: CitationSearchSource;
+    label: string;
+    status: "pending" | "searching" | "complete" | "error";
+    count: number;
+    error?: string;
+  }>;
+}
+
+export interface CitationDiscoveryProgress {
+  requestId: string;
+  sequence: number;
+  result: CitationDiscoveryResult;
 }
 
 export interface ScihubSessionStatus {
@@ -620,65 +696,12 @@ export interface ScihubSessionStatus {
   lastVerifiedAt?: string;
 }
 
-export interface CitationNetworkCommunity {
-  id: string;
-  label: string;
-  nodeIds: string[];
-  size: number;
-  libraryCount: number;
-  externalCount: number;
-  topTerms: string[];
-  startYear?: number;
-  endYear?: number;
-  citedByCount: number;
-}
-
-export interface CitationNetworkSimilarity {
-  source: string;
-  target: string;
-  score: number;
-  sharedCount: number;
-}
-
-export interface CitationNetworkPath {
-  id: string;
-  nodeIds: string[];
-  score: number;
-  startYear?: number;
-  endYear?: number;
-}
-
-export interface CitationNetworkBridge {
-  nodeId: string;
-  score: number;
-  degree: number;
-  connectedCommunities: number;
-}
-
-export interface CitationNetworkAnalysis {
-  generatedAt: string;
-  graphMode?: "standard" | "focused-two-hop";
-  focusedPaperId?: string;
-  metrics: {
-    nodeCount: number;
-    edgeCount: number;
-    density: number;
-    componentCount: number;
-    communityCount: number;
-  };
-  communities: CitationNetworkCommunity[];
-  bibliographicCoupling: CitationNetworkSimilarity[];
-  coCitation: CitationNetworkSimilarity[];
-  keyPaths: CitationNetworkPath[];
-  bridges: CitationNetworkBridge[];
-}
-
 export interface CitationGraphClearResult {
   clearedWorks: number;
   clearedPapers: number;
 }
 
-export type CitationGraphExportFormat = "json" | "html";
+export type CitationGraphExportFormat = "json";
 
 export interface CitationGraphExportRequest {
   format: CitationGraphExportFormat;
@@ -795,6 +818,7 @@ export interface PaperXcelApi {
   notes: {
     list: () => Promise<PaperNote[]>;
     get: (paperId: string) => Promise<PaperNote | null>;
+    getDraft: (paperId: string) => Promise<PaperNote | null>;
     save: (paperId: string, content: string) => Promise<PaperNote>;
     generate: (
       paperId: string,
@@ -802,6 +826,7 @@ export interface PaperXcelApi {
     ) => Promise<GeneratePaperNoteResult | GeneratePaperNoteCancelled>;
     cancel: (requestId: string) => Promise<boolean>;
     onAgentEvent: (listener: (event: AgentEvent) => void) => () => void;
+    onProgress: (listener: (event: PaperNoteStream) => void) => () => void;
     exportMarkdown: (paperId: string) => Promise<boolean>;
   };
   reviews: {
@@ -828,6 +853,7 @@ export interface PaperXcelApi {
     repairMarkdown: (
       paperId: string,
       requestId?: string,
+      mode?: "restart" | "retry",
     ) => Promise<KnowledgeBaseMarkdownRepairResult>;
     onProgress: (
       listener: (progress: KnowledgeBaseRepairProgress) => void,
@@ -862,7 +888,31 @@ export interface PaperXcelApi {
     test: (config: OpenAlexConfigInput) => Promise<OpenAlexTestResult>;
   };
   citationGraph: {
+    listResearchConversations: (
+      kind: ResearchKind,
+    ) => Promise<ResearchConversationSummary[]>;
+    getResearchConversation: (id: string) => Promise<ResearchConversation>;
+    renameResearchConversation: (
+      id: string,
+      title: string,
+    ) => Promise<ResearchConversationSummary>;
+    deleteResearchConversation: (id: string) => Promise<void>;
+    deleteResearchTurn: (
+      conversationId: string,
+      turnId: string,
+    ) => Promise<ResearchConversation>;
+    discoverWithAi: (input: DiscoveryAgentInput) => Promise<ResearchRunResult>;
+    cancelDiscoveryAgent: (requestId: string) => Promise<boolean>;
+    onDiscoveryAgentProgress: (
+      listener: (progress: ChatProgress) => void,
+    ) => () => void;
+    onDiscoveryAgentEvent: (
+      listener: (event: AgentEvent) => void,
+    ) => () => void;
     get: (paperIds?: string[]) => Promise<CitationGraphSnapshot>;
+    references: (
+      input: CitationReferencesInput,
+    ) => Promise<CitationReferencesResult>;
     refresh: (
       force?: boolean,
       paperIds?: string[],
@@ -874,17 +924,16 @@ export interface PaperXcelApi {
     discover: (
       input: CitationDiscoveryInput,
     ) => Promise<CitationDiscoveryResult>;
-    analyze: (
-      paperIds?: string[],
-      options?: CitationGraphAnalysisOptions,
-    ) => Promise<CitationNetworkAnalysis>;
-    openGoogleScholar: (query: string) => Promise<boolean>;
-    searchGoogleScholar: (
-      input: CitationDiscoveryInput,
-    ) => Promise<CitationDiscoveryResult>;
-    importGoogleScholarText: (
-      input: CitationDiscoveryInput & { text: string },
-    ) => Promise<CitationDiscoveryResult>;
+    cancelDiscovery: (requestId: string) => Promise<boolean>;
+    onDiscoveryProgress: (
+      listener: (progress: CitationDiscoveryProgress) => void,
+    ) => () => void;
+    analyze: (input: CitationAnalysisInput) => Promise<CitationAnalysisResult>;
+    cancelAnalysis: (requestId: string) => Promise<boolean>;
+    onAnalysisProgress: (
+      listener: (progress: ChatProgress) => void,
+    ) => () => void;
+    onAnalysisEvent: (listener: (event: AgentEvent) => void) => () => void;
     clear: () => Promise<CitationGraphClearResult>;
     export: (request: CitationGraphExportRequest) => Promise<boolean>;
   };

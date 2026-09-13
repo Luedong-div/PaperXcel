@@ -97,7 +97,11 @@ export async function writePaperTextArtifacts(
           version: 2,
           paper_id: paper.id,
           generated_at: generatedAt,
-          parser: "AI repair of PaperXcel full.md",
+          parser:
+            options.repair.sourceMode === "pdf-rebuild"
+              ? "AI page-by-page reconstruction from original PDF"
+              : "AI repair of PaperXcel full.md",
+          source_mode: options.repair.sourceMode,
           page_count: options.repair.pageCount,
           ai_repaired: true,
           model: options.repair.model,

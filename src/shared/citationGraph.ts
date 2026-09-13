@@ -299,9 +299,10 @@ export function buildCitationGraphSnapshot(
  * 为单篇本地论文构建“二阶参考/二阶引用”专用快照。
  *
  * 这里故意不复用多篇论文的直接关系过滤：二重图谱需要保留
- * 二阶节点之间的链路，最终呈现为：
+ * 二阶节点之间的链路，数据方向为：
  *
- * 二阶参考 -> 一阶参考 -> 目标论文 -> 一阶引用 -> 二阶引用
+ * 二阶参考 <- 一阶参考 <- 目标论文 <- 一阶引用 <- 二阶引用
+ * 数据边始终由引用者指向被引文献；画布箭头反向展示文献的传承关系。
  */
 export function buildFocusedCitationGraphSnapshot(
   paper: Paper,
@@ -337,17 +338,18 @@ export function buildFocusedCitationGraphSnapshot(
     if (!work) return undefined;
     const matchedPaper =
       localByOpenAlexId.get(workId) ??
-      (work.doi ? localByDoi.get(normalizeCitationDoi(work.doi) ?? "") : undefined);
+      (work.doi
+        ? localByDoi.get(normalizeCitationDoi(work.doi) ?? "")
+        : undefined);
     const nodeId = matchedPaper
       ? libraryNodeId(matchedPaper.id)
       : externalNodeId(workId);
     const existing = nodes.get(nodeId);
+    if (existing?.direction === "root") return nodeId;
     const nextDirection =
       direction === "both" ||
       existing?.direction === "both" ||
-      (existing?.direction &&
-        existing.direction !== "root" &&
-        existing.direction !== direction)
+      (existing?.direction && existing.direction !== direction)
         ? "both"
         : direction;
     const nextParentIds = [
@@ -371,10 +373,8 @@ export function buildFocusedCitationGraphSnapshot(
       issn: work.issn ? [...work.issn] : undefined,
       citedByCount: work.citedByCount,
       referencedByLibrary:
-        (existing?.referencedByLibrary ?? false) ||
-        direction === "references",
-      citesLibrary:
-        (existing?.citesLibrary ?? false) || direction === "citing",
+        (existing?.referencedByLibrary ?? false) || direction === "references",
+      citesLibrary: (existing?.citesLibrary ?? false) || direction === "citing",
       depth: Math.min(existing?.depth ?? depth, depth) as 1 | 2,
       direction: nextDirection,
       parentIds: nextParentIds,
@@ -431,44 +431,38 @@ export function buildFocusedCitationGraphSnapshot(
     });
   };
 
+  const referenceFirstNodes = new Map<string, string>();
+  const citingFirstNodes = new Map<string, string>();
   for (const workId of expansion.referenceFirstOrderIds) {
     const firstId = addNode(workId, "references", 1, [rootId]);
-    addEdge(firstId, rootId, "reference", 1);
-  }
-  for (const workId of expansion.referenceSecondOrderIds) {
-    const parentIds = expansion.referenceSecondOrderParentIds[workId] ?? [];
-    const parentNodeIds = parentIds
-      .map((parentId) => {
-        const parentWork = cache.works[parentId];
-        return parentWork
-          ? externalNodeId(parentId)
-          : undefined;
-      })
-      .filter((id): id is string => Boolean(id));
-    const secondId = addNode(workId, "references", 2, parentNodeIds);
-    for (const parentId of parentIds) {
-      const parentNodeId = addNode(parentId, "references", 1, [rootId]);
-      addEdge(secondId, parentNodeId, "reference", 2);
-    }
+    if (firstId && firstId !== rootId) referenceFirstNodes.set(workId, firstId);
+    addEdge(rootId, firstId, "reference", 1);
   }
   for (const workId of expansion.citingFirstOrderIds) {
     const firstId = addNode(workId, "citing", 1, [rootId]);
-    addEdge(rootId, firstId, "citing", 1);
+    if (firstId && firstId !== rootId) citingFirstNodes.set(workId, firstId);
+    addEdge(firstId, rootId, "citing", 1);
+  }
+  for (const workId of expansion.referenceSecondOrderIds) {
+    const parentNodeIds = (
+      expansion.referenceSecondOrderParentIds[workId] ?? []
+    )
+      .map((parentId) => referenceFirstNodes.get(parentId))
+      .filter((id): id is string => Boolean(id));
+    if (!parentNodeIds.length) continue;
+    const secondId = addNode(workId, "references", 2, parentNodeIds);
+    for (const parentNodeId of parentNodeIds) {
+      addEdge(parentNodeId, secondId, "reference", 2);
+    }
   }
   for (const workId of expansion.citingSecondOrderIds) {
-    const parentIds = expansion.citingSecondOrderParentIds[workId] ?? [];
-    const parentNodeIds = parentIds
-      .map((parentId) => {
-        const parentWork = cache.works[parentId];
-        return parentWork
-          ? externalNodeId(parentId)
-          : undefined;
-      })
+    const parentNodeIds = (expansion.citingSecondOrderParentIds[workId] ?? [])
+      .map((parentId) => citingFirstNodes.get(parentId))
       .filter((id): id is string => Boolean(id));
+    if (!parentNodeIds.length) continue;
     const secondId = addNode(workId, "citing", 2, parentNodeIds);
-    for (const parentId of parentIds) {
-      const parentNodeId = addNode(parentId, "citing", 1, [rootId]);
-      addEdge(parentNodeId, secondId, "citing", 2);
+    for (const parentNodeId of parentNodeIds) {
+      addEdge(secondId, parentNodeId, "citing", 2);
     }
   }
 
@@ -484,7 +478,7 @@ export function buildFocusedCitationGraphSnapshot(
     nodes: [...nodes.values()],
     edges: [...edges.values()],
     updatedAt: cache.updatedAt,
-    errors: [...(errors.length ? errors : expansion.errors ?? [])],
+    errors: [...(errors.length ? errors : (expansion.errors ?? []))],
     graphMode: "focused-two-hop",
     focusedPaperId: paper.id,
     expansion: expansionStats,
@@ -492,7 +486,8 @@ export function buildFocusedCitationGraphSnapshot(
 }
 
 /**
- * 按被引次数截取外部节点。这里是“显示上限”，不改缓存和原始关系，
+ * 按被引次数截取外部节点；二阶文献与它的一阶路径共同占用显示名额。
+ * 这里是“显示上限”，不改缓存和原始关系，
  * 因此用户拖动滑块只会改变画布/分析范围，不会触发重新抓取。
  */
 export function limitCitationGraphExternalNodes(
@@ -502,6 +497,22 @@ export function limitCitationGraphExternalNodes(
 ): CitationGraphSnapshot {
   const referenceLimit = clampExternalNodeLimit(limits.references, max);
   const citingLimit = clampExternalNodeLimit(limits.citing, max);
+  if (snapshot.graphMode === "focused-two-hop") {
+    const visibleIds = new Set([
+      ...snapshot.nodes
+        .filter((node) => node.depth === 0 || node.direction === "root")
+        .map((node) => node.id),
+      ...selectConnectedCitationNodes(snapshot, "reference", referenceLimit),
+      ...selectConnectedCitationNodes(snapshot, "citing", citingLimit),
+    ]);
+    return {
+      ...snapshot,
+      nodes: snapshot.nodes.filter((node) => visibleIds.has(node.id)),
+      edges: snapshot.edges.filter(
+        (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
+      ),
+    };
+  }
   const referenceIds = rankExternalNodes(
     snapshot.nodes.filter((node) => isReferenceExternalNode(node)),
   )
@@ -528,6 +539,88 @@ export function limitCitationGraphExternalNodes(
   };
 }
 
+function selectConnectedCitationNodes(
+  snapshot: CitationGraphSnapshot,
+  relation: "reference" | "citing",
+  limit: number,
+): Set<string> {
+  const byId = new Map(snapshot.nodes.map((node) => [node.id, node]));
+  const rootIds = new Set(
+    snapshot.nodes
+      .filter((node) => node.depth === 0 || node.direction === "root")
+      .map((node) => node.id),
+  );
+  const belongsToSide = (node: CitationGraphNode): boolean =>
+    relation === "reference"
+      ? node.referencedByLibrary ||
+        node.direction === "references" ||
+        node.direction === "both"
+      : node.citesLibrary ||
+        node.direction === "citing" ||
+        node.direction === "both";
+  const children = new Map<string, Set<string>>();
+  const directIds = new Set<string>();
+  for (const edge of snapshot.edges) {
+    if (edge.relation !== relation) continue;
+    const parent = relation === "reference" ? edge.source : edge.target;
+    const child = relation === "reference" ? edge.target : edge.source;
+    if (!byId.has(parent) || !byId.has(child)) continue;
+    if (rootIds.has(parent)) directIds.add(child);
+    const parents = children.get(child) ?? new Set<string>();
+    parents.add(parent);
+    children.set(child, parents);
+  }
+  const validFirstIds = new Set(
+    snapshot.nodes
+      .filter(
+        (node) =>
+          node.depth === 1 &&
+          belongsToSide(node) &&
+          (!rootIds.size || directIds.has(node.id)),
+      )
+      .map((node) => node.id),
+  );
+  const candidates = rankExternalNodes(
+    snapshot.nodes.filter(
+      (node) =>
+        belongsToSide(node) && (node.depth === 2 || validFirstIds.has(node.id)),
+    ),
+  );
+  const selected = new Set(
+    candidates
+      .filter((node) => node.kind === "library" && validFirstIds.has(node.id))
+      .map((node) => node.id),
+  );
+  let externalCount = 0;
+  // A second pass can add a local second-order paper after its external parent was selected.
+  for (let pass = 0; pass < 2; pass++)
+    for (const node of candidates) {
+      if (selected.has(node.id)) continue;
+      let path = [node];
+      if (node.depth === 2) {
+        const parents = rankExternalNodes(
+          [...(children.get(node.id) ?? [])]
+            .filter((id) => validFirstIds.has(id))
+            .map((id) => byId.get(id)!),
+        );
+        const parent =
+          parents.find((candidate) => selected.has(candidate.id)) ??
+          parents.find((candidate) => candidate.kind === "library") ??
+          parents[0];
+        if (!parent) continue;
+        path = [parent, node];
+      }
+      const extra = path.filter(
+        (candidate) =>
+          candidate.kind === "external" && !selected.has(candidate.id),
+      ).length;
+      if (externalCount + extra > limit) continue;
+      for (const candidate of path) selected.add(candidate.id);
+      externalCount += extra;
+    }
+  return selected;
+}
+
 function isReferenceExternalNode(node: CitationGraphNode): boolean {
   return (
     node.kind === "external" &&
@@ -540,7 +633,9 @@ function isReferenceExternalNode(node: CitationGraphNode): boolean {
 function isCitingExternalNode(node: CitationGraphNode): boolean {
   return (
     node.kind === "external" &&
-    (node.direction === "citing" || node.direction === "both" || node.citesLibrary)
+    (node.direction === "citing" ||
+      node.direction === "both" ||
+      node.citesLibrary)
   );
 }
 
@@ -555,10 +650,7 @@ function rankExternalNodes(nodes: CitationGraphNode[]): CitationGraphNode[] {
 }
 
 function clampExternalNodeLimit(value: number, max: number): number {
-  return Math.max(
-    0,
-    Math.min(Math.max(0, Math.round(max)), Math.round(value)),
-  );
+  return Math.max(0, Math.min(Math.max(0, Math.round(max)), Math.round(value)));
 }
 
 function libraryNodeId(paperId: string): string {

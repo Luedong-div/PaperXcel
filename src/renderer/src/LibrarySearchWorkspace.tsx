@@ -1,9 +1,3 @@
-import ReactMarkdown from "react-markdown";
-import rehypeKatex from "rehype-katex";
-import rehypeRaw from "rehype-raw";
-import remarkBreaks from "remark-breaks";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
 import {
   ArrowUp,
   ArrowUpRight,
@@ -32,6 +26,7 @@ import {
 } from "react";
 import type {
   AgentEvent,
+  ChatProgress,
   LibraryAskHistoryMessage,
   LibraryAskResult,
   LibrarySearchHit,
@@ -39,7 +34,11 @@ import type {
   Paper,
   ProviderProfile,
 } from "../../shared/contracts";
-import { normalizeMarkdownMath } from "./markdown";
+
+import { ChatMarkdown } from "./ChatMarkdown";
+import { PaperResearchPlanView } from "./PaperResearchPlanView";
+import { AgentExecutionTrace } from "./AgentExecutionTrace";
+import { AgentCommentaryView } from "./AgentCommentaryView";
 
 interface LibrarySearchWorkspaceProps {
   papers: Paper[];
@@ -64,7 +63,9 @@ interface LibraryChatTurn {
   selectedCount: number;
   requestId?: string;
   streamingContent?: string;
-  reasoningContent?: string;
+  reasoningObserved?: boolean;
+  detail?: string;
+  contextUsage?: import("../../shared/assistantContext").AssistantContextUsage;
   agentEvents?: AgentEvent[];
   answer?: LibraryAskResult;
   error?: string;
@@ -79,16 +80,6 @@ const LIBRARY_ASSISTANT_WIDTH_STORAGE_KEY =
   "paperxcel.library-search.assistant-width";
 const MAX_LIBRARY_CONTEXT_HITS = 30;
 
-function agentEventQueries(event: AgentEvent): string[] {
-  const queries = event.metadata?.queries;
-  return Array.isArray(queries)
-    ? queries
-        .filter((item): item is string => typeof item === "string")
-        .map((item) => item.trim())
-        .filter(Boolean)
-        .slice(0, 4)
-    : [];
-}
 const DEFAULT_LIBRARY_ASSISTANT_WIDTH = 500;
 const MIN_LIBRARY_ASSISTANT_WIDTH = 320;
 const MAX_LIBRARY_ASSISTANT_WIDTH = 720;
@@ -117,15 +108,13 @@ function readStoredChatTurns(): LibraryChatTurn[] {
     if (!stored) return [];
     const parsed = JSON.parse(stored) as LibraryChatTurn[];
     if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter(
-        (turn) =>
-          typeof turn?.id === "string" &&
-          typeof turn.question === "string" &&
-          typeof turn.selectedCount === "number" &&
-          (turn.answer || turn.error),
-      )
-      .slice(-20);
+    return parsed.filter(
+      (turn) =>
+        typeof turn?.id === "string" &&
+        typeof turn.question === "string" &&
+        typeof turn.selectedCount === "number" &&
+        (turn.answer || turn.error),
+    );
   } catch {
     return [];
   }
@@ -224,6 +213,8 @@ export function LibrarySearchWorkspace({
     readStoredSelectedHitKeys,
   );
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const followOutputRef = useRef(true);
+  const persistedHistoryRef = useRef("");
   const questionRef = useRef<HTMLTextAreaElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
@@ -316,12 +307,18 @@ export function LibrarySearchWorkspace({
   }, []);
 
   useEffect(() => {
-    window.sessionStorage.setItem(
-      LIBRARY_CHAT_STORAGE_KEY,
-      JSON.stringify(
-        turns.filter((turn) => turn.answer || turn.error).slice(-20),
-      ),
-    );
+    const completed = turns.filter((turn) => turn.answer || turn.error);
+    const signature = `${completed.length}:${completed.at(-1)?.id ?? ""}`;
+    if (persistedHistoryRef.current === signature) return;
+    try {
+      window.sessionStorage.setItem(
+        LIBRARY_CHAT_STORAGE_KEY,
+        JSON.stringify(completed),
+      );
+      persistedHistoryRef.current = signature;
+    } catch {
+      // Keep the complete in-memory conversation if browser storage is full.
+    }
   }, [turns]);
 
   useEffect(() => {
@@ -343,11 +340,44 @@ export function LibrarySearchWorkspace({
   }, [resultsSignature]);
 
   useEffect(() => {
-    if (!assistantOpen) return;
+    if (!assistantOpen || !followOutputRef.current) return;
     chatEndRef.current?.scrollIntoView({ block: "end" });
   }, [assistantOpen, answering, turns]);
 
   useEffect(() => {
+    let updates: ChatProgress[] = [];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let requestId: string | undefined;
+    let sequence = -1;
+    const flush = () => {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      const batch = updates;
+      updates = [];
+      if (!batch.length) return;
+      setTurns((current) =>
+        current.map((turn) => {
+          if (turn.answer || turn.error) return turn;
+          let next = turn;
+          for (const progress of batch) {
+            if (next.requestId !== progress.requestId) continue;
+            next = {
+              ...next,
+              streamingContent:
+                progress.answerContent !== undefined
+                  ? progress.answerContent
+                  : (next.streamingContent ?? "") +
+                    (progress.answerDelta ?? ""),
+              detail: progress.detail || next.detail,
+              reasoningObserved:
+                progress.reasoningObserved ?? next.reasoningObserved,
+              contextUsage: progress.contextUsage ?? next.contextUsage,
+            };
+          }
+          return next;
+        }),
+      );
+    };
     const disposeProgress = window.paperxcel.search.onProgress((progress) => {
       if (
         !progress.requestId ||
@@ -355,20 +385,20 @@ export function LibrarySearchWorkspace({
       ) {
         return;
       }
-      setTurns((current) =>
-        current.map((turn) =>
-          turn.requestId === progress.requestId
-            ? {
-                ...turn,
-                streamingContent:
-                  progress.answerContent ?? turn.streamingContent,
-              }
-            : turn,
-        ),
-      );
+      if (requestId !== progress.requestId) {
+        requestId = progress.requestId;
+        sequence = -1;
+      }
+      if (progress.sequence !== undefined) {
+        if (progress.sequence <= sequence) return;
+        sequence = progress.sequence;
+      }
+      updates.push(progress);
+      if (!timer) timer = setTimeout(flush, 40);
     });
     const disposeAgent = window.paperxcel.search.onAgentEvent((event) => {
       if (event.requestId !== activeRequestIdRef.current) return;
+      flush();
       setTurns((current) =>
         current.map((turn) =>
           turn.requestId === event.requestId
@@ -381,22 +411,21 @@ export function LibrarySearchWorkspace({
                   event,
                 ]
                   .sort((a, b) => a.sequence - b.sequence)
-                  .slice(-20),
+                  .slice(-256),
               }
             : turn,
         ),
       );
-      if (
-        event.type === "run.completed" ||
-        event.type === "run.cancelled" ||
-        event.type === "run.failed"
-      ) {
-        setAnswering(false);
-      }
     });
     return () => {
       disposeProgress();
       disposeAgent();
+      if (timer) clearTimeout(timer);
+      const active = activeRequestIdRef.current;
+      if (active)
+        void window.paperxcel.search
+          .cancelAskLibrary(active)
+          .catch(() => undefined);
     };
   }, []);
 
@@ -486,17 +515,26 @@ export function LibrarySearchWorkspace({
 
   const askLibrary = async (): Promise<void> => {
     const cleanQuestion = question.trim();
-    if (!cleanQuestion || answering || !provider?.hasApiKey) {
+    if (
+      !cleanQuestion ||
+      activeRequestIdRef.current ||
+      answering ||
+      !provider?.hasApiKey
+    ) {
       return;
     }
 
     const history: LibraryAskHistoryMessage[] = turns
-      .filter((turn) => turn.answer)
+      .filter((turn) => turn.answer && !turn.answer.cancelled)
       .flatMap((turn) => [
         { role: "user" as const, content: turn.question },
-        { role: "assistant" as const, content: turn.answer!.content },
-      ])
-      .slice(-12);
+        {
+          role: "assistant" as const,
+          content: turn.answer!.content,
+          contextCheckpoint: turn.answer!.contextCheckpoint,
+          citations: turn.answer!.citations,
+        },
+      ]);
     const turnId =
       globalThis.crypto?.randomUUID?.() ??
       `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -511,6 +549,7 @@ export function LibrarySearchWorkspace({
     setModelMenuOpen(false);
     setModelMenuSection(undefined);
     setAnswering(true);
+    followOutputRef.current = true;
     setActiveRequestId(turnId);
     activeRequestIdRef.current = turnId;
     setTurns((current) => [...current, pendingTurn]);
@@ -525,7 +564,12 @@ export function LibrarySearchWorkspace({
       setTurns((current) =>
         current.map((turn) =>
           turn.id === turnId
-            ? { ...turn, answer, streamingContent: undefined }
+            ? {
+                ...turn,
+                answer,
+                streamingContent: undefined,
+                contextUsage: answer.contextUsage ?? turn.contextUsage,
+              }
             : turn,
         ),
       );
@@ -788,6 +832,7 @@ export function LibrarySearchWorkspace({
                         ? `${provider.name} · ${provider.model}`
                         : "尚未配置模型"}
                     </small>
+                    <small>273K 上下文 · 自动压缩</small>
                   </div>
                 </div>
                 <div className="ai-header-actions">
@@ -823,7 +868,15 @@ export function LibrarySearchWorkspace({
               </header>
 
               <div className="assistant-view-panel">
-                <div className="chat-scroll">
+                <div
+                  className="chat-scroll"
+                  onScroll={(event) => {
+                    const view = event.currentTarget;
+                    followOutputRef.current =
+                      view.scrollHeight - view.scrollTop - view.clientHeight <
+                      100;
+                  }}
+                >
                   {!turns.length && (
                     <div className="chat-start library-search-chat-start">
                       <div className="chat-start-heading">
@@ -843,7 +896,7 @@ export function LibrarySearchWorkspace({
                           <small className="library-search-message-context">
                             {turn.selectedCount
                               ? `已固定 ${turn.selectedCount} 条索引片段`
-                              : "已自动检索全库"}
+                              : "全库研究"}
                           </small>
                         </div>
                       </article>
@@ -853,58 +906,50 @@ export function LibrarySearchWorkspace({
                           <span>PaperXcel</span>
                           <small>
                             {turn.answer?.model ??
-                              (turn.error ? "请求失败" : "正在综合证据")}
+                              (turn.error ? "请求失败" : "正在处理任务")}
                           </small>
                         </div>
-                        {turn.agentEvents && turn.agentEvents.length > 0 && (
-                          <div className="library-agent-timeline">
-                            {turn.agentEvents
-                              .filter((event) => event.type !== "content.delta")
-                              .slice(-6)
-                              .map((event) => {
-                                const queries = agentEventQueries(event);
-                                return (
-                                  <div
-                                    key={`${turn.id}-agent-${event.sequence}`}
-                                    className={`library-agent-event is-${event.status ?? "running"}`}
-                                  >
-                                    {event.status === "running" ? (
-                                      <LoaderCircle
-                                        className="spin"
-                                        size={12}
-                                      />
-                                    ) : (
-                                      <Check size={12} />
-                                    )}
-                                    <span>{event.title}</span>
-                                    {event.detail && (
-                                      <small>{event.detail}</small>
-                                    )}
-                                    {queries.length > 0 && (
-                                      <div className="library-agent-queries">
-                                        {queries.map((query) => (
-                                          <code key={query}>{query}</code>
-                                        ))}
-                                      </div>
-                                    )}
-                                  </div>
-                                );
-                              })}
-                          </div>
+                        {turn.agentEvents && (
+                          <>
+                            <PaperResearchPlanView events={turn.agentEvents} />
+                            <AgentCommentaryView
+                              events={turn.agentEvents}
+                              live={!turn.answer && !turn.error}
+                            />
+                            <AgentExecutionTrace
+                              events={turn.agentEvents}
+                              live={!turn.answer && !turn.error}
+                            />
+                          </>
+                        )}
+                        {!turn.answer && !turn.error && (
+                          <small role="status">
+                            {turn.detail || "正在等待模型响应"}
+                          </small>
+                        )}
+                        {turn.reasoningObserved && (
+                          <small className="chat-reasoning-observed">
+                            已收到模型推理信号
+                          </small>
+                        )}
+                        {turn.answer?.cancelled && (
+                          <small role="status">
+                            已停止生成，已接收内容保留。
+                          </small>
+                        )}
+                        {turn.contextUsage && (
+                          <small className="chat-context-usage">
+                            {Math.ceil(turn.contextUsage.inputTokens / 1000)}K /
+                            273K
+                            {turn.contextUsage.compactions
+                              ? ` · 已压缩 ${turn.contextUsage.compactions} 次`
+                              : ""}
+                          </small>
                         )}
                         {turn.answer ? (
                           <>
                             <div className="message-content knowledge-markdown">
-                              <ReactMarkdown
-                                remarkPlugins={[
-                                  remarkGfm,
-                                  remarkMath,
-                                  remarkBreaks,
-                                ]}
-                                rehypePlugins={[rehypeKatex, rehypeRaw]}
-                              >
-                                {normalizeMarkdownMath(turn.answer.content)}
-                              </ReactMarkdown>
+                              <ChatMarkdown content={turn.answer.content} />
                             </div>
                             {turn.answer.citationVerification?.status ===
                             "unverified" ? (
@@ -954,28 +999,22 @@ export function LibrarySearchWorkspace({
                           </>
                         ) : turn.error ? (
                           <div className="message-content">
+                            {turn.streamingContent && (
+                              <ChatMarkdown content={turn.streamingContent} />
+                            )}
                             <p className="library-search-chat-error">
                               {turn.error}
                             </p>
                           </div>
                         ) : turn.streamingContent ? (
                           <div className="message-content knowledge-markdown">
-                            <ReactMarkdown
-                              remarkPlugins={[
-                                remarkGfm,
-                                remarkMath,
-                                remarkBreaks,
-                              ]}
-                              rehypePlugins={[rehypeKatex, rehypeRaw]}
-                            >
-                              {normalizeMarkdownMath(turn.streamingContent)}
-                            </ReactMarkdown>
+                            <ChatMarkdown content={turn.streamingContent} />
                           </div>
                         ) : (
                           <div className="message-content pending-message">
                             <div className="pending-status">
                               <LoaderCircle className="spin" size={17} />
-                              <span>正在检索文献库并综合证据</span>
+                              <span>{turn.detail || "正在等待模型响应"}</span>
                             </div>
                           </div>
                         )}
@@ -1010,7 +1049,6 @@ export function LibrarySearchWorkspace({
                     <textarea
                       ref={questionRef}
                       aria-label="向全库助手提问"
-                      maxLength={500}
                       rows={3}
                       placeholder="直接提问会自动检索全部已索引论文，也可固定证据"
                       value={question}

@@ -8,6 +8,7 @@ export function toPublicChatProgress(
     detail: progress.detail,
     answerDelta: progress.answerDelta,
     answerContent: progress.answerContent,
+    ...(progress.contextUsage ? { contextUsage: progress.contextUsage } : {}),
     ...(progress.reasoningObserved !== undefined
       ? { reasoningObserved: progress.reasoningObserved }
       : {}),

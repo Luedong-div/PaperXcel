@@ -4,6 +4,7 @@ import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkBreaks from "remark-breaks";
+import remarkCjkFriendly from "remark-cjk-friendly";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { normalizeMarkdownMath } from "./markdown";
@@ -21,7 +22,8 @@ const markdownSchema = {
   },
 };
 
-const remarkPlugins = [remarkGfm, remarkMath, remarkBreaks];
+// Chinese punctuation beside ** must not turn AI-generated emphasis into text.
+const remarkPlugins = [remarkGfm, remarkCjkFriendly, remarkMath, remarkBreaks];
 const rehypePlugins = [
   rehypeRaw,
   [rehypeSanitize, markdownSchema],

@@ -1,293 +1,244 @@
+import { ChartNetwork, Focus, LoaderCircle, Sparkles } from "lucide-react";
+import type { CitationGraphSnapshot } from "../../shared/contracts";
 import {
-  ArrowRight,
-  ChartNetwork,
-  Focus,
-  GitBranch,
-  LoaderCircle,
-  Network,
-  Route,
-  Share2,
-  UsersRound,
-} from "lucide-react";
-import type {
-  CitationGraphNode,
-  CitationGraphSnapshot,
-  CitationNetworkAnalysis,
-  CitationNetworkSimilarity,
-} from "../../shared/contracts";
+  citationAnalysisSources,
+  type CitationAnalysisFinding,
+} from "../../shared/citationAnalysisAgent";
+import type { CitationAnalysisViewState } from "./useCitationAnalysis";
+import { AgentCommentaryView } from "./AgentCommentaryView";
+import { AgentExecutionTrace } from "./AgentExecutionTrace";
+import { PaperResearchPlanView } from "./PaperResearchPlanView";
+import { ChatMarkdown } from "./ChatMarkdown";
+import "./citationAnalysis.css";
 
 interface CitationAnalysisPanelProps {
-  analysis?: CitationNetworkAnalysis;
+  state: CitationAnalysisViewState;
   snapshot: CitationGraphSnapshot;
-  loading: boolean;
   selectedPaperCount: number;
+  model?: string;
+  question: string;
+  onQuestionChange: (question: string) => void;
+  onStart: () => void;
   onFocusNodes: (nodeIds: string[]) => void;
   onSelectNode: (nodeId: string) => void;
+  conversationControls?: React.ReactNode;
 }
+const kindLabels: Record<CitationAnalysisFinding["kind"], string> = {
+  theme: "研究主题",
+  bridge: "关键与桥接工作",
+  path: "演进路径",
+  gap: "待验证问题",
+};
 
 export function CitationAnalysisPanel({
-  analysis,
+  state,
   snapshot,
-  loading,
   selectedPaperCount,
+  model,
+  question,
+  onQuestionChange,
+  onStart,
   onFocusNodes,
   onSelectNode,
+  conversationControls,
 }: CitationAnalysisPanelProps): React.JSX.Element {
-  const nodeById = new Map(snapshot.nodes.map((node) => [node.id, node]));
-
-  if (loading) {
-    return (
-      <AnalysisEmpty
-        icon={<LoaderCircle className="spin" size={27} />}
-        title="正在分析引文网络"
-        description="正在计算社区、耦合关系、共被引和研究路径。"
-      />
-    );
-  }
-  if (selectedPaperCount === 0) {
-    return (
-      <AnalysisEmpty
-        icon={<ChartNetwork size={34} />}
-        title="先选择分析范围"
-        description="从左侧勾选需要分析的本地论文。"
-      />
-    );
-  }
-  if (!analysis || analysis.metrics.edgeCount === 0) {
-    return (
-      <AnalysisEmpty
-        icon={<Network size={34} />}
-        title="当前没有可分析的关系"
-        description="先刷新图谱，取得参考文献和引用本文关系。"
-      />
-    );
-  }
-
+  const running = state.status === "running" || state.status === "stopping";
+  const sources = citationAnalysisSources(snapshot);
+  const sourceByLabel = new Map(
+    sources.map((source) => [source.label, source.node]),
+  );
+  const sourceById = new Map(sources.map((source) => [source.node.id, source]));
+  const coverage = state.research?.coverage;
+  const findings = state.research?.findings ?? [];
+  const ready = selectedPaperCount > 0 && snapshot.nodes.length > 0;
+  const context = state.result?.contextUsage ?? state.progress?.contextUsage;
   return (
-    <div className="citation-analysis-view">
-      <div className="citation-analysis-metrics">
-        <Metric label="节点" value={analysis.metrics.nodeCount} />
-        <Metric label="引用关系" value={analysis.metrics.edgeCount} />
-        <Metric label="研究社区" value={analysis.metrics.communityCount} />
-        <Metric label="连通分量" value={analysis.metrics.componentCount} />
-        <Metric
-          label="网络密度"
-          value={`${(analysis.metrics.density * 100).toFixed(1)}%`}
-        />
+    <div className="citation-analysis-view citation-ai-analysis">
+      <header className="citation-ai-heading">
+        <span className="citation-ai-icon">
+          <Sparkles size={23} />
+        </span>
+        <div>
+          <h2>AI 引文网络分析</h2>
+          <p>综合文献内容与引用关系，解释主题、关键工作和研究演进。</p>
+        </div>
+      </header>
+      {conversationControls}
+      <div className="citation-ai-scope">
+        <span>
+          完整网络 <strong>{coverage?.total ?? snapshot.nodes.length}</strong>{" "}
+          篇
+        </span>
+        <span>
+          提供摘要{" "}
+          <strong>
+            {coverage?.withAbstract ??
+              snapshot.nodes.filter((node) => node.abstract?.trim()).length}
+          </strong>{" "}
+          篇
+        </span>
+        <span>
+          模型 <strong>{state.result?.model ?? model ?? "未配置"}</strong>
+        </span>
       </div>
-
-      <div className="citation-analysis-grid">
-        <section className="citation-analysis-section citation-analysis-communities">
-          <header>
-            <span>
-              <UsersRound size={16} />
-              研究社区
-            </span>
-            <small>{analysis.communities.length}</small>
-          </header>
-          <div>
-            {analysis.communities.map((community, index) => (
-              <button
-                type="button"
-                key={community.id}
-                onClick={() => onFocusNodes(community.nodeIds)}
-              >
-                <i className={`community-color community-${(index % 6) + 1}`} />
-                <span>
-                  <strong>{community.label}</strong>
-                  <small>
-                    {community.size} 篇 · 本地 {community.libraryCount} ·{" "}
-                    {formatYearRange(community.startYear, community.endYear)}
-                  </small>
-                </span>
-                <Focus size={14} />
-              </button>
-            ))}
-          </div>
-        </section>
-
-        <section className="citation-analysis-section citation-analysis-bridges">
-          <header>
-            <span>
-              <GitBranch size={16} />
-              桥接论文
-            </span>
-            <small>{analysis.bridges.length}</small>
-          </header>
-          <div>
-            {analysis.bridges.slice(0, 12).map((bridge) => {
-              const node = nodeById.get(bridge.nodeId);
-              if (!node) return null;
-              return (
-                <button
-                  type="button"
-                  key={bridge.nodeId}
-                  onClick={() => onSelectNode(bridge.nodeId)}
-                >
-                  <span>
-                    <strong>{node.title}</strong>
-                    <small>
-                      连接 {bridge.connectedCommunities} 个社区 · 度数{" "}
-                      {bridge.degree}
-                    </small>
-                  </span>
-                  <b>{bridge.score}</b>
-                </button>
-              );
-            })}
-          </div>
-        </section>
-
-        <section className="citation-analysis-section citation-analysis-paths">
-          <header>
-            <span>
-              <Route size={16} />
-              关键演进路径
-            </span>
-            <small>{analysis.keyPaths.length}</small>
-          </header>
-          <div>
-            {analysis.keyPaths.length ? (
-              analysis.keyPaths.slice(0, 6).map((path) => (
-                <button
-                  type="button"
-                  key={path.id}
-                  onClick={() => onFocusNodes(path.nodeIds)}
-                >
-                  <span className="citation-analysis-path-years">
-                    {formatYearRange(path.startYear, path.endYear)}
-                  </span>
-                  <span className="citation-analysis-path-chain">
-                    {path.nodeIds.map((nodeId, index) => {
-                      const node = nodeById.get(nodeId);
-                      return (
-                        <span key={nodeId}>
-                          {index > 0 && <ArrowRight size={12} />}
-                          <strong title={node?.title}>
-                            {shortTitle(node?.title ?? nodeId)}
-                          </strong>
-                        </span>
-                      );
-                    })}
-                  </span>
-                </button>
-              ))
+      <p className="citation-ai-source-note">
+        依据完整网络的摘要、关键词和引用关系分析；缺少摘要时会标明证据不足。
+      </p>
+      <label className="citation-ai-question">
+        <span>
+          分析关注点 <small>可选</small>
+        </span>
+        <textarea
+          aria-label="分析关注点"
+          value={question}
+          disabled={running}
+          maxLength={6000}
+          rows={2}
+          placeholder="例如：比较主要研究方法，找出结论分歧，以及值得优先阅读的论文。"
+          onChange={(event) => onQuestionChange(event.target.value)}
+        />
+      </label>
+      {state.error && state.status === "idle" && (
+        <p className="citation-ai-error" role="alert">
+          {state.error}
+        </p>
+      )}
+      {state.status === "idle" && (
+        <div className="citation-ai-start">
+          <button type="button" disabled={!ready} onClick={onStart}>
+            <Sparkles size={16} />
+            开始 AI 分析
+          </button>
+          {!ready && <p>请先在左侧选择论文并加载引文网络。</p>}
+        </div>
+      )}
+      {state.status !== "idle" && (
+        <>
+          <div
+            className={`citation-ai-status is-${state.status}`}
+            role="status"
+          >
+            {running ? (
+              <LoaderCircle className="spin" size={16} />
             ) : (
-              <EmptyRow text="当前关系中没有带年份的连续引用路径。" />
+              <ChartNetwork size={16} />
+            )}
+            <span>
+              {state.status === "completed"
+                ? "分析完成"
+                : state.status === "cancelled"
+                  ? "已停止，保留已生成的内容和发现"
+                  : state.status === "interrupted"
+                    ? "任务已中断，已恢复保存的内容"
+                    : state.status === "failed"
+                      ? "分析未完成"
+                      : state.status === "stopping"
+                        ? "正在停止分析"
+                        : state.progress?.detail || "正在启动分析 agent"}
+            </span>
+            {coverage && (
+              <small>
+                已读 {coverage.read}/{coverage.total} · 已记录 {coverage.noted}/
+                {coverage.total}
+              </small>
             )}
           </div>
-        </section>
-
-        <section className="citation-analysis-section citation-analysis-similarities">
-          <header>
-            <span>
-              <Share2 size={16} />
-              相似关系
-            </span>
-            <small>
-              {analysis.bibliographicCoupling.length +
-                analysis.coCitation.length}
-            </small>
-          </header>
-          <div className="citation-analysis-similarity-columns">
-            <SimilarityList
-              title="文献耦合"
-              links={analysis.bibliographicCoupling}
-              nodeById={nodeById}
-              onFocusNodes={onFocusNodes}
-            />
-            <SimilarityList
-              title="共被引"
-              links={analysis.coCitation}
-              nodeById={nodeById}
-              onFocusNodes={onFocusNodes}
-            />
-          </div>
-        </section>
-      </div>
-    </div>
-  );
-}
-
-function Metric({
-  label,
-  value,
-}: {
-  label: string;
-  value: string | number;
-}): React.JSX.Element {
-  return (
-    <div>
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
-function SimilarityList({
-  title,
-  links,
-  nodeById,
-  onFocusNodes,
-}: {
-  title: string;
-  links: CitationNetworkSimilarity[];
-  nodeById: Map<string, CitationGraphNode>;
-  onFocusNodes: (nodeIds: string[]) => void;
-}): React.JSX.Element {
-  return (
-    <div>
-      <h3>{title}</h3>
-      {links.length ? (
-        links.slice(0, 8).map((link) => (
-          <button
-            type="button"
-            key={`${link.source}:${link.target}`}
-            onClick={() => onFocusNodes([link.source, link.target])}
-          >
-            <span>
-              <strong>{shortTitle(nodeById.get(link.source)?.title)}</strong>
-              <small>{shortTitle(nodeById.get(link.target)?.title)}</small>
-            </span>
-            <b>{link.sharedCount}</b>
-          </button>
-        ))
-      ) : (
-        <EmptyRow text="暂无显著关系" />
+          {context && (
+            <p className="citation-ai-context">
+              上下文 {Math.round(context.inputTokens / 1000)}K / 273K
+              {context.compactions > 0
+                ? ` · 已自动压缩 ${context.compactions} 次`
+                : ""}
+            </p>
+          )}
+          {state.error && (
+            <p className="citation-ai-error" role="alert">
+              {state.error}
+            </p>
+          )}
+          <PaperResearchPlanView events={state.events} />
+          <AgentCommentaryView events={state.events} live={running} />
+          {state.content && (
+            <article
+              className="citation-ai-report knowledge-markdown"
+              aria-label="AI 分析报告"
+              onClick={(event) => {
+                const anchor = (event.target as Element).closest("a");
+                const match = anchor
+                  ?.getAttribute("href")
+                  ?.match(/^#citation\/(P\d+)$/);
+                if (!match) return;
+                event.preventDefault();
+                const node = sourceByLabel.get(match[1]);
+                if (node) onSelectNode(node.id);
+              }}
+            >
+              <ChatMarkdown content={state.content} />
+            </article>
+          )}
+          {findings.length > 0 && (
+            <div className="citation-ai-findings">
+              {(
+                Object.keys(kindLabels) as CitationAnalysisFinding["kind"][]
+              ).map((kind) => {
+                const items = findings.filter(
+                  (finding) => finding.kind === kind,
+                );
+                return (
+                  items.length > 0 && (
+                    <section
+                      key={kind}
+                      className={`citation-ai-finding-group kind-${kind}`}
+                    >
+                      <h3>
+                        {kindLabels[kind]} <small>{items.length}</small>
+                      </h3>
+                      {items.map((finding) => (
+                        <article
+                          key={finding.id}
+                          className="citation-ai-finding"
+                        >
+                          <header>
+                            <h4>{finding.title}</h4>
+                            {finding.tentative && <small>待验证</small>}
+                          </header>
+                          <p>{finding.explanation}</p>
+                          <div className="citation-ai-evidence">
+                            {finding.nodeIds.map((nodeId) => {
+                              const source = sourceById.get(nodeId);
+                              return (
+                                source && (
+                                  <button
+                                    type="button"
+                                    key={nodeId}
+                                    title={source.node.title}
+                                    onClick={() => onSelectNode(nodeId)}
+                                  >
+                                    {source.label} · {source.node.title}
+                                  </button>
+                                )
+                              );
+                            })}
+                          </div>
+                          <button
+                            type="button"
+                            className="citation-ai-focus"
+                            onClick={() => onFocusNodes(finding.nodeIds)}
+                          >
+                            <Focus size={14} />
+                            在图谱中查看
+                          </button>
+                        </article>
+                      ))}
+                    </section>
+                  )
+                );
+              })}
+            </div>
+          )}
+          <AgentExecutionTrace events={state.events} live={running} />
+        </>
       )}
     </div>
   );
-}
-
-function EmptyRow({ text }: { text: string }): React.JSX.Element {
-  return <p className="citation-analysis-empty-row">{text}</p>;
-}
-
-function AnalysisEmpty({
-  icon,
-  title,
-  description,
-}: {
-  icon: React.JSX.Element;
-  title: string;
-  description: string;
-}): React.JSX.Element {
-  return (
-    <div className="citation-research-empty">
-      {icon}
-      <h3>{title}</h3>
-      <p>{description}</p>
-    </div>
-  );
-}
-
-function shortTitle(value = ""): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  return normalized.length > 42 ? `${normalized.slice(0, 41)}…` : normalized;
-}
-
-function formatYearRange(start?: number, end?: number): string {
-  if (!start && !end) return "年份未知";
-  if (start === end || !end) return String(start ?? end);
-  return `${start ?? end} - ${end}`;
 }

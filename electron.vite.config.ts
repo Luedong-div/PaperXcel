@@ -26,6 +26,8 @@ export default defineConfig({
           "electron-store",
           "fast-xml-parser",
           "openai",
+          "js-tiktoken",
+          "pdf-lib",
           "pdfjs-dist",
         ],
       }),
@@ -44,6 +46,21 @@ export default defineConfig({
     },
   },
   renderer: {
+    server: {
+      host: "127.0.0.1",
+      proxy: process.env.PAPERXCEL_DEV_BRIDGE_PORT
+        ? {
+            "/__paperxcel": {
+              target: `http://127.0.0.1:${process.env.PAPERXCEL_DEV_BRIDGE_PORT}`,
+              changeOrigin: false,
+              headers: {
+                "x-paperxcel-proxy":
+                  process.env.PAPERXCEL_DEV_BRIDGE_NONCE ?? "",
+              },
+            },
+          }
+        : undefined,
+    },
     publicDir: resolve("public"),
     resolve: {
       alias: {

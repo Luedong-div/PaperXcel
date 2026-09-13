@@ -5,6 +5,7 @@ import { ChatMarkdown } from "./ChatMarkdown";
 import { formatProcessingDuration } from "./chatProgress";
 import { PaperResearchPlanView } from "./PaperResearchPlanView";
 import { AgentExecutionTrace } from "./AgentExecutionTrace";
+import { AgentCommentaryView } from "./AgentCommentaryView";
 
 export function ChatStreamView({
   store,
@@ -42,10 +43,19 @@ export function ChatStreamView({
       {run.reasoningObserved && (
         <small className="chat-reasoning-observed">已收到模型推理信号</small>
       )}
+      {run.contextUsage && (
+        <small className="chat-context-usage">
+          {Math.ceil(run.contextUsage.inputTokens / 1000)}K / 273K
+          {run.contextUsage.compactions
+            ? ` · 已压缩 ${run.contextUsage.compactions} 次`
+            : ""}
+        </small>
+      )}
       <PaperResearchPlanView
         key={`${run.requestId}-plan`}
         events={run.events}
       />
+      <AgentCommentaryView events={run.events} live />
       <AgentExecutionTrace key={run.requestId} events={run.events} live />
       {run.answer && (
         <div className="message-content pending-answer-content">
